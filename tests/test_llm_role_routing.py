@@ -31,6 +31,40 @@ def test_role_backend_inherits_default_and_can_override(monkeypatch):
     assert built["answer"].scope == "remote"
 
 
+def test_src_private_network_guard_applies_only_to_local_roles(monkeypatch):
+    built = roles.build_role_backends(
+        default_backend="openai",
+        default_base_url="https://api.openai.com/v1",
+        default_model="default-model",
+        default_api_key="default-secret",
+        default_verify_tls=True,
+        default_ca_file=None,
+        private_network_only=True,
+        role_overrides={
+            "planner": {
+                "backend": "ollama",
+                "base_url": "http://127.0.0.1:11434",
+                "model": "planner-local",
+                "scope": "local",
+            },
+            "answer": {
+                "backend": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "model": "answer-remote",
+                "scope": "remote",
+            },
+        },
+    )
+
+    assert built["planner"].scope == "local"
+    assert built["planner"].backend.private_network_only is True
+    assert built["planner"].backend.trust_env is False
+
+    assert built["answer"].scope == "remote"
+    assert built["answer"].backend.private_network_only is False
+    assert built["answer"].backend.trust_env is True
+
+
 def test_legacy_remote_answer_context_is_hard_bounded(monkeypatch):
     monkeypatch.setattr(provider, "_role_remote", lambda role: role == "answer")
     monkeypatch.setattr(provider, "_answer_context_budget", lambda: None)
