@@ -47,6 +47,8 @@ from rag.policy_hooks import (
     apply_policy_hook,
 )
 from rag.source_registry import register_document
+from rag.evidence_boundary import guarded_evidence_prompt, serialize_evidence_records
+from rag.secret_env import secret_env
 
 log = get_logger("web")
 
@@ -274,38 +276,110 @@ def _extract_pdf_text(data: bytes) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _is_public_host(host: str) -> bool:
+def _is_public_ip(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(str(value or ""))
+    except ValueError:
+        return False
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    )
+
+
+def _resolve_host_ips(host: str, port: int) -> list[str]:
     host = str(host or "").strip().rstrip(".")
     if not host:
-        return False
-    if host.casefold() in {"localhost", "localhost.localdomain"}:
-        return False
+        return []
     try:
-        addresses = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        return [str(literal)]
+    try:
+        infos = socket.getaddrinfo(
+            host,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
     except socket.gaierror:
-        return False
-    found = False
-    for item in addresses:
-        ip = item[4][0]
-        try:
-            addr = ipaddress.ip_address(ip)
-        except ValueError:
-            return False
-        found = True
-        if (
-            addr.is_private or addr.is_loopback or addr.is_link_local or
-            addr.is_multicast or addr.is_reserved or addr.is_unspecified
-        ):
-            return False
-    return found
+        return []
+    return sorted({str(item[4][0]) for item in infos if item and item[4]})
 
 
-def _validate_public_url(url: str, allow_private: bool = False) -> None:
-    parsed = urlparse(str(url or ""))
+def _validated_connect_targets(
+    url: str,
+    allow_private: bool = False,
+    *,
+    allowed_ports: set[int] | None = None,
+) -> list[tuple[str, str, str]]:
+    """Return IP-pinned request targets for one validated HTTP(S) URL.
+
+    DNS is resolved exactly here. The caller connects to the returned IP
+    literal, while retaining the original Host header and TLS SNI hostname.
+    This closes the validation/connect DNS-rebinding window.
+    """
+    try:
+        parsed = urlparse(str(url or ""))
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise RuntimeError("invalid URL") from exc
+
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise RuntimeError("unsupported/non-HTTP URL")
-    if not allow_private and not _is_public_host(parsed.hostname):
+    if parsed.username is not None or parsed.password is not None:
+        raise RuntimeError("userinfo in URLs is not allowed")
+    if allowed_ports is not None and port not in allowed_ports:
+        raise RuntimeError(f"destination port {port} is not allowed")
+
+    folded = parsed.hostname.casefold().rstrip(".")
+    if folded == "localhost" or folded.endswith(".localhost"):
+        if not allow_private:
+            raise RuntimeError("private/local destination blocked")
+
+    addresses = _resolve_host_ips(parsed.hostname, port)
+    if not addresses:
+        raise RuntimeError("DNS resolution failed")
+    if not allow_private and any(not _is_public_ip(value) for value in addresses):
         raise RuntimeError("private/local destination blocked")
+
+    default_port = 443 if parsed.scheme == "https" else 80
+    display_host = parsed.hostname
+    if ":" in display_host and not display_host.startswith("["):
+        display_host = f"[{display_host}]"
+    host_header = display_host if port == default_port else f"{display_host}:{port}"
+
+    original = httpx.URL(str(url))
+    targets: list[tuple[str, str, str]] = []
+    for address in addresses:
+        pinned = original.copy_with(host=address)
+        targets.append((str(pinned), host_header, parsed.hostname))
+    return targets
+
+
+def _is_public_host(host: str) -> bool:
+    values = _resolve_host_ips(host, 443)
+    return bool(values) and all(_is_public_ip(value) for value in values)
+
+
+def _validate_public_url(
+    url: str,
+    allow_private: bool = False,
+    *,
+    allowed_ports: set[int] | None = None,
+) -> None:
+    _validated_connect_targets(
+        url,
+        allow_private,
+        allowed_ports=allowed_ports,
+    )
 
 
 class WebSearchProvider:
@@ -319,7 +393,7 @@ class WebSearchProvider:
         self.max_results = max(1, min(int(search.get("max_results") or 10), 30))
 
     def _key(self) -> str:
-        return os.getenv(self.api_key_env, "") if self.api_key_env else ""
+        return secret_env(self.api_key_env, "") if self.api_key_env else ""
 
     def readiness(self) -> tuple[bool, str]:
         if self.provider == "brave":
@@ -395,67 +469,154 @@ class WebFetcher:
         self.user_agent = str(fetch.get("user_agent") or "Nextcloud-RAG-WebEvidence/0.8")
         self.max_redirects = max(0, min(int(fetch.get("max_redirects") or 5), 10))
         self.allow_private = _truthy(fetch.get("allow_private"), False)
+        raw_ports = fetch.get("allowed_ports")
+        if raw_ports is None:
+            raw_ports = [80, 443]
+        if isinstance(raw_ports, (str, int)):
+            raw_ports = [raw_ports]
+        self.allowed_ports = {
+            int(value)
+            for value in raw_ports
+            if str(value).strip() and 1 <= int(value) <= 65535
+        }
+        if not self.allowed_ports:
+            raise ValueError("web.fetch.allowed_ports must contain at least one valid TCP port")
 
     async def fetch(self, hit: SearchHit) -> FetchedSource:
         retrieved = _utc_now().isoformat()
         url = hit.url
         current = url
+        final_url = current
+        content_type = ""
+        data = b""
         status_code = 0
         redirect_count = 0
         try:
-            async with httpx.AsyncClient(timeout=self.timeout, verify=self.verify_tls, follow_redirects=False) as client:
-                response: httpx.Response | None = None
-                for _ in range(self.max_redirects + 1):
-                    current = apply_policy_hook(
-                        PRE_FETCH,
-                        content=current,
-                        metadata={
-                            "source": "web",
-                            "search_provider": hit.provider,
-                            "original_url": url,
-                            "redirect_count": redirect_count,
-                        },
-                    )
-                    if not isinstance(current, str):
-                        raise TypeError("pre_fetch policy hook must return str content")
-                    _validate_public_url(current, self.allow_private)
-                    response = await client.get(
-                        current,
-                        headers={
-                            "User-Agent": self.user_agent,
-                            "Accept": "text/html,application/pdf,text/plain;q=0.9,*/*;q=0.5",
-                        },
-                    )
-                    status_code = int(response.status_code)
-                    if response.status_code in {301, 302, 303, 307, 308}:
-                        location = response.headers.get("location")
-                        if not location:
-                            break
-                        current = urljoin(current, location)
-                        redirect_count += 1
-                        continue
-                    break
-                if response is None:
-                    raise RuntimeError("no HTTP response")
-                response.raise_for_status()
-                content_type = str(response.headers.get("content-type") or "application/octet-stream").lower()
-                final_url = str(response.url)
-                data = apply_policy_hook(
-                    POST_FETCH,
-                    content=response.content,
+            # No environment proxy is allowed on untrusted public-Web fetches.
+            # Every connect is made to an IP returned by the validation DNS
+            # lookup; original Host/SNI is retained for virtual hosting/TLS.
+            # A fresh HTTPX client is used for every redirect hop so a pooled
+            # TLS connection authenticated for host A can never be reused for
+            # host B merely because both names resolve to the same pinned IP.
+            for _ in range(self.max_redirects + 1):
+                current = apply_policy_hook(
+                    PRE_FETCH,
+                    content=current,
                     metadata={
                         "source": "web",
-                        "requested_url": current,
-                        "final_url": final_url,
-                        "content_type": content_type,
-                        "http_status": status_code,
+                        "search_provider": hit.provider,
+                        "original_url": url,
+                        "redirect_count": redirect_count,
                     },
                 )
-                if not isinstance(data, (bytes, bytearray)):
-                    raise TypeError("post_fetch policy hook must return bytes content")
-                data = bytes(data)
-                if len(data) > self.max_bytes:
-                    raise RuntimeError(f"source exceeds max_bytes={self.max_bytes}")
+                if not isinstance(current, str):
+                    raise TypeError("pre_fetch policy hook must return str content")
+
+                targets = _validated_connect_targets(
+                    current,
+                    self.allow_private,
+                    allowed_ports=self.allowed_ports,
+                )
+                redirect_target = ""
+                last_transport_error: Exception | None = None
+
+                for pinned_url, host_header, sni_hostname in targets:
+                    headers = {
+                        "Host": host_header,
+                        "User-Agent": self.user_agent,
+                        "Accept": "text/html,application/pdf,text/plain;q=0.9,*/*;q=0.5",
+                    }
+                    extensions = (
+                        {"sni_hostname": sni_hostname}
+                        if urlparse(current).scheme == "https"
+                        else None
+                    )
+                    try:
+                        async with httpx.AsyncClient(
+                            timeout=self.timeout,
+                            verify=self.verify_tls,
+                            follow_redirects=False,
+                            trust_env=False,
+                        ) as client:
+                            async with client.stream(
+                                "GET",
+                                pinned_url,
+                                headers=headers,
+                                extensions=extensions,
+                            ) as response:
+                                status_code = int(response.status_code)
+                                # User-visible/archive provenance keeps the
+                                # original hostname URL, never the pinned IP.
+                                final_url = current
+
+                                if response.status_code in {301, 302, 303, 307, 308}:
+                                    location = response.headers.get("location")
+                                    if not location:
+                                        raise RuntimeError("redirect response has no location")
+                                    if redirect_count >= self.max_redirects:
+                                        raise RuntimeError(
+                                            f"source exceeds max_redirects={self.max_redirects}"
+                                        )
+                                    redirect_target = urljoin(current, location)
+                                    break
+
+                                response.raise_for_status()
+                                content_type = str(
+                                    response.headers.get("content-type")
+                                    or "application/octet-stream"
+                                ).lower()
+                                content_length = response.headers.get("content-length")
+                                if content_length:
+                                    try:
+                                        if int(content_length) > self.max_bytes:
+                                            raise RuntimeError(
+                                                f"source exceeds max_bytes={self.max_bytes}"
+                                            )
+                                    except ValueError:
+                                        pass
+
+                                chunks = bytearray()
+                                async for chunk in response.aiter_bytes():
+                                    if len(chunks) + len(chunk) > self.max_bytes:
+                                        raise RuntimeError(
+                                            f"source exceeds max_bytes={self.max_bytes}"
+                                        )
+                                    chunks.extend(chunk)
+                                data = bytes(chunks)
+                                break
+                    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                        last_transport_error = exc
+                        continue
+
+                if redirect_target:
+                    current = redirect_target
+                    redirect_count += 1
+                    continue
+                if data:
+                    break
+                if last_transport_error is not None:
+                    raise last_transport_error
+                raise RuntimeError("no reachable validated destination")
+
+            if not data:
+                raise RuntimeError("no HTTP response body")
+
+            data = apply_policy_hook(
+                POST_FETCH,
+                content=data,
+                metadata={
+                    "source": "web",
+                    "requested_url": current,
+                    "final_url": final_url,
+                    "content_type": content_type,
+                    "http_status": status_code,
+                },
+            )
+            if not isinstance(data, (bytes, bytearray)):
+                raise TypeError("post_fetch policy hook must return bytes content")
+            data = bytes(data)
+            if len(data) > self.max_bytes:
+                raise RuntimeError(f"source exceeds max_bytes={self.max_bytes}")
 
             title = hit.title
             published = ""
@@ -551,7 +712,7 @@ class RelevanceGate:
         base_url = str(rel.get("url") or os.getenv("WEB_LLM_BASE_URL") or os.getenv("LLM_BASE_URL") or os.getenv("OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
         model = str(rel.get("model") or os.getenv("WEB_LLM_MODEL") or os.getenv("EVIDENCE_MODEL") or os.getenv("LLM_MODEL") or "qwen3:8b")
         key_env = str(rel.get("api_key_env") or "WEB_LLM_API_KEY").strip()
-        api_key = os.getenv(key_env, "") or os.getenv("LLM_API_KEY", "")
+        api_key = secret_env(key_env, "") or secret_env("LLM_API_KEY", "")
         self.backend = build_llm_backend(
             backend_name,
             base_url=base_url,
@@ -578,17 +739,21 @@ class RelevanceGate:
         usable = [s for s in sources if s.text and not s.fetch_error]
         if not usable:
             return [], []
-        blocks = []
+        records: list[dict[str, Any]] = []
         for i, source in enumerate(usable, start=1):
-            # The relevance model must see the passage that best matches the
-            # query, not simply the first N characters of a page. Long public
-            # pages often start with navigation/boilerplate while the actual
-            # evidence occurs much later. Search snippets remain excluded: the
-            # passage is selected only from text we actually fetched.
+            # The relevance model sees only fetched text, never search snippets.
+            # JSON serialization prevents fetched content from impersonating
+            # server-generated source boundaries or metadata fields.
             preview = best_passage(query, source.text, self.preview_chars)
-            blocks.append(
-                f"SOURCE {i}\nTITLE: {source.title}\nURL: {source.final_url}\n"
-                f"PUBLISHED: {source.published_at}\nTEXT:\n{preview}"
+            records.append(
+                {
+                    "citation": f"[W{i}]",
+                    "id": i,
+                    "title": str(source.title or "")[:512],
+                    "url": str(source.final_url or source.url or "")[:2048],
+                    "published_at": str(source.published_at or "")[:128],
+                    "text": preview,
+                }
             )
         system = (
             "Du bewertest bereits tatsächlich abgerufene Webquellen für eine Recherche. "
@@ -602,7 +767,13 @@ class RelevanceGate:
             "auch irrelevante Quellen dürfen nicht ausgelassen werden. Das JSON-Wurzelobjekt hat genau das Feld "
             "sources; jedes Element enthält genau id, relevant, score und reason. Gib ausschließlich JSON zurück."
         )
-        user = "FRAGE:\n" + query + "\n\nQUELLEN:\n\n" + "\n\n---\n\n".join(blocks)
+        system = guarded_evidence_prompt(system)
+        user = (
+            "FRAGE:\n"
+            + query
+            + "\n\nQUELLEN_JSON:\n"
+            + serialize_evidence_records(records, kind="public_web_relevance")
+        )
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
         expected_ids = set(range(1, len(usable) + 1))
@@ -843,16 +1014,24 @@ class PlaywrightRenderer:
         )
         if not isinstance(render_url, str):
             raise TypeError("pre_fetch policy hook must return str content")
-        async with httpx.AsyncClient(timeout=self.timeout, verify=self.verify_tls) as client:
+        html_snapshot = _decode_html(source.raw, source.content_type)
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            verify=self.verify_tls,
+            trust_env=False,
+        ) as client:
             response = await client.post(
                 self.url,
                 json={
                     "url": render_url,
+                    "html": html_snapshot,
                     "landscape": self.landscape,
                     "prefer_css_page_size": self.prefer_css_page_size,
                     "viewport_width": self.viewport_width,
                     "viewport_height": self.viewport_height,
-                    "persist_state": self.persist_state,
+                    # rc1.2 renderer is deliberately network-free. Persistent
+                    # cookies/state only make sense for live navigation.
+                    "persist_state": False,
                     "cleanup_cookie_consent": self.cleanup_cookie_consent,
                     "cleanup_dismiss_overlays": self.cleanup_dismiss_overlays,
                     "cleanup_remove_overlays": self.cleanup_remove_overlays,
