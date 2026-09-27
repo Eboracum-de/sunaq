@@ -1,0 +1,42 @@
+# SunaQ capability preset: workgroup
+# Conservative ERG baseline. Optional sources still require their own global
+# and per-user configuration; this preset does not create credentials or enable Web.
+architecture:
+  tier: erg
+acl:
+  enabled: true
+retrieval_policy:
+  internal:
+    files: required
+    vector: disabled
+    graph: disabled
+  optional_default: include
+  web: explicit
+qdrant:
+  enabled: false
+sync_worker:
+  enabled: false
+sync:
+  graph_queue:
+    enabled: false
+graph_queue:
+  enabled: false
+  auto_enqueue_cited_documents: false
+  worker:
+    enabled: false
+research_findings:
+  enabled: true
+graph_indexer:
+  enabled: false
+graph_entity_discovery:
+  enabled: false
+graph_relation_discovery:
+  enabled: false
+mail_metadata:
+  enabled: true
+mail:
+  enabled: false
+  worker:
+    enabled: false
+chat_archive:
+  enabled: true

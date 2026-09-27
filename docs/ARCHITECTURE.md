@@ -1,9 +1,9 @@
 # SunaQ architecture
-## Architecture and design baseline 0.8.6-rc1.1
+## Architecture and design baseline 0.8.6-rc1.2
 
 **Updated:** 24 September 2026  
 **Status:** Release Candidate  
-**Reference version:** `0.8.6-rc1.1`
+**Reference version:** `0.8.6-rc1.2`
 
 ---
 
@@ -36,49 +36,46 @@ The model layers are independently configurable. Embedding models, rerankers and
 
 ### 1.1 SRC and ERG capability layers
 
-The codebase is organized around two capability layers:
+The codebase enforces two architecture tiers:
 
 ```text
-A — Secure RAG Core (SRC)        BASELINE
+A — Secure RAG Core (SRC)
     Nextcloud documents
             ↓
-    FullTextSearch / Elasticsearch
+    FullTextSearch / Elasticsearch (files only)
             ↓
-       live Nextcloud ACL
+       live Nextcloud ACL (mandatory)
             ↓
-             LLM
-      local preferred;
-      external allowed with
-      managed/accepted egress
+ local or administrator-approved LLM roles
+    one retrieval round
 
-B — Eboracum Research Gate (ERG) ADMIN OPT-IN
-    SRC + selected additional capabilities
+B — Eboracum Research Gate (ERG)
+    SRC foundation + selected extensions
             ↓
     Mail / Web / Chat archives
+    broader external egress surfaces
     live Web research / Playwright
-    semantic retrieval / reranking
-    Findings / Graph-Lite / full graph
+    Qdrant / semantic retrieval
+    Findings / Graph-Lite / document graph
     additional retrieval rounds
-    other specialist functions
 ```
 
-A fresh installation deliberately starts close to layer A. Web Research and Web
-archiving are off, Playwright is not installed unless requested, the mail worker
-is off, chat archives are not retrieval evidence and Research-Finding
-persistence is off.
+SRC is a runtime contract in rc1.2, not a marketing label. Incompatible
+configuration fails validation; omitted retrieval arms are normalized to
+`files`; deterministic document selectors are filtered to ordinary Documents;
+and ERG-only internal endpoints are unavailable. Neo4j may still provide
+administrator-owned seed/alias context without becoming a document-evidence arm.
+Remote LLM routing is an administrator-controlled egress choice within either
+tier; SRC does not require zero model egress, and remote evidence caps remain
+mandatory whenever a role endpoint is classified as remote.
 
-SRC prefers local/private model processing, but it does not require zero egress.
-An administrator may use bounded external model endpoints where the disclosure
-is understood, explicitly accepted and controlled by the configured remote
-evidence limits.
+ERG remains a menu rather than a monolithic advanced mode. Enabling an ERG
+capability can add retained state, untrusted input, external egress,
+latency/resource cost or lifecycle obligations.
 
-ERG is deliberately a menu rather than a monolithic "advanced mode". Enabling an
-ERG capability can add retained state, untrusted input, external egress,
-latency/resource cost or lifecycle obligations. Each capability therefore
-remains an explicit administrator decision.
-
-In 0.8.6-rc1.1 SRC/ERG is architecture and administration terminology, not yet
-a supported installer/configuration tier. See [SRC-ERG.md](SRC-ERG.md).
+Super-Light ships as formal SRC in rc1.2. The full reference configuration is
+ERG for upgrade compatibility with installations that already used optional
+capabilities. See [SRC-ERG.md](SRC-ERG.md).
 
 ### 1.2 Policy/inspection boundaries
 
@@ -87,12 +84,12 @@ sends data outward, fetches untrusted content or writes imported/generated
 content back to Nextcloud. The stages are `outbound_query`, `pre_fetch`,
 `post_fetch`, `pre_persist` and `pre_model_egress`.
 
-The shipped rc1.1 evaluator is deliberately a no-op: every stage returns
-`ALLOW`, so the hooks do not claim malware, DLP, URL-filtering or egress
-protection. rc1.2 is intended to add administrator configuration and concrete
-adapters such as malware scanning, URL policy, ICAP/YARA/DLP/redaction or custom
-inspection services. Evaluator failures are not swallowed, allowing a configured
-required security adapter to fail closed.
+The shipped evaluator remains deliberately a no-op: every stage returns
+`ALLOW`, so the hooks do not claim malware, DLP or reputation filtering.
+rc1.2 adds non-optional application-level SSRF/network destination enforcement
+for Web and Playwright independently of this hook scaffold. Concrete scanner/DLP
+adapters remain optional future extensions. Evaluator failures are not swallowed,
+allowing a configured required adapter to fail closed.
 
 ---
 
@@ -572,7 +569,7 @@ Search snippets are discovery metadata and are not answer evidence.
 
 ### 11.2 Evidence pipeline
 
-Current rc1.1 execution is shown together with the planned rc1.2 hook insertion
+Current rc1.2 execution is shown together with the policy-hook insertion points
 points:
 
 ```text
@@ -688,7 +685,7 @@ authority*:
 | Research Findings / graph extraction, when enabled | **Yes** | persistent knowledge pollution is possible |
 | Web-after queries, when enabled | **Yes** | possible query-egress manipulation; separate policy boundary |
 
-The shipped 0.8.6-rc1.1 profiles use one retrieval round. Corpus text therefore
+The shipped 0.8.6-rc1.2 profiles use one retrieval round. Corpus text therefore
 does not feed back into their query rewriter during the same request. A future
 multi-round profile intentionally changes that assumption and must be evaluated
 as a larger prompt-injection surface.

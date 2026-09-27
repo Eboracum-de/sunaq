@@ -8,6 +8,7 @@ PREFIX_EXPLICIT=0
 NEXTCLOUD_URL=""
 ELASTICSEARCH_URL=""
 ELASTICSEARCH_INDEX="my_index"
+ELASTICSEARCH_INDEX_EXPLICIT=0
 INSTALL_SYSTEM_PACKAGES=1
 ASSUME_YES=0
 PLAN_ONLY=0
@@ -27,6 +28,9 @@ PROXY_HTTP_PORT_EXPLICIT=0
 PROXY_HTTPS_PORT_EXPLICIT=0
 CA_CERTIFICATES=()
 X509_STRICT=0
+X509_STRICT_EXPLICIT=0
+PRESET_FILE=""
+PRESET_NAME=""
 
 usage() {
   cat <<'USAGE'
@@ -41,6 +45,8 @@ Required for a started installation:
 
 Options:
   --elasticsearch-index ID  Elasticsearch index (default: my_index)
+  --preset core|workgroup   Apply a shipped capability preset
+  --preset-file FILE        Apply a safe YAML capability overlay
   --prefix PATH             Install prefix (default: /opt/sunaq)
   --skip-system-packages    Do not install Docker/curl/jq/openssl
   --no-start                Prepare files/images but do not start the stack
@@ -72,7 +78,14 @@ while [[ $# -gt 0 ]]; do
     --prefix) PREFIX="$2"; PREFIX_EXPLICIT=1; shift 2 ;;
     --nextcloud-url) NEXTCLOUD_URL="$2"; shift 2 ;;
     --elasticsearch-url) ELASTICSEARCH_URL="$2"; shift 2 ;;
-    --elasticsearch-index) ELASTICSEARCH_INDEX="$2"; shift 2 ;;
+    --elasticsearch-index) ELASTICSEARCH_INDEX="$2"; ELASTICSEARCH_INDEX_EXPLICIT=1; shift 2 ;;
+    --preset)
+      [[ $# -ge 2 ]] || { echo "--preset requires core or workgroup" >&2; exit 2; }
+      case "$2" in core|workgroup) PRESET_NAME="$2"; PRESET_FILE="$SOURCE_DIR/install/presets/$2.yaml" ;; *) echo "Unknown preset: $2" >&2; exit 2 ;; esac
+      shift 2 ;;
+    --preset-file)
+      [[ $# -ge 2 ]] || { echo "--preset-file requires a readable YAML file" >&2; exit 2; }
+      PRESET_NAME="custom"; PRESET_FILE="$2"; shift 2 ;;
     --skip-system-packages) INSTALL_SYSTEM_PACKAGES=0; shift ;;
     --no-start) START_STACK=0; shift ;;
     --with-openwebui) WITH_OPENWEBUI=1; OPENWEBUI_EXPLICIT=1; shift ;;
@@ -84,14 +97,22 @@ while [[ $# -gt 0 ]]; do
     --proxy-http-port) [[ $# -ge 2 ]] || { echo "--proxy-http-port requires a port" >&2; exit 2; }; PROXY_HTTP_PORT="$2"; PROXY_HTTP_PORT_EXPLICIT=1; shift 2 ;;
     --proxy-https-port) [[ $# -ge 2 ]] || { echo "--proxy-https-port requires a port" >&2; exit 2; }; PROXY_HTTPS_PORT="$2"; PROXY_HTTPS_PORT_EXPLICIT=1; shift 2 ;;
     --ca-certificate) [[ $# -ge 2 ]] || { echo "--ca-certificate requires a file" >&2; exit 2; }; CA_CERTIFICATES+=("$2"); shift 2 ;;
-    --x509-strict) X509_STRICT=1; shift ;;
-    --no-x509-strict) X509_STRICT=0; shift ;;
+    --x509-strict) X509_STRICT=1; X509_STRICT_EXPLICIT=1; shift ;;
+    --no-x509-strict) X509_STRICT=0; X509_STRICT_EXPLICIT=1; shift ;;
     --plan) PLAN_ONLY=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+if [[ -n "$PRESET_FILE" && ! -r "$PRESET_FILE" ]]; then
+  echo "Preset file is not readable: $PRESET_FILE" >&2
+  exit 2
+fi
+if [[ -n "$PRESET_FILE" ]]; then
+  PRESET_FILE="$(cd "$(dirname "$PRESET_FILE")" && pwd)/$(basename "$PRESET_FILE")"
+fi
 
 # Fresh installs use /opt/sunaq. Existing 0.8.5 installations remain in place
 # unless the administrator explicitly supplies --prefix; moving a live install
@@ -202,7 +223,7 @@ print_plan() {
   fi
 
   cat <<PLAN
-SunaQ / Eboracum Research Gateway 0.8.6-rc1.1 - super-light installation profile
+SunaQ / Eboracum Research Gateway 0.8.6-rc1.2 - super-light installation profile
 ----------------------------------------------
 Install prefix:          $PREFIX
 Deployment mode:         dockerized
@@ -219,6 +240,7 @@ Reverse proxy:           $([[ $WITH_PROXY -eq 1 ]] && echo "bundled/start on ${P
 Nextcloud URL:           ${NEXTCLOUD_URL:-<required before start>}
 Elasticsearch URL:       ${ELASTICSEARCH_URL:-<required before start>}
 Elasticsearch index:     $ELASTICSEARCH_INDEX
+Capability preset:       ${PRESET_NAME:-core (Super-Light packaged default)}
 RAM target:              4 GiB practical minimum, 4-8 GiB recommended; Neo4j 256m pagecache / 512m max heap
 Private CA trust:        ${#CA_CERTIFICATES[@]} certificate(s) supplied on this run
 Python X.509 strict:      $([[ $X509_STRICT -eq 1 ]] && echo enabled || echo disabled-compatibility-mode)
@@ -372,6 +394,30 @@ compose() {
   fi
 }
 
+mail_worker_enabled_from_config() {
+  [[ -f "$PREFIX/config.yaml" ]] || return 1
+  awk '
+    /^mail:[[:space:]]*$/ { in_mail=1; next }
+    in_mail && /^[^[:space:]#]/ { exit }
+    in_mail && /^  enabled:[[:space:]]*/ {
+      value=$0
+      sub(/^  enabled:[[:space:]]*/, "", value)
+      sub(/[[:space:]]+#.*$/, "", value)
+      gsub(/[[:space:]"]/, "", value)
+      mail=(tolower(value) ~ /^(1|true|yes|on)$/)
+    }
+    in_mail && /^  worker:[[:space:]]*$/ { in_worker=1; next }
+    in_mail && in_worker && /^    enabled:[[:space:]]*/ {
+      value=$0
+      sub(/^    enabled:[[:space:]]*/, "", value)
+      sub(/[[:space:]]+#.*$/, "", value)
+      gsub(/[[:space:]"]/, "", value)
+      worker=(tolower(value) ~ /^(1|true|yes|on)$/)
+    }
+    END { exit !(mail && worker) }
+  ' "$PREFIX/config.yaml"
+}
+
 random_secret() { openssl rand -hex 32; }
 sed_repl() { printf '%s' "$1" | sed 's/[&|]/\\&/g'; }
 
@@ -437,6 +483,30 @@ fi
 if [[ ! -f "$PREFIX/config.yaml" ]]; then
   cp "$PREFIX/install/super-light/config.super-light.yaml" "$PREFIX/config.yaml"
 fi
+CONFIG_TX_DIR="$(mktemp -d "$PREFIX/runtime/.installer-config.XXXXXX")"
+cp -p "$PREFIX/config.yaml" "$CONFIG_TX_DIR/config.yaml"
+if [[ -f "$PREFIX/web.yaml" ]]; then
+  cp -p "$PREFIX/web.yaml" "$CONFIG_TX_DIR/web.yaml"
+else
+  : > "$CONFIG_TX_DIR/web.absent"
+fi
+CONFIG_TX_ACTIVE=1
+rollback_config_transaction() {
+  local rc=$?
+  set +e
+  if [[ "${CONFIG_TX_ACTIVE:-0}" -eq 1 && -d "${CONFIG_TX_DIR:-}" ]]; then
+    cp -p "$CONFIG_TX_DIR/config.yaml" "$PREFIX/config.yaml"
+    if [[ -f "$CONFIG_TX_DIR/web.yaml" ]]; then
+      cp -p "$CONFIG_TX_DIR/web.yaml" "$PREFIX/web.yaml"
+    elif [[ -f "$CONFIG_TX_DIR/web.absent" ]]; then
+      rm -f "$PREFIX/web.yaml"
+    fi
+    echo "Installer configuration validation failed; previous config.yaml/web.yaml restored." >&2
+  fi
+  rm -rf "${CONFIG_TX_DIR:-}"
+  exit "$rc"
+}
+trap rollback_config_transaction EXIT
 if [[ $X509_STRICT -eq 1 ]]; then
   sed -i "/^tls:/,/^[^[:space:]]/ s/^  x509_strict:.*/  x509_strict: true/" "$PREFIX/config.yaml"
 else
@@ -542,11 +612,13 @@ chown -R 10001:10001 "$PREFIX/runtime"
 chmod 700 "$PREFIX/runtime"
 chmod 600 "$PREFIX/runtime/credential-master.key"
 
+log "Synchronizing file-backed container secrets"
+bash "$PREFIX/install/sync-container-secrets.sh" "$PREFIX"
+
 cat > "$PREFIX/install/super-light/.env" <<ENV
 NEO4J_IMAGE=neo4j:5.26.29-community@sha256:d9dd3dc7d1c78fa959191ff02dbdcbefadceaf83eee23428fb92a58cac8ad3fe
 OPENWEBUI_IMAGE=ghcr.io/open-webui/open-webui:v0.11.4-slim@sha256:0487ad4a5a4b986062dedace806c3ef1e88fec38c10d1e64d6a5501c66671e5e
 NGINX_IMAGE=nginx:1.30.4-alpine3.24@sha256:97d490c12ba55b4946b01546d1c3ed324e8d41ab1c9fcb2a616aa470620e5b46
-NEO4J_PASSWORD=${NEO4J_PASSWORD}
 OPENWEBUI_PROVIDER_API_KEY=${PROVIDER_API_KEY}
 NEO4J_HTTP_PORT=7474
 NEO4J_BOLT_PORT=7687
@@ -642,18 +714,137 @@ EOFSSL
 fi
 
 
-# Generate the effective optional-service override. Keeping OpenWebUI/proxy out of
-# the base compose file is important on legacy Compose: a later plain
-# `docker-compose up` must not silently start optional heavy services.
+# Remove any stale generated override before one-off build/preset operations.
+# The final override is generated only after the resulting architecture/config
+# has been validated, so optional services follow the effective capabilities.
 OVERRIDE="$PREFIX/install/super-light/docker-compose.override.yml"
 rm -f "$OVERRIDE"
-if [[ $WITH_OPENWEBUI -eq 1 || $WITH_PROXY -eq 1 ]]; then
-  cat > "$OVERRIDE" <<'EOFOVR'
+
+if [[ $WITH_PLAYWRIGHT -eq 1 ]]; then
+  log "Preparing Playwright Chromium seccomp profile"
+  "$PREFIX/install/components/playwright-renderer/prepare.sh"
+fi
+
+cd "$PREFIX/install/super-light"
+if [[ $WITH_PLAYWRIGHT -eq 0 ]]; then
+  compose stop playwright-renderer >/dev/null 2>&1 || true
+  compose rm -f playwright-renderer >/dev/null 2>&1 || true
+fi
+log "Building super-light API/provider images"
+compose build api provider
+
+if [[ -n "$PRESET_FILE" ]]; then
+  log "Applying capability preset: ${PRESET_NAME:-custom}"
+  PRESET_STAGE="$PREFIX/runtime/install-preset.yaml"
+  PRESET_OUTPUT="$PREFIX/runtime/install-config.yaml"
+  cp "$PRESET_FILE" "$PRESET_STAGE"
+  chmod 0644 "$PRESET_STAGE"
+  rm -f "$PRESET_OUTPUT"
+  # config.yaml is deliberately mounted read-only in runtime containers. Apply
+  # the preset to a writable runtime staging file, then install it host-side.
+  compose run --rm --no-deps provider python -m rag.config_preset \
+    --config /app/config.yaml \
+    --preset /app/runtime/install-preset.yaml \
+    --output /app/runtime/install-config.yaml
+  [[ -s "$PRESET_OUTPUT" ]] || {
+    echo "Preset application did not produce a staged configuration: $PRESET_OUTPUT" >&2
+    exit 2
+  }
+  cp "$PRESET_OUTPUT" "$PREFIX/config.yaml"
+  rm -f "$PRESET_STAGE" "$PRESET_OUTPUT"
+
+  # Explicit installer arguments remain authoritative over preset values.
+  if [[ $X509_STRICT_EXPLICIT -eq 1 ]]; then
+    if [[ $X509_STRICT -eq 1 ]]; then
+      sed -i "/^tls:/,/^[^[:space:]]/ s/^  x509_strict:.*/  x509_strict: true/" "$PREFIX/config.yaml"
+    else
+      sed -i "/^tls:/,/^[^[:space:]]/ s/^  x509_strict:.*/  x509_strict: false/" "$PREFIX/config.yaml"
+    fi
+  fi
+  if [[ -n "$NEXTCLOUD_URL" ]]; then
+    esc="$(sed_repl "${NEXTCLOUD_URL%/}")"
+    sed -i "/^nextcloud:/,/^[^[:space:]]/ s|^  base_url:.*|  base_url: ${esc}/|" "$PREFIX/config.yaml"
+  fi
+  if [[ -n "$NEXTCLOUD_CA_FILE" ]]; then
+    esc="$(sed_repl "$NEXTCLOUD_CA_FILE")"
+    sed -i "/^nextcloud:/,/^[^[:space:]]/ s|^  verify_tls:.*|  verify_tls: true|" "$PREFIX/config.yaml"
+    sed -i "/^nextcloud:/,/^[^[:space:]]/ s|^  ca_file:.*|  ca_file: ${esc}|" "$PREFIX/config.yaml"
+  fi
+  if [[ -n "$ELASTICSEARCH_URL" ]]; then
+    esc="$(sed_repl "${ELASTICSEARCH_URL%/}")"
+    sed -i "/^elasticsearch:/,/^[^[:space:]]/ s|^  url:.*|  url: ${esc}|" "$PREFIX/config.yaml"
+  fi
+  if [[ $ELASTICSEARCH_INDEX_EXPLICIT -eq 1 ]]; then
+    idx="$(sed_repl "$ELASTICSEARCH_INDEX")"
+    sed -i "/^elasticsearch:/,/^[^[:space:]]/ s|^  index:.*|  index: ${idx}|" "$PREFIX/config.yaml"
+  fi
+fi
+
+log "Validating final SRC/ERG architecture configuration"
+# This is a pure config/policy check and does not require Compose orchestration.
+# In particular, avoid a second one-off `docker-compose run`: legacy
+# docker-compose 1.25.x can crash while reconciling one-off containers/orphans
+# after a rerun changed the service set (for example when disabling Playwright).
+SUNAQ_RUNTIME_IMAGE="$(
+  awk '/^[[:space:]]*image:[[:space:]]+sunaq:/{print $2; exit}' \
+    "$PREFIX/install/super-light/docker-compose.yml"
+)"
+[[ -n "$SUNAQ_RUNTIME_IMAGE" ]] || {
+  echo "Could not determine SunaQ runtime image for final configuration validation." >&2
+  exit 2
+}
+if ! docker run --rm \
+  -v "$PREFIX/config.yaml:/app/config.yaml:ro" \
+  "$SUNAQ_RUNTIME_IMAGE" \
+  python -m rag.config_preset --config /app/config.yaml --validate-only; then
+  exit 2
+fi
+
+# Generate the effective optional-service override from the validated final
+# configuration. Core/SRC therefore has no Mail worker service at all, while
+# ERG can expose it only when mail and its worker are explicitly enabled.
+MAIL_WORKER_ACTIVE=0
+mail_worker_enabled_from_config && MAIL_WORKER_ACTIVE=1
+
+OVERRIDE_TMP="$OVERRIDE.tmp"
+rm -f "$OVERRIDE_TMP"
+if [[ $WITH_PLAYWRIGHT -eq 1 || $WITH_OPENWEBUI -eq 1 || $WITH_PROXY -eq 1 || $MAIL_WORKER_ACTIVE -eq 1 ]]; then
+  cat > "$OVERRIDE_TMP" <<'EOFOVR'
 version: "2.4"
 services:
 EOFOVR
+  if [[ $WITH_PLAYWRIGHT -eq 1 ]]; then
+    cat >> "$OVERRIDE_TMP" <<'EOFOVR'
+  playwright-renderer:
+    build:
+      context: ../components/playwright-renderer
+    image: rag-playwright-renderer:0.2.3
+    restart: unless-stopped
+    init: true
+    ipc: host
+    ports:
+      - "127.0.0.1:${PLAYWRIGHT_PORT:-8090}:8080"
+    environment:
+      RENDER_NAV_TIMEOUT_MS: "30000"
+      RENDER_POSTLOAD_WAIT_MS: "750"
+      RENDER_MAX_PDF_BYTES: "52428800"
+      RENDER_ALLOWED_PORTS: "80,443"
+      RENDER_MAX_CONCURRENCY: "1"
+      RENDER_STATE_DIR: "/state"
+    volumes:
+      - playwright_state:/state
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,mode=1777
+      - /home/ragpw:size=256m,uid=10001,gid=10001,mode=0700
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+      - "seccomp=${PLAYWRIGHT_SECCOMP_PROFILE:-unconfined}"
+EOFOVR
+  fi
   if [[ $WITH_OPENWEBUI -eq 1 ]]; then
-    cat >> "$OVERRIDE" <<'EOFOVR'
+    cat >> "$OVERRIDE_TMP" <<'EOFOVR'
   openwebui:
     image: ${OPENWEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.11.4-slim@sha256:0487ad4a5a4b986062dedace806c3ef1e88fec38c10d1e64d6a5501c66671e5e}
     restart: unless-stopped
@@ -677,7 +868,7 @@ EOFOVR
 EOFOVR
   fi
   if [[ $WITH_PROXY -eq 1 ]]; then
-    cat >> "$OVERRIDE" <<'EOFOVR'
+    cat >> "$OVERRIDE_TMP" <<'EOFOVR'
   proxy:
     image: ${NGINX_IMAGE:-nginx:1.30.4-alpine3.24@sha256:97d490c12ba55b4946b01546d1c3ed324e8d41ab1c9fcb2a616aa470620e5b46}
     restart: unless-stopped
@@ -691,26 +882,39 @@ EOFOVR
       - provider
 EOFOVR
   fi
-  if [[ $WITH_OPENWEBUI -eq 1 ]]; then
-    cat >> "$OVERRIDE" <<'EOFOVR'
-volumes:
-  openwebui_data:
+  if [[ $MAIL_WORKER_ACTIVE -eq 1 ]]; then
+    cat >> "$OVERRIDE_TMP" <<'EOFOVR'
+  mail-worker:
+    image: sunaq:0.8.6-rc1.2
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ../../runtime.container.env
+    command: ["python", "-m", "rag.mail_worker", "--config", "/app/config.yaml"]
+    volumes:
+      - ../../config.yaml:/app/config.yaml:ro
+      - ../../web.yaml:/app/web.yaml:ro
+      - ../../runtime:/app/runtime
+      - ../../runtime/service-secrets:/run/sunaq-secrets:ro
+    depends_on:
+      - api
 EOFOVR
   fi
+  if [[ $WITH_PLAYWRIGHT -eq 1 || $WITH_OPENWEBUI -eq 1 ]]; then
+    cat >> "$OVERRIDE_TMP" <<'EOFOVR'
+volumes:
+EOFOVR
+    [[ $WITH_PLAYWRIGHT -eq 1 ]] && echo "  playwright_state:" >> "$OVERRIDE_TMP"
+    [[ $WITH_OPENWEBUI -eq 1 ]] && echo "  openwebui_data:" >> "$OVERRIDE_TMP"
+  fi
+  mv "$OVERRIDE_TMP" "$OVERRIDE"
+else
+  rm -f "$OVERRIDE"
 fi
+CONFIG_TX_ACTIVE=0
+rm -rf "$CONFIG_TX_DIR"
+trap - EXIT
 
-if [[ $WITH_PLAYWRIGHT -eq 1 ]]; then
-  log "Preparing Playwright Chromium seccomp profile"
-  "$PREFIX/install/components/playwright-renderer/prepare.sh"
-fi
-
-cd "$PREFIX/install/super-light"
-if [[ $WITH_PLAYWRIGHT -eq 0 ]]; then
-  compose stop playwright-renderer >/dev/null 2>&1 || true
-  compose rm -f playwright-renderer >/dev/null 2>&1 || true
-fi
-log "Building super-light API/provider images"
-compose build api provider
 if [[ $WITH_PLAYWRIGHT -eq 1 ]]; then
   log "Building Playwright renderer image"
   compose build playwright-renderer
@@ -719,9 +923,9 @@ fi
 
 log "Registering default trusted provider client"
 compose run --rm --no-deps provider python - <<'PYCLIENT'
-import os
 from rag.credential_store import CredentialStore
-key = os.environ.get("PROVIDER_API_KEY", "").strip()
+from rag.secret_env import secret_env
+key = secret_env("PROVIDER_API_KEY", "").strip()
 if len(key) < 24:
     raise SystemExit("PROVIDER_API_KEY missing/too short")
 store = CredentialStore("runtime/users.sqlite")
@@ -779,20 +983,62 @@ Generated credentials (store them now; both are also in $PREFIX/runtime.env):
   Admin password:   ${ADMIN_PASSWORD}
   Provider API key: ${PROVIDER_API_KEY}
 
-Before real use, configure the external model/provider credentials in:
-  $PREFIX/runtime.env      # e.g. LLM_API_KEY, WEB_SEARCH_API_KEY when used
-and review:
-  $PREFIX/provider.env     # model/backend selection
+Before real use:
+  Configure LLM backend/model routing in:
+    $PREFIX/provider.env
+  Keep LLM/API credentials and other secrets in:
+    $PREFIX/runtime.env
+
+  Answer and retrieval quality depend materially on the selected LLMs and
+  available compute. Undersized local models can make incorrect relevance,
+  entity-resolution or evidence decisions. Validate the selected models on
+  representative queries and documents before production use.
+
+  LLM_API_KEY is the default LLM credential. Optional role-specific keys
+  (PLANNER_LLM_API_KEY, VERIFIER_LLM_API_KEY, EVIDENCE_LLM_API_KEY,
+  ANSWER_LLM_API_KEY) override it only when set; otherwise the role falls
+  back to LLM_API_KEY.
+
+  On an installed Dockerized system, changes to provider.env or runtime.env
+  require environment rematerialization and container recreation. Do not use
+  docker-compose restart for these changes; use maintenance-mode.sh on followed
+  by maintenance-mode.sh off.
+
+Review infrastructure/security settings in:
   $PREFIX/config.yaml
+and optional Web Research settings only when enabled:
   $PREFIX/web.yaml
+
+If the bundled reverse proxy is enabled, replace the generated bootstrap TLS
+credentials with the server certificate and private key for this host:
+  $PREFIX/install/nginx/tls/server.crt
+  $PREFIX/install/nginx/tls/server.key
+Then restart the proxy service from $PREFIX/install/super-light with the Compose
+command available on the host (docker compose restart proxy or
+docker-compose restart proxy).
+
+If you intend to use the SunaQ Nextcloud app, copy:
+  $PREFIX/clients/nextcloud/sunaq
+to the appropriate Nextcloud app directory (usually <nextcloud-root>/apps/sunaq),
+then enable it from the Nextcloud root as the web-server user:
+  sudo -u <web-user> php occ app:enable sunaq
+
+In Nextcloud, open Settings -> Administration -> Additional settings and enter:
+  SunaQ URL:  the public SunaQ base URL (without /v1)
+  API-Key:    the Provider API key generated by this installer
+
+If you use OpenWebUI or another OpenAI-compatible client, configure SunaQ as an
+additional provider using the SunaQ /v1 endpoint and a Trusted Client API key.
+Make sure the client forwards a stable user identity in the supported header
+(for example X-OpenWebUI-User-Id for OpenWebUI). See the trusted-client and
+alternative-frontend sections in docs/TECHNICAL-REFERENCE.md for details.
 
 After configuration/verification, leave maintenance mode and start the normal stack:
   sudo $PREFIX/install/maintenance-mode.sh off
 
-Contact seeds:
-  Per-user CardDAV seeds are managed under RAG Admin -> Users -> Kontakt-DB
-  and use the Nextcloud credential already stored by the Login Flow. CLI:
-  $PREFIX/install/super-light/contacts.sh sync --user NEXTCLOUD_LOGIN
-  Missing credentials or contacts are a clean no-op. The legacy global
-  NEXTCLOUD_USERNAME/NEXTCLOUD_APP_PASSWORD path is compatibility-only.
+Then run the bundled smoke test:
+  sudo $PREFIX/install/smoke-test.sh $PREFIX
+
+For a Super-Light service overview, you can also run:
+  $PREFIX/install/super-light/status-super-light.sh
 DONE

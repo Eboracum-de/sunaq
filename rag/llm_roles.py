@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from rag.llm_backend import LLMBackend, build_llm_backend
+from rag.secret_env import secret_env
 
 
 ROLES = ("default", "planner", "verifier", "evidence", "answer")
@@ -90,6 +91,7 @@ def build_role_backends(
     default_ca_file: str | None,
     models: dict[str, str] | None = None,
     role_overrides: dict[str, dict[str, Any]] | None = None,
+    private_network_only: bool = False,
 ) -> dict[str, RoleBackend]:
     """Build immutable role backends for one SunaQ runtime model.
 
@@ -123,12 +125,9 @@ def build_role_backends(
                 str(os.getenv(f"{prefix}_LLM_BASE_URL", "") or "").strip().rstrip("/")
                 or default_base_url
             )
-            api_key_env_value = os.getenv(f"{prefix}_LLM_API_KEY")
-            api_key = (
-                default_api_key
-                if api_key_env_value is None or api_key_env_value == ""
-                else api_key_env_value
-            )
+            api_key_name = f"{prefix}_LLM_API_KEY"
+            api_key_env_value = secret_env(api_key_name, "")
+            api_key = default_api_key if not api_key_env_value else api_key_env_value
             verify_raw = os.getenv(f"{prefix}_LLM_VERIFY_TLS")
             verify_tls = (
                 default_verify_tls
@@ -174,13 +173,20 @@ def build_role_backends(
                 ca_file = str(override.get("ca_file") or "").strip() or None
             key_env = str(override.get("api_key_env") or "").strip()
             if key_env:
-                api_key = str(os.getenv(key_env, "") or "")
+                api_key = secret_env(key_env, "")
             if "scope" in override:
                 scope_override = str(override.get("scope") or "").strip().lower()
 
         if scope_override and scope_override not in {"local", "remote"}:
             raise RuntimeError(f"{prefix}_LLM_SCOPE must be 'local' or 'remote'")
         scope = scope_override or _scope_for_url(base_url)
+
+        # SRC may deliberately route a role to a remote LLM. The architecture
+        # tier therefore cannot itself mean "private network only" for every
+        # backend. Keep the stricter network pinning for roles classified as
+        # local, while allowing administrator-selected remote roles to reach
+        # their configured public endpoint.
+        enforce_private_network = private_network_only and scope == "local"
         backend = build_llm_backend(
             backend_name,
             base_url=base_url,
@@ -188,6 +194,8 @@ def build_role_backends(
             api_key=api_key,
             verify_tls=verify_tls,
             ca_file=ca_file,
+            private_network_only=enforce_private_network,
+            trust_env=not enforce_private_network,
         )
         result[role] = RoleBackend(
             role=role,

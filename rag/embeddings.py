@@ -16,6 +16,8 @@ import ssl
 from dataclasses import dataclass
 from typing import Any
 
+from rag.secret_env import secret_env
+
 import httpx
 
 from rag.policy_hooks import PRE_MODEL_EGRESS, apply_policy_hook
@@ -333,7 +335,7 @@ def build_embedding_backend_from_config(config: dict[str, Any]) -> EmbeddingBack
     profile = requested_profile or ("custom" if (document_prefix or query_prefix) else "plain")
 
     env_name = str(section.get("api_key_env") or "").strip()
-    api_key = os.getenv(env_name, "") if env_name else str(section.get("api_key") or "")
+    api_key = secret_env(env_name, "") if env_name else str(section.get("api_key") or "")
     verify_tls = bool(section.get("verify_tls", True))
     ca_file = str(section.get("ca_file") or "").strip() or None
     timeout = float(section.get("timeout", 300.0))

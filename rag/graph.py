@@ -48,6 +48,8 @@ from rag.research_findings import (
 from urllib.parse import unquote, urlparse
 
 import yaml
+
+from rag.secret_env import secret_env
 try:
     from neo4j import GraphDatabase
 except ImportError:  # optional when Neo4j is disabled in a lite deployment
@@ -99,7 +101,7 @@ def cfg_get(cfg: dict[str, Any], *paths: str, default=None):
 def env_or_value(cfg: dict[str, Any], value_path: str, env_path: str, *, default: str = "") -> str:
     env_name = str(cfg_get(cfg, env_path, default="") or "").strip()
     if env_name:
-        value = os.getenv(env_name, "")
+        value = secret_env(env_name, "")
         if value:
             return value
     return str(cfg_get(cfg, value_path, default=default) or default)

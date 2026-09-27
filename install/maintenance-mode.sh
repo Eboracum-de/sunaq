@@ -43,6 +43,13 @@ elif [[ -f "$BASE_DIR/.sunaq-installation" || -f "$BASE_DIR/.aki-rag-installatio
   [[ "$value" == "dockerized" || "$value" == "native" ]] && deployment_mode="$value"
 fi
 
+sync_container_secrets() {
+  # Both deployment modes consume generated secret state in rc1.2:
+  # Docker uses runtime.container.env + mounted files, native launchers source
+  # runtime.service.env. Refresh before every service transition/rotation.
+  bash "$BASE_DIR/install/sync-container-secrets.sh" "$BASE_DIR" >/dev/null
+}
+
 compose() {
   (
     cd "$BASE_DIR/install/super-light"
@@ -70,6 +77,7 @@ native_require_root() {
 
 enable_native() {
   native_require_root
+  sync_container_secrets
   if native_systemd_available; then
     systemctl stop rag-api rag-graph-worker rag-sync-worker rag-mail-worker 2>/dev/null || true
     systemctl restart rag-provider
@@ -81,6 +89,7 @@ enable_native() {
 
 disable_native() {
   native_require_root
+  sync_container_secrets
   if native_systemd_available; then
     systemctl start rag-api
     systemctl restart rag-provider
@@ -128,11 +137,20 @@ mail_worker_enabled() {
 }
 
 enable_dockerized() {
-  compose stop api mail-worker playwright-renderer >/dev/null 2>&1 || true
+  sync_container_secrets
+  local services=(api)
+  if mail_worker_enabled; then
+    services+=(mail-worker)
+  fi
+  if state_enabled LOCAL_PLAYWRIGHT; then
+    services+=(playwright-renderer)
+  fi
+  compose stop "${services[@]}" >/dev/null 2>&1 || true
   compose up -d --no-deps --force-recreate provider
 }
 
 disable_dockerized() {
+  sync_container_secrets
   local services=(neo4j api)
   if state_enabled LOCAL_PLAYWRIGHT; then
     services=(neo4j playwright-renderer api)

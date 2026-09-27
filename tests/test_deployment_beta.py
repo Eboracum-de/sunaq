@@ -247,7 +247,7 @@ def test_docker_and_ml_beta_dependencies_are_pinned():
         if "build" not in cfg["services"][name]
     ]
     assert all("@sha256:" in image for image in external_images)
-    assert images["playwright-renderer"] == "rag-playwright-renderer:0.2.2"
+    assert images["playwright-renderer"] == "rag-playwright-renderer:0.2.3"
     renderer_dockerfile = (ROOT / "install/components/playwright-renderer/Dockerfile").read_text()
     assert "PIP_ROOT_USER_ACTION=ignore" in renderer_dockerfile
     assert "PIP_DISABLE_PIP_VERSION_CHECK=1" in renderer_dockerfile
@@ -329,6 +329,7 @@ def test_runtime_does_not_start_mail_worker_when_feature_is_disabled():
     assert 'if [[ "$mail_enabled" == "1" ]]' in start
     assert 'skipped (mail feature/worker disabled)' in start
     assert 'if systemctl is-enabled rag-mail-worker' in maintenance
+    assert 'if mail_worker_enabled; then' in maintenance
     assert 'compose up -d neo4j playwright-renderer api mail-worker' not in maintenance
     assert 'MAIL_WORKER_ENABLED=' in standard
     assert 'systemctl disable rag-mail-worker' in standard
@@ -458,8 +459,47 @@ def test_periodic_sync_worker_wraps_existing_rag_sync():
 
 
 
+
+def test_super_light_core_services_use_generated_non_secret_env_only():
+    cfg = yaml.safe_load((ROOT / "install/super-light/docker-compose.yml").read_text())
+    for name in ("api", "provider"):
+        assert cfg["services"][name]["env_file"] == ["../../runtime.container.env"]
+    assert "mail-worker" not in cfg["services"]
+    installer = (ROOT / "install/profiles/install-super-light.sh").read_text()
+    assert '  mail-worker:' in installer
+    assert 'MAIL_WORKER_ACTIVE' in installer
+    sync = (ROOT / "install/sync-container-secrets.sh").read_text()
+    assert "RAG_PROVIDER_INTERNAL_KEY" in sync
+    assert "*_API_KEY|*_KEY|*_PASSWORD|*_TOKEN|*_SECRET|*_CREDENTIALS|*_AUTH_CONFIG" in sync
+    assert "is_runtime_non_secret_key" in sync
+    assert '[[ "$file" == "$RUNTIME_ENV" ]] && ! is_runtime_non_secret_key "$key"' in sync
+    assert "runtime.container.env" in sync
+    assert "service-secrets" in sync
+    loader = (ROOT / "install/load-service-env.sh").read_text()
+    assert "runtime.service.env" in loader
+    assert "WARNING: runtime.service.env missing" in loader
+
+
+def test_final_architecture_validation_runs_after_installer_overrides():
+    standard = _standard_installer_text()
+    super_light = (ROOT / "install/profiles/install-super-light.sh").read_text()
+    for installer in (standard, super_light):
+        assert "--validate-only" in installer
+        assert 'Validating final SRC/ERG architecture configuration' in installer
+    assert "X509_STRICT_EXPLICIT=1" in standard
+    assert "X509_STRICT_EXPLICIT=1" in super_light
+    assert "ELASTICSEARCH_INDEX_EXPLICIT=1" in super_light
+
+
+def test_rc_line_documents_destructive_erg_to_src_graph_reset():
+    graph = (ROOT / "rag/graph.py").read_text()
+    docs = (ROOT / "docs/SRC-ERG.md").read_text()
+    assert 'sub.add_parser("reset"' in graph
+    assert 'MATCH (n) DETACH DELETE n' in graph
+    assert "--yes-really-delete-all" in docs
+
 def test_release_repository_hygiene():
-    assert (ROOT / "rag/version.py").read_text().strip() == 'VERSION = "0.8.6-rc1.1"'
+    assert (ROOT / "rag/version.py").read_text().strip() == 'VERSION = "0.8.6-rc1.2"'
     assert not (ROOT / "provider.env").exists()
     assert "provider.env" in (ROOT / ".gitignore").read_text().splitlines()
     assert (ROOT / "CHANGELOG.md").exists()
@@ -726,3 +766,138 @@ def test_standard_runtime_internal_keys_replace_placeholders():
     assert '[[ -n "$current" && "$current" != "replace-me" ]]' in installer
     assert '[[ -n "$RAG_INTERNAL_API_KEY" && "$RAG_INTERNAL_API_KEY" != "replace-me" ]]' in installer
     assert '[[ -n "$RAG_PROVIDER_INTERNAL_KEY" && "$RAG_PROVIDER_INTERNAL_KEY" != "replace-me" ]]' in installer
+
+
+
+def test_native_maintenance_refreshes_generated_secret_environment():
+    helper = (ROOT / "install/maintenance-mode.sh").read_text()
+    enable = helper.split("enable_native() {", 1)[1].split("disable_native() {", 1)[0]
+    disable = helper.split("disable_native() {", 1)[1].split("state_enabled() {", 1)[0]
+    assert "sync_container_secrets" in enable
+    assert "sync_container_secrets" in disable
+    assert "runtime.service.env" in (ROOT / "install/load-service-env.sh").read_text()
+
+
+def test_installer_config_changes_are_rollback_protected_until_validation():
+    standard = _standard_installer_text()
+    super_light = (ROOT / "install/profiles/install-super-light.sh").read_text()
+    for installer in (standard, super_light):
+        assert 'CONFIG_TX_ACTIVE=1' in installer
+        assert 'trap rollback_config_transaction EXIT' in installer
+        assert 'previous config.yaml/web.yaml restored' in installer
+        validation = installer.index("Validating final SRC/ERG architecture configuration")
+        commit = installer.index("CONFIG_TX_ACTIVE=0", validation)
+        assert validation < commit
+
+
+
+def test_super_light_preset_uses_writable_runtime_staging_not_readonly_config():
+    installer = (ROOT / "install/profiles/install-super-light.sh").read_text()
+    compose = yaml.safe_load((ROOT / "install/super-light/docker-compose.yml").read_text())
+    provider_mounts = compose["services"]["provider"]["volumes"]
+    assert "../../config.yaml:/app/config.yaml:ro" in provider_mounts
+    assert "--output /app/runtime/install-config.yaml" in installer
+    assert 'cp "$PRESET_OUTPUT" "$PREFIX/config.yaml"' in installer
+    preset_block = installer.split('log "Applying capability preset:', 1)[1].split(
+        '# Explicit installer arguments remain authoritative', 1
+    )[0]
+    assert "--config /app/config.yaml" in preset_block
+    assert "--preset /app/runtime/install-preset.yaml" in preset_block
+    assert "--output /app/runtime/install-config.yaml" in preset_block
+
+
+
+def test_runtime_templates_document_role_llm_key_fallbacks_without_legacy_single_user_credentials():
+    for path in (
+        ROOT / "install/runtime.env.example",
+        ROOT / "install/super-light/runtime.env.super-light.example",
+    ):
+        text = path.read_text()
+        for key in (
+            "LLM_API_KEY=",
+            "PLANNER_LLM_API_KEY=",
+            "VERIFIER_LLM_API_KEY=",
+            "EVIDENCE_LLM_API_KEY=",
+            "ANSWER_LLM_API_KEY=",
+        ):
+            assert key in text
+        assert "falls back to LLM_API_KEY" in text
+        assert "NEXTCLOUD_USERNAME=" not in text
+        assert "NEXTCLOUD_APP_PASSWORD=" not in text
+
+
+def test_super_light_completion_message_separates_provider_routing_and_secrets():
+    installer = (ROOT / "install/profiles/install-super-light.sh").read_text()
+    assert "Configure LLM backend/model routing in:" in installer
+    assert "$PREFIX/provider.env" in installer
+    assert "Keep LLM/API credentials and other secrets in:" in installer
+    assert "$PREFIX/runtime.env" in installer
+    assert "otherwise the role falls" in installer
+    assert "back to LLM_API_KEY." in installer
+    assert "Contact seeds:" not in installer
+
+
+def test_provider_templates_do_not_duplicate_llm_api_secret():
+    for path in (
+        ROOT / "provider.env.example",
+        ROOT / "install/super-light/provider.env.super-light.example",
+    ):
+        lines = path.read_text().splitlines()
+        assert "LLM_API_KEY=" not in lines
+        assert any("runtime.env" in line and "LLM_API_KEY" in line for line in lines)
+
+
+
+def test_super_light_completion_mentions_reverse_proxy_tls_replacement():
+    installer = (ROOT / "install/profiles/install-super-light.sh").read_text()
+    assert "$PREFIX/install/nginx/tls/server.crt" in installer
+    assert "$PREFIX/install/nginx/tls/server.key" in installer
+    assert "docker compose restart proxy" in installer
+    assert "docker-compose restart proxy" in installer
+
+
+
+def test_smoke_test_requires_configured_llm_roles_to_be_healthy():
+    smoke = (ROOT / "install/smoke-test.sh").read_text()
+    assert ".llm.status" in smoke
+    assert 'ok "LLM roles reachable"' in smoke
+    assert 'bad "LLM roles not fully reachable' in smoke
+    assert ".llm.roles" in smoke
+    assert ".maintenance // false" in smoke
+    assert "LLM role health deferred while provider is in maintenance mode." in smoke
+
+
+
+def test_super_light_playwright_is_not_in_base_compose_and_is_generated_only_when_selected():
+    cfg = yaml.safe_load((ROOT / "install/super-light/docker-compose.yml").read_text())
+    assert "playwright-renderer" not in cfg["services"]
+    assert "playwright_state" not in (cfg.get("volumes") or {})
+
+    installer = (ROOT / "install/profiles/install-super-light.sh").read_text()
+    assert 'if [[ $WITH_PLAYWRIGHT -eq 1 || $WITH_OPENWEBUI -eq 1 || $WITH_PROXY -eq 1 || $MAIL_WORKER_ACTIVE -eq 1 ]]; then' in installer
+    assert "  playwright-renderer:" in installer
+    assert "  playwright_state:" in installer
+
+
+
+def test_super_light_final_architecture_validation_does_not_require_compose_run():
+    installer = (ROOT / "install/profiles/install-super-light.sh").read_text()
+    marker = 'log "Validating final SRC/ERG architecture configuration"'
+    block = installer.split(marker, 1)[1].split('CONFIG_TX_ACTIVE=0', 1)[0]
+    assert "docker run --rm" in block
+    assert "python -m rag.config_preset --config /app/config.yaml --validate-only" in block
+    assert "compose run --rm --no-deps provider" not in block
+    assert "SUNAQ_RUNTIME_IMAGE" in block
+
+
+
+def test_super_light_mail_worker_is_generated_only_from_final_enabled_config():
+    installer = (ROOT / "install/profiles/install-super-light.sh").read_text()
+    base = yaml.safe_load((ROOT / "install/super-light/docker-compose.yml").read_text())
+    assert "mail-worker" not in base["services"]
+    assert "mail_worker_enabled_from_config" in installer
+    assert "MAIL_WORKER_ACTIVE=0" in installer
+    assert "mail_worker_enabled_from_config && MAIL_WORKER_ACTIVE=1" in installer
+    validation = installer.index('log "Validating final SRC/ERG architecture configuration"')
+    mail_override = installer.index('  mail-worker:')
+    assert validation < mail_override

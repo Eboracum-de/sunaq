@@ -33,6 +33,8 @@ import httpx
 from rapidfuzz import fuzz
 
 from rag.llm_backend import build_llm_backend
+from rag.evidence_boundary import guarded_evidence_prompt, serialize_evidence_records
+from rag.secret_env import secret_env
 from rag.logging_utils import get_logger
 from rag.mail_metadata import MailMetadataReader, message_key, reply_parent_id, representation_role
 from rag.ontology import load_relation_ontology, ontology_prompt, relation_schema, validate_relation_semantics
@@ -763,8 +765,8 @@ class GraphEvidenceIndexer:
         )
         discovery_api_key_env = str(cfg_get(cfg, "graph_entity_discovery.api_key_env", default="") or "").strip()
         discovery_api_key = (
-            os.getenv(discovery_api_key_env, "") if discovery_api_key_env
-            else os.getenv("GRAPH_ENTITY_API_KEY") or os.getenv("LLM_API_KEY") or ""
+            secret_env(discovery_api_key_env, "") if discovery_api_key_env
+            else secret_env("GRAPH_ENTITY_API_KEY", "") or secret_env("LLM_API_KEY", "")
         )
         self.discovery_api_key = discovery_api_key
         self.discovery_verify_tls = bool(cfg_get(cfg, "graph_entity_discovery.verify_tls", default=True))
@@ -834,8 +836,8 @@ class GraphEvidenceIndexer:
         )
         relation_api_key_env = str(cfg_get(cfg, "graph_relation_discovery.api_key_env", default="") or "").strip()
         relation_api_key = (
-            os.getenv(relation_api_key_env, "") if relation_api_key_env
-            else os.getenv("GRAPH_RELATION_API_KEY") or self.discovery_api_key or os.getenv("LLM_API_KEY") or ""
+            secret_env(relation_api_key_env, "") if relation_api_key_env
+            else secret_env("GRAPH_RELATION_API_KEY", "") or self.discovery_api_key or secret_env("LLM_API_KEY", "")
         )
         relation_verify_tls = bool(cfg_get(cfg, "graph_relation_discovery.verify_tls", default=self.discovery_verify_tls))
         relation_ca_file = str(cfg_get(cfg, "graph_relation_discovery.ca_file", default=self.discovery_ca_file or "") or "").strip() or None
@@ -979,14 +981,18 @@ class GraphEvidenceIndexer:
         return hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
 
     def _llm_entity_extract(self, chunk: str, *, title: str = "") -> dict[str, Any]:
+        evidence = serialize_evidence_records(
+            [{"title": title or "(ohne Titel)", "text": str(chunk or "")}],
+            kind="graph_entity_extract",
+        )
         user = (
-            f"DOKUMENT: {title or '(ohne Titel)'}\n\n"
-            "AUSSCHNITT:\n"
-            f"{chunk}\n\n"
-            "Extrahiere nur die im Ausschnitt ausdrücklich genannten Personen und Organisationen."
+            "EVIDENCE_JSON:\n"
+            + evidence
+            + "\n\nExtrahiere nur die in diesem Evidence-Record ausdrücklich "
+            "genannten Personen und Organisationen."
         )
         messages = [
-            {"role": "system", "content": self.discovery_prompt},
+            {"role": "system", "content": guarded_evidence_prompt(self.discovery_prompt)},
             {"role": "user", "content": user},
         ]
 
@@ -1321,22 +1327,26 @@ class GraphEvidenceIndexer:
         title: str,
         allowed_entities: list[dict[str, str]],
     ) -> dict[str, Any]:
-        entity_lines = "\n".join(
-            f"- {item['entity_id']} | type={item.get('entity_type','')} | kind={item.get('entity_kind','')} | {item.get('display_name','')}"
-            for item in allowed_entities
+        evidence = serialize_evidence_records(
+            [
+                {
+                    "title": title or "(ohne Titel)",
+                    "text": str(chunk or ""),
+                    "allowed_entities": list(allowed_entities),
+                }
+            ],
+            kind="graph_relation_extract",
         )
         user = (
-            f"DOKUMENT: {title or '(ohne Titel)'}\n\n"
-            f"{self.relation_ontology_prompt}\n\n"
-            "ERLAUBTE ENTITIES (nur diese IDs verwenden):\n"
-            f"{entity_lines}\n\n"
-            "AUSSCHNITT:\n"
-            f"{chunk}\n\n"
+            f"VERTRAUENSWÜRDIGE RELATIONS-ONTOLOGIE:\n{self.relation_ontology_prompt}\n\n"
+            "EVIDENCE_JSON:\n"
+            + evidence
+            + "\n\nVerwende nur entity_id-Werte aus allowed_entities. "
             "Extrahiere nur explizit durch relation_text und evidence_text belegte Beziehungen. "
             "Wenn keine Ontologie-Relation explizit passt, liefere eine leere relations-Liste."
         )
         messages = [
-            {"role": "system", "content": self.relation_prompt},
+            {"role": "system", "content": guarded_evidence_prompt(self.relation_prompt)},
             {"role": "user", "content": user},
         ]
 
@@ -1426,18 +1436,26 @@ class GraphEvidenceIndexer:
                 + "\n\n[ENDE DES DOKUMENTS]\n" + full_text[-tail_n:]
             )
             text_truncated = True
-        helper = {
-            "known_entities": known_entities[:40],
-            "known_relations": known_relations[:30],
-            "text_truncated": text_truncated,
-        }
+        evidence = serialize_evidence_records(
+            [
+                {
+                    "title": title or "(ohne Titel)",
+                    "text": excerpt,
+                    "known_entities": known_entities[:40],
+                    "known_relations": known_relations[:30],
+                    "text_truncated": text_truncated,
+                }
+            ],
+            kind="graph_document_summary",
+        )
         user = (
-            f"DOKUMENT: {title or '(ohne Titel)'}\n\n"
-            f"BEREITS ERKANNTE STRUKTUR (nur Hilfsinformation):\n{json.dumps(helper, ensure_ascii=False)}\n\n"
-            f"DOKUMENTTEXT:\n{excerpt}"
+            "EVIDENCE_JSON:\n"
+            + evidence
+            + "\n\nFasse ausschließlich die im Evidence-Record belegten Inhalte "
+            "gemäß dem vorgegebenen Schema zusammen."
         )
         messages = [
-            {"role": "system", "content": self.summary_prompt},
+            {"role": "system", "content": guarded_evidence_prompt(self.summary_prompt)},
             {"role": "user", "content": user},
         ]
 

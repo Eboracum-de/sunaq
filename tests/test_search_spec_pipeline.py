@@ -143,6 +143,55 @@ def test_query_rewriter_accepts_llm_authored_elastic_query_and_analysis_metadata
     assert "ExampleHost GmbH" in captured["messages"][1]["content"]
 
 
+def test_followup_rewrite_restores_explicit_user_phrase(monkeypatch):
+    async def fake_complete(*args, **kwargs):
+        return json.dumps({
+            "use_history": True,
+            "standalone_query": "+Project +Alpha +42 Vertrag",
+        })
+
+    monkeypatch.setattr(provider, "_ollama_complete", fake_complete)
+    monkeypatch.setattr(provider, "QUERY_REWRITE_MODE", "followup")
+    current = 'Und was ist mit (+"Project Alpha 42")?'
+    rewritten, used_history = asyncio.run(provider._rewrite_query_with_context(
+        [
+            {"role": "user", "content": "Vorheriger Kontext"},
+            {"role": "assistant", "content": "Vorherige Antwort"},
+            {"role": "user", "content": current},
+        ],
+        current,
+    ))
+
+    assert used_history is True
+    assert rewritten == 'Vertrag +"Project Alpha 42"'
+
+
+def test_query_rewriter_preserves_explicit_user_phrase(monkeypatch):
+    async def fake_complete(*args, **kwargs):
+        return json.dumps({
+            "stop": False,
+            "reason": "",
+            "elastic_query": "+Project +Alpha 42",
+            "semantic_query": "Project Alpha 42",
+            "entities": ["Project Alpha"],
+            "concepts": [],
+            "constraints": [],
+            "verification_requirements": [],
+        })
+
+    monkeypatch.setattr(provider, "_ollama_complete", fake_complete)
+    decision = asyncio.run(provider._rewrite_search_spec(
+        question='"Project Alpha 42"',
+        round_no=1,
+        results=[],
+        previous_spec=None,
+        retrieval_arms={"files"},
+    ))
+
+    assert decision["valid"] is True
+    assert decision["spec"]["elastic_query"] == '"Project Alpha 42"'
+
+
 def test_query_rewriter_never_needs_lexical_terms_for_vector_only(monkeypatch):
     async def fake_complete(*args, **kwargs):
         return json.dumps({

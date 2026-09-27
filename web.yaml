@@ -19,7 +19,11 @@ fetch:
   max_redirects: 5
   max_bytes: 15000000
   max_text_chars: 300000
-  user_agent: "AKI-RAG-WebEvidence/0.8.5-rc3"
+  user_agent: "SunaQ-WebEvidence/0.8.6"
+  # Public-Web retrieval is restricted to normal Web ports by default.
+  allowed_ports: [80, 443]
+  # UNSAFE compatibility escape hatch for controlled lab networks only.
+  # Keep false for normal ERG deployments; true permits RFC1918/loopback/link-local targets.
   allow_private: false
 
 relevance:
@@ -59,7 +63,9 @@ archive:
     viewport:
       width: 1440
       height: 900
-    persist_state: true
+    # rc1.2 renders the already fetched HTML snapshot without browser network
+    # access; persistent browser cookies/state are therefore intentionally off.
+    persist_state: false
     cleanup:
       # Best-effort rendering cleanup. No site-specific bypass logic.
       cookie_consent: off

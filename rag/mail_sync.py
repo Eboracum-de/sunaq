@@ -52,6 +52,7 @@ import httpx
 import yaml
 
 from rag.logging_utils import get_logger
+from rag.secret_env import secret_env
 from rag.nextcloud_tls import nextcloud_verify_value
 from rag.policy_hooks import POST_FETCH, PRE_PERSIST, apply_policy_hook
 from rag.credential_store import CredentialStore, MailAccount
@@ -148,7 +149,7 @@ def html_to_text(value: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _env_secret(name: str) -> str:
-    value = os.getenv(str(name or ""), "")
+    value = secret_env(str(name or ""), "")
     if not value:
         raise RuntimeError(f"Umgebungsvariable {name!r} ist nicht gesetzt")
     return value
@@ -163,7 +164,7 @@ def _config_value_or_env(cfg: dict, key: str) -> str:
     """
     env_name = str(cfg.get(f"{key}_env") or "").strip()
     if env_name:
-        value = os.getenv(env_name, "")
+        value = secret_env(env_name, "")
         if not value:
             raise RuntimeError(f"Umgebungsvariable {env_name!r} ist nicht gesetzt")
         return value

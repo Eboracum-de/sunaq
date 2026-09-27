@@ -7,10 +7,11 @@ Legacy ``user``/``password`` keys remain accepted for compatibility.
 """
 from __future__ import annotations
 
-import os
 import ssl
 from pathlib import Path
 from typing import Any
+
+from rag.secret_env import secret_env
 
 
 def _section(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -23,7 +24,7 @@ def elastic_credentials(cfg: dict[str, Any]) -> tuple[str, str] | None:
     password_env = str(es.get("password_env") or "ELASTICSEARCH_PASSWORD").strip()
     password = ""
     if password_env:
-        password = str(os.getenv(password_env, "") or "")
+        password = secret_env(password_env, "")
     if not password:
         # Compatibility only; new installations should not put secrets in YAML.
         password = str(es.get("password") or "")

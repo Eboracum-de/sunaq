@@ -210,7 +210,10 @@ never suggest itself as an upgrade.
 
 The model registry and prompt files are loaded at API/provider process startup.
 After changing a profile package, restart the normal API/provider processes
-before testing it.
+before testing it. In Dockerized Super-Light, `models/` is mounted read-only
+into both API and provider containers, so the normal Maintenance ON/OFF
+recreate cycle reloads administrator-owned profile and model-specific prompt
+changes; an image rebuild is not required for those files.
 
 Installer reruns preserve existing model-package directories as
 administrator-owned configuration and add only newly shipped package

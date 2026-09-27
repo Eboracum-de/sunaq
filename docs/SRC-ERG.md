@@ -1,57 +1,134 @@
-# SRC and ERG target architecture
+# SRC and ERG architecture
 
-**Status:** architecture concept in `0.8.6-rc1.1`; explicit installer and
-configuration support planned for `0.8.6-rc1.2`.
+**Status:** enforced architecture tiers in `0.8.6-rc1.2`.
 
 SunaQ is the product. **Secure RAG Core (SRC)** and **Eboracum Research Gate
-(ERG)** describe trust/capability envelopes, not separate products.
+(ERG)** are capability/trust envelopes, not separate products and not deployment
+mechanisms.
 
-SRC is the conservative Elasticsearch-centric target: ordinary Nextcloud
-documents, FullTextSearch/Elasticsearch, live Nextcloud ACL and optional
-administrator-owned seed/alias context. Local/private model processing is
-preferred, but SRC does not require zero egress: bounded external model
-processing is acceptable where the administrator explicitly accepts and manages
-the disclosure.
+## Secure RAG Core (SRC)
 
-ERG is the opt-in extension space for additional sources, derived state and more
-complex retrieval or graph functions. Examples include Mail, live Web research
-and Web archiving, Chat archive, semantic retrieval/reranking,
-Research Findings/Graph-Lite, full document graphization and additional
-retrieval rounds. ERG is a menu, not a requirement to enable all of these.
+SRC is the deliberately narrow baseline:
 
-The expected everyday **workgroup** preset is therefore Elasticsearch-centric:
-Documents + Mail + Web/Web archive + Playwright + Chat archive +
-Findings/Graph-Lite, with Qdrant and full graph off unless needed.
+- ordinary Nextcloud documents are the only evidence source;
+- FullTextSearch / Elasticsearch `files` is the only document retrieval arm;
+- live Nextcloud ACL is mandatory and remains the final authorization boundary;
+- model roles may be local or remote; remote model egress is an explicit
+  administrator decision and remains subject to the configured hard evidence caps;
+- retrieval is limited to one round;
+- Qdrant/vector retrieval, document-graph retrieval, Mail, Web/Web archive,
+  Chat archive, Research Findings and document graphization are disabled;
+- an administrator-owned Neo4j seed/alias store may still exist for identity
+  normalization/query expansion, but document graph evidence and graph-derived
+  persistence are outside SRC.
 
-## rc1.1 status
+These rules are runtime invariants. Setting `architecture.tier: src` while
+enabling an incompatible capability fails validation rather than silently
+creating an SRC-like hybrid. Omitted retrieval arms are normalized to `files`
+inside SRC, deterministic filename/document-ID paths remain Documents-only, and
+ERG-only middleware surfaces are unavailable.
 
-There is no supported `architecture.tier` switch in rc1.1. Existing component
-gates can be combined manually into SRC-like or ERG-like operation, but that is
-an administrator-managed override rather than a named, validated profile.
+Remote LLM routing is not itself an ERG capability. SRC prefers a private/local
+processing path, but an administrator may deliberately configure remote
+planner/verifier/evidence/answer roles and thereby accept model data egress.
+Remote-role document/count/character caps continue to apply.
 
-Deployment profile (Standard/Super-Light) and research model
-(Schnell/Gründlich/Tief) remain independent of this architecture concept.
+## Eboracum Research Gate (ERG)
 
-## rc1.2 target
+ERG is the extension envelope. It may add, individually and deliberately:
 
-The first supported implementation should stay small: individual
-`--x-enabled` / `--x-disabled` switches, a safe plain-text
-`--preset-file`, and shipped **core** / **workgroup** preset files. Explicit
-CLI overrides win over preset values. Contradictory combinations should be
-validated where security depends on them.
+- broader external egress surfaces such as Web search, external embeddings or
+  additional externally hosted processing;
+- live Web research and Web archiving;
+- Mail and Chat archive evidence;
+- Qdrant/vector retrieval and external embeddings;
+- Research Findings / Graph-Lite or fuller graph processing;
+- additional retrieval rounds;
+- external user interfaces and other trust boundaries.
 
-Conversation provenance is part of the same rc1.2 hardening step: replayed
-client history is not authoritative. SunaQ should maintain its own conversation
-store, derive bounded follow-up context from it, resolve prior-source references
-from it, and generate Chat archives from it. Client-side Knowledge/RAG context
-should not become a second evidence layer in front of SunaQ.
+ERG is a menu, not a requirement to enable all features.
 
-rc1.1 already defines and wires ALLOW-only modular policy/inspection hooks at
-outbound-search, URL-fetch, received-content, Nextcloud-persistence and
-model/embedding-egress boundaries. rc1.2 should add administrator configuration
-and concrete adapters. This is particularly useful for ERG sources such as Mail/Web, but
-`pre_model_egress` also applies to an SRC deployment that deliberately uses a
-remote model. The architecture should permit adapters such as malware scanning,
-URL policy or DLP without requiring one specific product.
+## Packaging and presets
+
+Deployment profile and architecture tier remain separate axes.
+
+- **Super-Light** is packaged as the formal SRC baseline in rc1.2.
+- The full reference `config.yaml` remains ERG for upgrade compatibility with
+  existing installations that already used optional capabilities.
+- Installations predating `architecture.tier` default to ERG rather than being
+  retroactively labelled SRC.
+
+Two safe YAML overlays are shipped:
+
+- `install/presets/core.yaml` — enforced SRC;
+- `install/presets/workgroup.yaml` — conservative Elasticsearch-centric ERG
+  baseline with optional working-group capabilities, while Qdrant and full
+  document graph processing remain off.
+
+Installers accept `--preset core|workgroup` and `--preset-file FILE`. Preset
+files are parsed as YAML data only; they are never sourced or evaluated as shell
+code. Explicit installer URL/TLS/index arguments remain authoritative over the
+preset. The same merge path is also available directly through
+`python -m rag.config_preset`.
+
+For a fresh Dockerized Super-Light/SRC installation, the recommended operational
+form is therefore explicit:
+
+```bash
+sudo ./install/install.sh \
+  --profile super-light \
+  --deployment dockerized \
+  --preset core \
+  --nextcloud-url https://cloud.example.org/nextcloud \
+  --elasticsearch-url http://10.0.0.20:9200 \
+  --elasticsearch-index my_index \
+  --plan
+```
+
+Remove `--plan` for the actual installation. Super-Light would select the same
+SRC baseline without an explicit preset, but recording all three switches makes
+the deployment mechanism and capability boundary reproducible and reviewable.
+
+
+### ERG-to-SRC transition during the RC line
+
+rc1.2 does not migrate historical ERG graph contents into SRC. Before converting
+an existing RC installation that has used document-derived Graph/Findings data,
+stop SunaQ and reset Neo4j explicitly:
+
+```bash
+python -m rag.graph --config /opt/sunaq/config.yaml reset --yes-really-delete-all
+```
+
+For a Dockerized Super-Light installation run the same command inside the
+provider/API image with the normal mounted config and secret files. After the
+reset, re-import only the wanted CardDAV/administrator seed sources. This is a
+deliberately destructive RC transition; no legacy graph-provenance migration is
+provided.
+
+## Security boundaries added in rc1.2
+
+rc1.2 also hardens boundaries that apply independently of architecture naming:
+
+- retrieved evidence is serialized into server-generated JSON records;
+- an immutable Python-side untrusted-evidence guard is appended to all model
+  roles that consume retrieved evidence;
+- public Web retrieval blocks local/private/link-local/reserved destinations
+  and revalidates redirect targets; the Playwright renderer applies the same
+  public-network principle to browser requests;
+- service credentials can be supplied through file-backed secret material
+  rather than ordinary container environment variables.
+
+The optional policy-hook framework remains a separate extension point. Core SSRF
+protection and SRC invariants do not depend on an installed policy evaluator.
+
+## Deferred to rc2
+
+The following are deliberately **not** part of rc1.2:
+
+- improved/evaluated multi-round retrieval;
+- authoritative server-side conversation history;
+- broader administration/maintenance UX;
+- experimental additional retrieval sources.
 
 See [Roadmap](ROADMAP.md).

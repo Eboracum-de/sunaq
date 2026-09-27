@@ -1,17 +1,18 @@
-# Installation – 0.8.6-rc1 (draft)
+# Installation – 0.8.6-rc1.2 (draft)
 
 All deployment variants use the single public entry point `install/install.sh`. Select `--profile standard` (default) or `--profile super-light`. The super-light profile is containerized and therefore does not require Python >=3.10 on the host; it is intended for older/smaller systems such as Leap 15.3.
 
-Functional profile and deployment mechanism are conceptually separate. In the 0.8.6-rc1 candidate the supported mappings remain `standard -> native` and `super-light -> dockerized`; the latter is not a fork of the middleware.
+Functional profile and deployment mechanism are conceptually separate. In the 0.8.6-rc1.2 candidate the supported mappings remain `standard -> native` and `super-light -> dockerized`; the latter is not a fork of the middleware.
 
 Fresh 0.8.6 installations default to **`/opt/sunaq`**. A recognized existing
 installation is deliberately kept at its current prefix (for example
 `/opt/sunaq`); the installer does not move site-owned runtime state.
 
-0.8.6-rc1 retains the rc5.1 authorization/Graph-Lite/backup baseline and adds
-SunaQ research profiles, per-user model access, the SunaQ Nextcloud client and
-client-neutral document-only source defaults. The security and
-user-configuration model remains:
+0.8.6-rc1.2 retains the rc1/rc1.1 research/client baseline and adds enforced
+SRC/ERG architecture tiers, structured untrusted-evidence handling, Web/Playwright
+SSRF hardening and file-backed service-secret delivery. Super-Light is the
+packaged SRC baseline; Standard remains the ERG-compatible reference profile.
+The security and user-configuration model remains:
 
 - multi-user + live Nextcloud ACL is the safe installation default;
 - Nextcloud TLS verification is on by default;
@@ -85,6 +86,40 @@ The fresh-install default prefix is `/opt/sunaq` and the service user is `rag`. 
 
 ## 2. Installation modes
 
+### Architecture presets
+
+Super-Light starts from the formal SRC configuration. For fresh Super-Light
+acceptance and reproducible operational records, the recommended command still
+spells this out as `--profile super-light --deployment dockerized --preset core`.
+The first two switches select the tested deployment mapping; `--preset core`
+selects and validates the formal SRC capability contract. This remains useful
+even though those choices match the packaged Super-Light defaults, because
+`install/last-install-command.sh` then records the intended architecture
+explicitly.
+
+Both supported installers also accept:
+
+```text
+--preset core
+--preset workgroup
+--preset-file /path/to/site-preset.yaml
+```
+
+Preset files are parsed as YAML data through `rag.config_preset`; they are not
+sourced as shell. The merge is validated against SRC/ERG invariants. Explicit
+installer connection, TLS and Elasticsearch-index arguments remain authoritative
+over preset values. Existing installations receive no preset change unless the
+operator explicitly selects one.
+
+When an existing **ERG** RC installation is deliberately converted to
+`--preset core`, historical Neo4j contents are **not migrated**. Stop the
+installation, reset the graph with `python -m rag.graph --config
+/opt/sunaq/config.yaml reset --yes-really-delete-all`, then re-import only the
+wanted CardDAV/administrator seeds before normal SRC use. This destructive reset
+is intentional during the RC line and avoids carrying document-derived ERG
+entities into SRC query expansion.
+
+
 ```text
 (default)      multi-user credential_store + live ACL
 --single-user  explicit one-user mode; live ACL remains enabled
@@ -98,7 +133,10 @@ Other useful flags:
 ```text
 --with-qdrant       local Qdrant
 --with-neo4j        local Neo4j
---core              Qdrant + Neo4j
+--core              legacy resource shorthand: Qdrant + Neo4j (not SRC)
+--preset core|workgroup
+                    apply a shipped capability preset
+--preset-file FILE  apply a safe site-owned YAML capability overlay
 --with-openwebui    bundled OpenWebUI
 --full              Qdrant + Neo4j + OpenWebUI
 --with-systemd      install/enable optional middleware units, do not start yet
@@ -116,7 +154,7 @@ the normal API; Playwright starts only when explicitly installed with
 has enabled and started that optional ingestion path. A smoke test reports only
 selected local components.
 
-Current rc1.1 operational note: the Neo4j image can still be first pulled at
+Current rc1.2 operational note: the Neo4j image can still be first pulled at
 `maintenance-mode.sh off` rather than during the installer preparation phase.
 That is functional but not the intended long-term UX; a future installer cleanup
 should pull every selected runtime image before the maintenance hand-off so
@@ -213,7 +251,7 @@ the public trust used for OpenAI, Hugging Face and unrelated HTTPS endpoints.
 `security.allow_insecure_nextcloud=true` exists only as an explicit lab escape
 hatch.
 
-Edit `/opt/sunaq/provider.env` for the default backend connection and secrets, and review `models/` for the user-visible SunaQ profiles. The shipped rc1 profiles route planner/verifier/evidence/answer roles through the configured backend unless a profile supplies an explicit role override. Put API keys only in `runtime.env` or another configured secret environment. Embeddings remain independently configured in `config.yaml`.
+Edit `/opt/sunaq/provider.env` for the default backend connection and review `models/` for the user-visible SunaQ profiles. The shipped profiles route planner/verifier/evidence/answer roles through the configured backend unless a profile supplies an explicit role override. Keep API keys in root-protected runtime provisioning state; rc1.2 materializes file-backed runtime secrets for supported services. Embeddings remain independently configured in `config.yaml`.
 
 ## 4. Start and smoke test
 
@@ -260,6 +298,7 @@ If Nextcloud's Apache already owns host ports 80/443, keep Apache as the public 
 sudo ./install/install.sh \
   --profile super-light \
   --deployment dockerized \
+  --preset core \
   --nextcloud-url https://cloud.example.org/nextcloud \
   --elasticsearch-url http://127.0.0.1:9200 \
   --elasticsearch-index my_index \
@@ -688,7 +727,7 @@ Qdrant, embedding backend and Nextcloud Live-ACL.
 
 Fresh installs create `runtime/credential-master.key` as `root:rag 0640`, add
 `RAG_CREDENTIAL_MASTER_KEY_FILE` and `RAG_CREDENTIAL_ENCRYPTION=required` to
-`runtime.env`, and verify the encrypted credential store. `0.8.5-rc4.3` is the current release-candidate baseline; no upgrade path from unpublished internal snapshots is documented or supported.
+`runtime.env`, and verify the encrypted credential store. `0.8.6-rc1.2` is the current development release-candidate baseline; no upgrade path from unpublished internal snapshots is documented or supported.
 
 The master key must be backed up separately. The Admin UI can report encryption
 status and replace IMAP credentials, but does not reveal stored secrets or create
@@ -750,6 +789,7 @@ Preservation is intentional and is not a schema merge: newly introduced optional
 sudo ./install/install.sh \
   --profile super-light \
   --deployment dockerized \
+  --preset core \
   --with-proxy \
   --ca-certificate /etc/pki/trust/anchors/Company_Root_CA.crt \
   --nextcloud-url https://cloud.internal.example/nextcloud \

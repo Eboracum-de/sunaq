@@ -10,6 +10,7 @@ from typing import Any
 from fastapi import HTTPException, Request
 
 from rag.acl import AclConfigurationError, AclIdentityError, NextcloudLiveAcl
+from rag.secret_env import secret_env
 from rag.internal_auth import (
     ENV_NAME as INTERNAL_API_KEY_ENV,
     HEADER_NAME as INTERNAL_API_KEY_HEADER,
@@ -106,7 +107,7 @@ class ApiSecurity:
         self.require_internal_client(request)
 
         username = str(os.getenv("RAG_ADMIN_USER", "") or "").strip()
-        password = str(os.getenv("RAG_ADMIN_PASSWORD", "") or "")
+        password = secret_env("RAG_ADMIN_PASSWORD", "")
         if not username or not password:
             raise HTTPException(status_code=503, detail="RAG Admin credentials are not configured")
 

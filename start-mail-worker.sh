@@ -2,10 +2,7 @@
 set -euo pipefail
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$BASE_DIR"
-set -a
-[[ -f provider.env ]] && source provider.env
-[[ -f runtime.env ]] && source runtime.env
-set +a
+source "$BASE_DIR/install/load-service-env.sh" "$BASE_DIR"
 
 if [[ -n "${RAG_PYTHON:-}" ]]; then
   PYTHON_BIN="$RAG_PYTHON"

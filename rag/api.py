@@ -21,10 +21,17 @@ from pydantic import (
     Field,
 )
 
+from rag.secret_env import secret_env
 from rag.version import VERSION
 from rag.credential_store import CredentialStore
 from rag.logging_utils import get_logger, configure_third_party_logging
 from rag.runtime_validation import require_secure_runtime_config
+from rag.architecture_policy import (
+    api_path_blocked,
+    effective_retrieval_arms,
+    is_src,
+    request_capability_error,
+)
 from rag.tls_compat import configure_tls_compat
 from rag.nextcloud_tls import nextcloud_verify_value
 from rag.api_security import (
@@ -46,7 +53,7 @@ from rag.web_research import WebResearchArm, load_web_config
 from rag.retrieval_planner import load_retrieval_planner_settings
 from rag.sunaq_models import RuntimeModel, load_model_registry
 from rag.reranker import get_reranker_status
-from rag.source_origin import chat_archive_roots, path_is_under, classify_source_origin
+from rag.source_origin import chat_archive_roots, path_is_under, classify_source_origin, source_scope_allows_record
 from rag.source_registry import register_document, auto_mirror_registry_to_elasticsearch
 from rag.acl import (
     NextcloudLiveAcl,
@@ -283,6 +290,40 @@ ZONE_USER = _zone(SECURITY_USER, api_security.require_current_user)
 ZONE_ADMIN = _zone(SECURITY_ADMIN, api_security.require_admin)
 
 
+def _enforce_architecture_request(
+    *,
+    retrieval_arms: list[str] | set[str] | None = None,
+    source_scopes: list[str] | set[str] | None = None,
+    web_requested: bool = False,
+) -> list[str] | None:
+    """Reject requests outside the architecture tier and return effective arms."""
+    error = request_capability_error(
+        app_config,
+        retrieval_arms=retrieval_arms,
+        source_scopes=source_scopes,
+        web_requested=web_requested,
+    )
+    if error:
+        raise HTTPException(status_code=403, detail=error)
+    return effective_retrieval_arms(app_config, retrieval_arms)
+
+
+def _src_documents_only(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prevent archive records from entering SRC through deterministic lookups."""
+    if not is_src(app_config):
+        return items
+    return [
+        item
+        for item in items
+        if source_scope_allows_record(
+            str(item.get("document_id") or ""),
+            str(item.get("path") or item.get("title") or ""),
+            {"documents"},
+            indexed_origin=str(item.get("source_origin") or "").strip() or None,
+        )
+    ]
+
+
 @app.middleware("http")
 async def require_internal_api_auth(request: Request, call_next):
     """Defense-in-depth default deny for middleware routes.
@@ -294,6 +335,13 @@ async def require_internal_api_auth(request: Request, call_next):
     """
     if api_security.is_baseline_exempt(request.url.path):
         return await call_next(request)
+    if api_path_blocked(app_config, request.url.path):
+        return JSONResponse(
+            status_code=404,
+            content={
+                "detail": "Capability not available in the configured SunaQ architecture tier"
+            },
+        )
     try:
         api_security.require_internal_client(request)
     except HTTPException as exc:
@@ -1125,7 +1173,7 @@ def _health_web(timeout: float) -> dict[str, Any]:
         return result
     if provider == "brave":
         key_env = str(search_cfg.get("api_key_env") or "WEB_SEARCH_API_KEY").strip()
-        if not key_env or not os.getenv(key_env, "").strip():
+        if not key_env or not secret_env(key_env, "").strip():
             result.update({"status": "unconfigured", "error": f"{key_env or 'WEB_SEARCH_API_KEY'} fehlt"})
             return result
         # Avoid billable external search requests from /health.
@@ -1746,6 +1794,14 @@ async def documents_resolve(body: DocumentResolveRequest, http_request: Request)
 
         normal_refs: list[str] = []
         web_refs: list[tuple[str, str]] = []
+        if is_src(app_config) and any(
+            str(reference or "").strip().casefold().startswith("webarchive:")
+            for reference in body.references
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Web archive references are not available in Secure RAG Core (SRC)",
+            )
         for reference in body.references:
             value = str(reference or "").strip()
             if value.casefold().startswith("webarchive:"):
@@ -1763,7 +1819,9 @@ async def documents_resolve(body: DocumentResolveRequest, http_request: Request)
             candidate_sets: dict[str, list[dict[str, Any]]] = {}
             candidate_by_id: dict[str, dict[str, Any]] = {}
             for reference in normal_refs:
-                matches = document_reference_candidates(reference, limit=50)
+                matches = _src_documents_only(
+                    document_reference_candidates(reference, limit=50)
+                )
                 deduped: list[dict[str, Any]] = []
                 local_seen: set[str] = set()
                 for item in matches:
@@ -1858,7 +1916,7 @@ async def documents_resolve(body: DocumentResolveRequest, http_request: Request)
                 "resolved_count": 0,
             }
 
-        normal_results = list(payload.get("results", []))
+        normal_results = _src_documents_only(list(payload.get("results", [])))
         acl = live_acl.authorize(normal_results, rag_user_id=user_id)
         if acl.enabled:
             print(
@@ -1919,6 +1977,7 @@ async def documents_resolve(body: DocumentResolveRequest, http_request: Request)
 )
 def elastic_search_endpoint(body: ElasticSearchRequest, http_request: Request):
     try:
+        _enforce_architecture_request(source_scopes=body.source_scopes)
         graph_queue.mark_activity("elastic_search")
 
         # With ACL enabled, inspect only a bounded prefix.  Exact counting of a
@@ -2068,6 +2127,10 @@ def multi_search(body: MultiSearchRequest, http_request: Request):
                 "semantic_query": body.original_query,
                 "retrieval_arms": None,
             }]
+        for probe in probes:
+            probe["retrieval_arms"] = _enforce_architecture_request(
+                retrieval_arms=probe.get("retrieval_arms"),
+            )
 
         files_requested = any(
             probe.get("retrieval_arms") is None
@@ -2086,9 +2149,11 @@ def multi_search(body: MultiSearchRequest, http_request: Request):
         # mandatory candidate so joint reranking cannot discard it.
         explicit_filename = extract_filename(body.original_query) if files_requested else None
         if explicit_filename:
-            filename_matches = strict_filename_lookup(
-                explicit_filename,
-                limit=max(20, effective_limit),
+            filename_matches = _src_documents_only(
+                strict_filename_lookup(
+                    explicit_filename,
+                    limit=max(20, effective_limit),
+                )
             )
             filename_acl = live_acl.authorize(
                 filename_matches,
@@ -2152,7 +2217,9 @@ def multi_search(body: MultiSearchRequest, http_request: Request):
             # Later planner rounds reuse the already authorized strict set from
             # round 1.  No second broad ACL preflight is performed.  These
             # exact ids are still checked by the normal final Live-ACL below.
-            required_results.extend(document_ids_lookup(strict_required_ids))
+            required_results.extend(
+                _src_documents_only(document_ids_lookup(strict_required_ids))
+            )
             required_results = _dedupe_acl_candidates(required_results)
 
         # Recall-draft1: natural-language exhaustive search no longer creates
@@ -2249,6 +2316,10 @@ def search(
 
     try:
 
+        effective_arms = _enforce_architecture_request(
+            retrieval_arms=body.retrieval_arms,
+            source_scopes=body.source_scopes,
+        )
         graph_queue.mark_activity("search")
 
         # Multi-user fail-fast boundary: do not spend retrieval/reranker work on
@@ -2271,7 +2342,7 @@ def search(
                 question=body.query,
                 limit=effective_limit,
                 entity_recall=body.entity_recall,
-                retrieval_arms=body.retrieval_arms,
+                retrieval_arms=effective_arms,
                 source_scopes=body.source_scopes,
                 raw_results=body.raw_results,
                 # With live ACL enabled the broad-field stop must not happen before
@@ -2385,7 +2456,7 @@ def search(
                 response_retrieval_message,
 
             "retrieval_arms":
-                search_result.get("retrieval_arms", body.retrieval_arms),
+                search_result.get("retrieval_arms", effective_arms),
 
             "source_scopes":
                 search_result.get("source_scopes", body.source_scopes),

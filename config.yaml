@@ -1,4 +1,8 @@
-# SunaQ / Eboracum Research Gateway - 0.8.6-rc1.1
+# SunaQ architecture tier. Existing/full reference configuration is ERG-capable.
+architecture:
+  tier: erg  # src | erg; see docs/SRC-ERG.md
+
+# SunaQ / Eboracum Research Gateway - 0.8.6-rc1.2
 
 health:
   timeout_seconds: 4

@@ -7,6 +7,8 @@ import httpx
 import yaml
 
 from rag.logging_utils import get_logger
+from rag.architecture_policy import is_src
+from rag.network_policy import pinned_private_target
 
 
 # ------------------------------------------------------------
@@ -46,6 +48,7 @@ TEI_BATCH_SIZE = int(reranker_config.get("tei_batch_size", 32) or 32)
 FALLBACK_BACKEND = str(
     reranker_config.get("fallback_backend", "none") or "none"
 ).strip().lower()
+PRIVATE_NETWORK_ONLY = is_src(config)
 
 _VALID_BACKENDS = {"none", "local", "tei"}
 _VALID_FALLBACKS = {"none", "local"}
@@ -185,6 +188,7 @@ class Reranker:
         timeout_seconds: float = TIMEOUT_SECONDS,
         tei_batch_size: int = TEI_BATCH_SIZE,
         fallback_backend: str = FALLBACK_BACKEND,
+        private_network_only: bool = PRIVATE_NETWORK_ONLY,
     ):
         self.model_name = str(model_name).strip()
         self.device_name = str(device).strip() or "cpu"
@@ -195,6 +199,7 @@ class Reranker:
         self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.tei_batch_size = max(1, int(tei_batch_size))
         self.fallback_backend = str(fallback_backend or "none").strip().lower()
+        self.private_network_only = bool(private_network_only)
 
         if self.backend not in _VALID_BACKENDS:
             raise ValueError(
@@ -311,6 +316,7 @@ class Reranker:
             "local_load_attempted": self.local_load_attempted,
             "local_load_error": self.local_load_error,
             "disabled_reason": self.disabled_reason,
+            "private_network_only": self.private_network_only,
         }
 
     # --------------------------------------------------------
@@ -327,17 +333,28 @@ class Reranker:
             for start in range(0, len(texts), self.tei_batch_size):
                 batch_texts = texts[start:start + self.tei_batch_size]
                 calls += 1
-                response = httpx.post(
-                    endpoint,
-                    json={
-                        "query": query,
-                        "texts": batch_texts,
-                        "truncate": True,
-                        "raw_scores": False,
-                        "return_text": False,
-                    },
+                target_url = endpoint
+                target_headers: dict[str, str] | None = None
+                target_extensions: dict[str, str] | None = None
+                if self.private_network_only:
+                    target_url, host_header, target_extensions = pinned_private_target(endpoint)
+                    target_headers = {"Host": host_header}
+                with httpx.Client(
                     timeout=self.timeout_seconds,
-                )
+                    trust_env=not self.private_network_only,
+                ) as client:
+                    response = client.post(
+                        target_url,
+                        headers=target_headers,
+                        extensions=target_extensions,
+                        json={
+                            "query": query,
+                            "texts": batch_texts,
+                            "truncate": True,
+                            "raw_scores": False,
+                            "return_text": False,
+                        },
+                    )
                 response.raise_for_status()
                 payload = response.json()
 
@@ -524,7 +541,7 @@ class Reranker:
 # Singleton
 # ------------------------------------------------------------
 
-reranker = Reranker()
+reranker = Reranker(private_network_only=PRIVATE_NETWORK_ONLY)
 _profile_rerankers: dict[tuple, Reranker] = {}
 _profile_rerankers_lock = threading.Lock()
 
@@ -571,6 +588,7 @@ def _reranker_for_config(config_override: dict | None) -> Reranker:
                 timeout_seconds=key[6],
                 tei_batch_size=key[7],
                 fallback_backend=key[8],
+                private_network_only=PRIVATE_NETWORK_ONLY,
             )
             _profile_rerankers[key] = selected
         return selected

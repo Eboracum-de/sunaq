@@ -7,6 +7,7 @@ CLI.  High-impact actions are preview-first.
 """
 
 from __future__ import annotations
+from rag.secret_env import secret_configured, secret_env
 from rag.version import VERSION
 
 import asyncio
@@ -48,7 +49,7 @@ log = logging.getLogger("rag.admin")
 def _env_or_cfg(cfg: dict[str, Any], direct_path: str, env_path: str, default: str = "") -> str:
     env_name = str(cfg_get(cfg, env_path, default="") or "").strip()
     if env_name:
-        value = os.getenv(env_name, "")
+        value = secret_env(env_name, "")
         if value:
             return value
     return str(cfg_get(cfg, direct_path, default=default) or default)
@@ -505,7 +506,7 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
             "ELASTICSEARCH_PASSWORD", "NEO4J_PASSWORD", "RAG_ADMIN_PASSWORD",
             "PROVIDER_API_KEY", "RAG_INTERNAL_API_KEY", "RAG_PROVIDER_INTERNAL_KEY",
         )
-        env_status = [{"name": name, "configured": bool(os.getenv(name, ""))} for name in env_names]
+        env_status = [{"name": name, "configured": secret_configured(name)} for name in env_names]
         return render(request, "security.html", secret_status=status, env_status=env_status)
 
     @router.post("/security/migrate", name="admin_security_migrate", dependencies=auth)

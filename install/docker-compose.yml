@@ -23,7 +23,7 @@ services:
     image: ${NEO4J_IMAGE:-neo4j:5.26.29-community@sha256:d9dd3dc7d1c78fa959191ff02dbdcbefadceaf83eee23428fb92a58cac8ad3fe}
     restart: unless-stopped
     environment:
-      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in install/.env}"
+      NEO4J_AUTH_FILE: "/run/secrets/neo4j_auth"
       NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-512m}
       NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-1G}
       NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-512m}
@@ -33,12 +33,13 @@ services:
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
+      - ../runtime/service-secrets/neo4j_auth:/run/secrets/neo4j_auth:ro
 
   playwright-renderer:
     profiles: ["renderer"]
     build:
       context: ./components/playwright-renderer
-    image: rag-playwright-renderer:0.2.2
+    image: rag-playwright-renderer:0.2.3
     restart: unless-stopped
     init: true
     ipc: host

@@ -3,10 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-set -a
-[[ -f provider.env ]] && source provider.env
-[[ -f runtime.env ]] && source runtime.env
-set +a
+source "$(pwd)/install/load-service-env.sh" "$(pwd)"
 
 RAG_API_BIND="${RAG_API_HOST:-127.0.0.1}"
 case "$RAG_API_BIND" in

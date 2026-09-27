@@ -40,6 +40,7 @@ ALLOWED_PORTS = {
 
 class RenderRequest(BaseModel):
     url: str = Field(min_length=8, max_length=4096)
+    html: str = Field(min_length=1, max_length=20_000_000)
     print_background: bool = True
     prefer_css_page_size: bool = False
     landscape: bool = True
@@ -170,21 +171,24 @@ async def _validate_target(url: str) -> None:
 
 
 async def _route_guard(route: Route, request: Request) -> None:
-    url = request.url
-    scheme = urlsplit(url).scheme
+    """Network-free snapshot renderer.
 
-    # Harmless in-page schemes used by Chromium itself.
+    The HTML body has already been fetched by SunaQ's IP-pinned WebFetcher.
+    Chromium is therefore never allowed to perform a second HTTP(S), WebSocket,
+    frame or subresource fetch.
+    """
+    scheme = urlsplit(request.url).scheme
     if scheme in {"data", "blob", "about"}:
         await route.continue_()
         return
+    await route.abort("blockedbyclient")
 
+
+async def _websocket_guard(route) -> None:
     try:
-        await _validate_target(url)
-    except HTTPException:
-        await route.abort("blockedbyclient")
-        return
-
-    await route.continue_()
+        await route.close()
+    except Exception:
+        log.debug("WebSocket close failed", exc_info=True)
 
 
 COOKIE_ACCEPT_SELECTORS = (
@@ -394,7 +398,7 @@ async def lifespan(_: FastAPI):
         PLAYWRIGHT = None
 
 
-app = FastAPI(title="RAG Playwright Renderer", version="0.2.2", lifespan=lifespan)
+app = FastAPI(title="RAG Playwright Renderer", version="0.2.3", lifespan=lifespan)
 
 
 @app.get("/live")
@@ -402,7 +406,7 @@ async def live() -> dict[str, object]:
     return {
         "ok": BROWSER is not None,
         "service": "rag-playwright-renderer",
-        "version": "0.2.2",
+        "version": "0.2.3",
         "launch_error": BROWSER_LAUNCH_ERROR,
     }
 
@@ -417,75 +421,53 @@ async def render(req: RenderRequest) -> Response:
 
 
 async def _render_one(req: RenderRequest) -> Response:
-    await _validate_target(req.url)
+    # The source URL is provenance only. No browser navigation to it occurs.
+    _validate_url_shape(req.url)
     started = time.monotonic()
 
-    storage_state_path = _load_storage_state_path(req.url) if req.persist_state else None
     context = await BROWSER.new_context(
         accept_downloads=False,
-        java_script_enabled=True,
+        java_script_enabled=False,
         service_workers="block",
         viewport={"width": req.viewport_width, "height": req.viewport_height},
-        storage_state=storage_state_path,
     )
     page = await context.new_page()
     await context.route("**/*", _route_guard)
+    if hasattr(context, "route_web_socket"):
+        await context.route_web_socket("**/*", _websocket_guard)
 
     try:
         try:
-            response = await page.goto(
-                req.url,
+            await page.set_content(
+                req.html,
                 wait_until="domcontentloaded",
                 timeout=NAV_TIMEOUT_MS,
             )
         except PlaywrightError as exc:
-            # Individual sites can fail navigation (notably HTTP/2 protocol errors,
-            # bot mitigations or TLS quirks). This is an expected per-source
-            # archive failure, not a renderer process failure: return a bounded
-            # 502 so the background archive worker can mark only this snapshot
-            # failed without an ASGI traceback.
-            message = re.sub(r"\s+", " ", str(exc or "Playwright navigation failed")).strip()
-            raise HTTPException(status_code=502, detail=f"Navigation failed: {message[:700]}") from exc
-        if response is None:
-            raise HTTPException(status_code=502, detail="Navigation returned no HTTP response")
+            message = re.sub(r"\s+", " ", str(exc or "Playwright snapshot render failed")).strip()
+            raise HTTPException(status_code=502, detail=f"Snapshot render failed: {message[:700]}") from exc
 
-        # Validate the final URL independently after redirects.
-        final_url = page.url
-        await _validate_target(final_url)
-
-        content_type = (response.headers.get("content-type") or "").lower()
-        if "application/pdf" in content_type:
-            raise HTTPException(
-                status_code=415,
-                detail="Source is already a PDF; archive the original instead of rendering it",
-            )
-
-        # Avoid waiting for networkidle: ad/analytics connections can keep it open indefinitely.
+        final_url = req.url
         if POSTLOAD_WAIT_MS > 0:
             await page.wait_for_timeout(POSTLOAD_WAIT_MS)
 
         cleanup = await _cleanup_page(page, req)
-        # Consent managers are often injected late. One bounded second pass just
-        # before capture handles that without site-specific rules.
-        await page.wait_for_timeout(400)
+        await page.wait_for_timeout(200)
         cleanup = _merge_cleanup(cleanup, await _cleanup_page(page, req))
-        state_persisted = await _persist_storage_state(context, req.url) if req.persist_state else False
+        state_persisted = False
         title = (await page.title()).strip()
 
-        # Preserve the normal on-screen presentation rather than @media print CSS.
         await page.emulate_media(media="screen")
 
-        # PDFs cannot preserve video playback. Where the page provides a poster
-        # image, replace the video element with that poster so the archived PDF
-        # stays closer to what a browser user sees before pressing Play.
+        # Network is disabled, so only already embedded data/blob poster images
+        # can survive as video preview replacements.
         poster_count = await page.evaluate(
             """
             async () => {
               const replacements = [];
               for (const video of document.querySelectorAll('video')) {
                 const poster = video.poster || video.getAttribute('poster');
-                if (!poster) continue;
-
+                if (!poster || !/^(?:data:|blob:)/i.test(poster)) continue;
                 const rect = video.getBoundingClientRect();
                 const computed = getComputedStyle(video);
                 const img = document.createElement('img');
@@ -496,28 +478,11 @@ async def _render_one(req: RenderRequest) -> Response:
                 img.style.objectFit = computed.objectFit || 'cover';
                 img.style.objectPosition = computed.objectPosition || '50% 50%';
                 img.style.display = computed.display === 'inline' ? 'inline-block' : computed.display;
-
                 if (rect.width > 0) img.style.width = `${rect.width}px`;
                 if (rect.height > 0) img.style.height = `${rect.height}px`;
-
-                for (const attr of ['width', 'height', 'loading', 'decoding']) {
-                  if (video.hasAttribute(attr)) img.setAttribute(attr, video.getAttribute(attr));
-                }
-
                 video.replaceWith(img);
                 replacements.push(img);
               }
-
-              await Promise.allSettled(replacements.map(async (img) => {
-                if (img.complete) return;
-                await new Promise((resolve) => {
-                  const done = () => resolve();
-                  img.addEventListener('load', done, { once: true });
-                  img.addEventListener('error', done, { once: true });
-                  setTimeout(done, 2000);
-                });
-              }));
-
               return replacements.length;
             }
             """
@@ -550,7 +515,7 @@ async def _render_one(req: RenderRequest) -> Response:
             "X-Render-DOM-Modified": "true" if cleanup["dom_modified"] else "false",
             "X-Render-Landscape": "true" if req.landscape else "false",
             "X-Render-Viewport": f"{req.viewport_width}x{req.viewport_height}",
-            "X-Render-State-Reused": "true" if storage_state_path else "false",
+            "X-Render-State-Reused": "false",
             "X-Render-State-Persisted": "true" if state_persisted else "false",
             "Cache-Control": "no-store",
         }

@@ -12,6 +12,7 @@ Zielsprache fuer `elastic_query` ist die Nextcloud-kompatible Volltextsyntax:
 Regeln fuer `elastic_query`:
 - Nutze dein Sprachverstaendnis, um die Suchabsicht so zu formulieren, wie ein erfahrener Benutzer eine gute Volltextsuche schreiben wuerde.
 - Explizit genannte Namen, Firmen, Domains/Marken, Kennungen, Aktenzeichen und andere unterscheidende Anker duerfen nicht still verschwinden.
+- Vom Nutzer gesetzte Anfuehrungszeichen sind verbindliche Suchsyntax: Eine explizite Mehrwort-Phrase wie `"Project Alpha 42"` muss als zusammenhaengende Phrase erhalten bleiben und darf nicht in Einzelbegriffe zerlegt oder abgeschwaecht werden. Ein vorangestelltes `+` oder `-` bleibt ebenfalls erhalten.
 - Grammatische Flexion darf vorsichtig auf eine in Dokumenten wahrscheinliche Grundform normalisiert werden, z. B. `Rechnungen` -> `Rechnung`. Erfinde keine fachlichen Synonyme.
 - Erzwinge nur Schreibweisen, deren Auftreten im Dokument plausibel ist. Eine Zeitangabe wie `Februar 2021` darf nicht willkuerlich zu `02-2021` umgeschrieben und als Mussbegriff verlangt werden.
 - Zeitliche oder fachliche Praezision, die sich nicht verlaesslich als Textanker abbilden laesst, bleibt in `constraints` und `verification_requirements` erhalten.

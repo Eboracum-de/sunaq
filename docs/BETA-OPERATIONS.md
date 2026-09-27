@@ -29,12 +29,16 @@ renderer only when required with `--with-playwright`.
 
 ## 2. Super-Light installation
 
-Inspect the plan first:
+Inspect the plan first. For rc1.2 acceptance, keep the architecture choice
+explicit in the recorded command even where Super-Light would select the same
+packaged defaults: `--profile super-light --deployment dockerized --preset core`
+means the Dockerized Super-Light deployment of the formal SRC contract.
 
 ```bash
 sudo ./install/install.sh \
   --profile super-light \
   --deployment dockerized \
+  --preset core \
   --nextcloud-url https://cloud.example/nextcloud \
   --elasticsearch-url http://10.0.0.20:9200 \
   --elasticsearch-index my_index \
@@ -55,6 +59,7 @@ RFC-5280 checks require an Authority Key Identifier, additionally use
 sudo ./install/install.sh \
   --profile super-light \
   --deployment dockerized \
+  --preset core \
   --nextcloud-url https://cloud.example/nextcloud \
   --elasticsearch-url http://10.0.0.20:9200 \
   --elasticsearch-index my_index \
@@ -80,6 +85,7 @@ When Super-Light runs on the same host as Nextcloud and Apache already owns 80/4
 sudo ./install/install.sh \
   --profile super-light \
   --deployment dockerized \
+  --preset core \
   --nextcloud-url https://cloud.example/nextcloud \
   --elasticsearch-url http://127.0.0.1:9200 \
   --elasticsearch-index my_index \
@@ -98,7 +104,9 @@ The installer also refuses a non-empty `--prefix` that is not recognized as an S
 
 
 After installation, keep `/opt/sunaq/install/last-install-command.sh` with the
-host's operational records. The installer writes the exact shell-escaped wrapper command
+host's operational records. Prefer retaining the explicit `--profile`,
+`--deployment` and `--preset` switches even when they match defaults; the
+recorded command then documents both deployment topology and architecture tier. The installer writes the exact shell-escaped wrapper command
 used on the last run so later maintenance does not depend on reconstructing profile,
 URLs, CA files or optional component switches from memory.
 
@@ -378,3 +386,24 @@ For native/standard deployments run the equivalent module with the installed ven
 ## TLS strict mode
 
 Normal TLS verification is enabled by default. `tls.x509_strict` defaults to `false` for compatibility with older private PKIs; this only disables the additional Python/OpenSSL `VERIFY_X509_STRICT` flag. Use `--x509-strict` to opt into strict RFC-5280 checks. Do not use `verify_tls: false` as a substitute.
+
+## Query formulation in Elasticsearch-only operation
+
+In an Elasticsearch-only deployment, retrieval quality is more sensitive to the
+lexical form of the user's query than in a hybrid setup. For example,
+`Project Alpha 42` and `"Project Alpha 42"` are intentionally not equivalent:
+the first allows the rewriter to use the individual lexical anchors, while the
+quoted form requests the multi-word string as one phrase. Quoting can therefore
+materially narrow the candidate set when names, project labels, identifiers or
+OCR-heavy documents contain otherwise common tokens.
+
+This is expected behaviour for a lexical retrieval arm rather than an ACL or LLM
+failure. The effect should become less pronounced as entity resolution and alias
+coverage improve, because better-resolved entities provide stronger canonical
+search anchors. In ERG/hybrid deployments, an additional semantic vector arm
+such as Qdrant can further reduce dependence on exact lexical wording by
+providing semantically similar candidates as a complementary recall signal.
+Vector retrieval remains complementary: live Nextcloud ACL and downstream
+verification/evidence handling remain authoritative boundaries, and explicit
+quoted lexical constraints are preserved when the user supplies them.
+

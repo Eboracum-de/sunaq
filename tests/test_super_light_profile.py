@@ -122,26 +122,41 @@ def test_super_light_web_capability_is_globally_off_by_default():
     assert web["search"]["provider"] == "brave"
 
 
-def test_super_light_base_compose_does_not_define_optional_openwebui_or_proxy():
+def test_super_light_base_compose_does_not_define_optional_frontends_or_renderer():
     compose = yaml.safe_load((ROOT / "install/super-light/docker-compose.yml").read_text())
     services = compose["services"]
     assert "openwebui" not in services
     assert "proxy" not in services
-    assert {"api", "provider", "neo4j", "playwright-renderer"}.issubset(services)
+    assert "playwright-renderer" not in services
+    assert "mail-worker" not in services
+    assert {"api", "provider", "neo4j"}.issubset(services)
+
+
+def test_super_light_mounts_administrator_models_read_only():
+    compose = yaml.safe_load((ROOT / "install/super-light/docker-compose.yml").read_text())
+    for service in ("api", "provider"):
+        volumes = compose["services"][service]["volumes"]
+        assert "../../models:/app/models:ro" in volumes
 
 
 def test_super_light_installer_generates_optional_compose_override():
     installer = (ROOT / "install/profiles/install-super-light.sh").read_text(encoding="utf-8")
     assert 'docker-compose.override.yml' in installer
+    assert 'if [[ $WITH_PLAYWRIGHT -eq 1 ]]' in installer
     assert 'if [[ $WITH_OPENWEBUI -eq 1 ]]' in installer
     assert 'if [[ $WITH_PROXY -eq 1 ]]' in installer
+    assert '  playwright-renderer:' in installer
+    assert '  mail-worker:' in installer
+    assert 'MAIL_WORKER_ACTIVE' in installer
+    assert 'mail_worker_enabled_from_config' in installer
     assert 'compose up -d --remove-orphans' in installer
 
 
 def test_super_light_disabled_playwright_does_not_require_generated_seccomp_file():
     compose = (ROOT / "install/super-light/docker-compose.yml").read_text(encoding="utf-8")
     installer = (ROOT / "install/profiles/install-super-light.sh").read_text(encoding="utf-8")
-    assert 'seccomp=${PLAYWRIGHT_SECCOMP_PROFILE:-unconfined}' in compose
+    assert 'playwright-renderer:' not in compose
+    assert 'seccomp=${PLAYWRIGHT_SECCOMP_PROFILE:-unconfined}' in installer
     assert 'PLAYWRIGHT_SECCOMP_PROFILE=$([[ $WITH_PLAYWRIGHT -eq 1 ]]' in installer
     prepare = '"$PREFIX/install/components/playwright-renderer/prepare.sh"'
     first_compose = 'compose stop playwright-renderer'
@@ -183,7 +198,7 @@ def test_super_light_retrieval_policy_keeps_es_required_and_document_graph_disab
         "vector": "disabled",
         "graph": "disabled",
     }
-    assert policy["web"] == "planner"
+    assert policy["web"] == "disabled"
     assert cfg["tls"]["x509_strict"] is False
 
 
@@ -219,10 +234,9 @@ def test_super_light_uses_profile_specific_verification_budget_without_reranker(
 
 
 def test_super_light_renderer_is_shared_landscape_desktop_component():
-    compose = yaml.safe_load((ROOT / "install/super-light/docker-compose.yml").read_text())
-    service = compose["services"]["playwright-renderer"]
-    assert service["build"]["context"] == "../components/playwright-renderer"
-    assert "playwright_state:/state" in service["volumes"]
+    installer = (ROOT / "install/profiles/install-super-light.sh").read_text(encoding="utf-8")
+    assert 'context: ../components/playwright-renderer' in installer
+    assert 'playwright_state:/state' in installer
     assert (ROOT / "install/components/playwright-renderer/app/renderer.py").is_file()
     web = yaml.safe_load((ROOT / "install/super-light/web.super-light.yaml").read_text())
     renderer = web["archive"]["renderer"]

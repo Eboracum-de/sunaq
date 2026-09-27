@@ -8,9 +8,9 @@ The graph may contain **shared retrieval knowledge** such as curated names/alias
 
 Reversible per-user Nextcloud and IMAP credentials, together with pending Nextcloud Login Flow poll tokens, are encrypted at rest in `runtime/users.sqlite` using AES-256-GCM. The credential master key is stored separately and production mode is fail-closed when required encryption cannot be satisfied.
 
-Global service secrets such as API keys and backend passwords remain environment-file configuration in the current release-candidate line. Keep `runtime.env`, live `provider.env`, `runtime/`, TLS private keys and backups out of source control.
+Global service secrets are provisioned from root-protected runtime state and rc1.2 delivers routine middleware/container credentials through file-backed secret material where practical. Keep `runtime.env`, generated service-secret files, live `provider.env`, `runtime/`, TLS private keys and backups out of source control.
 
-On Dockerized/Super-Light deployments, an account that is allowed to operate Docker/Compose can currently render or inspect container environment values, including service/API secrets (for example through `docker-compose config` or container inspection). Do not paste full rendered Compose output into issues, chats or support logs. Docker-daemon access must already be treated as a privileged/root-equivalent capability; RC5 additionally retains plaintext environment-file delivery for several global secrets. Reducing routine Compose/environment exposure through Docker secrets or file-mounted credentials is deferred hardening tracked in `docs/ROADMAP.md`.
+File-backed delivery removes routine SunaQ service credentials from the API/provider/mail container environment; it does not make Docker access unprivileged. The optional bundled OpenWebUI currently receives its scoped provider-client credential through the upstream environment interface, so that UI credential remains visible in its Compose/container configuration when OpenWebUI is enabled. A Docker-daemon/root-equivalent operator can also inspect mounted secret files and container state. Do not publish `runtime/`, local Compose `.env` files, rendered diagnostics or backup material that may contain credentials.
 
 The FastAPI middleware on port 8765 is an **internal service boundary**. RC4.3 uses two installer-managed machine credentials: `RAG_INTERNAL_API_KEY` proves membership in the internal service plane, while `RAG_PROVIDER_INTERNAL_KEY` proves the narrower trusted-provider role. The provider supplies both on provider-originated middleware calls. Bundled nginx receives only the internal key and therefore cannot impersonate the provider merely by forwarding a request. These machine credentials do not replace provider Bearer authentication, SunaQ Admin authentication, Nextcloud live ACL or curation-session authentication.
 
@@ -40,12 +40,12 @@ Use GitHub private vulnerability reporting when available. Security questions or
 
 The complete private corpus is expected to remain in the local/private retrieval plane. Elasticsearch/Nextcloud access, embeddings, Qdrant and live ACL checks do not need to be exposed to an external LLM provider.
 
-Planner, verifier, evidence-control and answer roles can be configured independently. Remote roles are subject to explicit document/count/character budgets. Those limits reduce exposure but do not make transmitted evidence non-sensitive.
+Planner, verifier, evidence-control and answer roles can be configured independently. Formal SRC permits local/private model roles and explicitly administrator-configured remote model roles; remote evidence remains subject to document/count/character caps. Those limits reduce exposure but do not make transmitted evidence non-sensitive. The reranker/TEI path remains local/private in SRC because reranking occurs before the final live Nextcloud ACL decision.
 
 Graph entity/relation extraction is a separate trust decision because it may process larger document portions. Automatic graph-worker startup and automatic enqueue of cited documents are disabled by default in the reference configuration.
 
 Web archive writes have independent TLS verification settings. Disabling TLS verification is a diagnostic exception and should not be a production default.
 
-Incoming mail, public web pages and saved chats are untrusted content even when they are successfully indexed. Structured verifier/Graph schemas and evidence separation reduce prompt-injection risk but are not a complete defense. Do not treat model extraction as a trust signal.
+Incoming documents, mail, public web pages and saved chats are untrusted content even when successfully retrieved. rc1.2 serializes retrieved evidence as server-generated JSON records and appends an immutable Python-side evidence guard to evidence-consuming model roles. This reduces delimiter spoofing and removable-prompt risk but is not a guarantee that an LLM cannot be influenced by adversarial content. Do not treat model extraction as a trust signal.
 
 Deletion and backup are separate from authorization. The current release does not provide a single cross-store purge/restore transaction; see `docs/DATA-LIFECYCLE.md`.

@@ -60,10 +60,17 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from rag.version import VERSION
-from rag.search_text import normalize_query_quotes
+from rag.search_text import normalize_query_quotes, preserve_explicit_quoted_phrases
 from rag.research_log import ResearchLog
 from rag.llm_backend import build_llm_backend
 from rag.llm_roles import build_role_backends
+from rag.architecture_policy import (
+    architecture_tier,
+    is_src,
+    request_capability_error,
+    validate_role_backends,
+    validate_runtime_model,
+)
 from rag.sunaq_models import RuntimeModel, load_model_registry
 from rag.logging_utils import get_logger
 from rag.credential_store import CredentialStore, scope_identity
@@ -90,6 +97,13 @@ from rag.search_spec import (
     query_frame_from_search_spec,
 )
 from rag.source_origin import source_scope_allows_record
+from rag.evidence_boundary import (
+    fit_evidence_line_records,
+    fit_evidence_records,
+    guarded_evidence_prompt,
+    serialize_evidence_records,
+)
+from rag.secret_env import secret_env
 
 
 log = get_logger("provider")
@@ -153,7 +167,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", _LEGACY_OLLAMA_MODEL)
 ANSWER_MODEL = os.getenv("ANSWER_MODEL", LLM_MODEL)
 FOLLOWUP_MODEL = os.getenv("FOLLOWUP_MODEL", LLM_MODEL)
 
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_API_KEY = secret_env("LLM_API_KEY", "")
 LLM_VERIFY_TLS = os.getenv("LLM_VERIFY_TLS", "true").lower() in {
     "1", "true", "yes", "on"
 }
@@ -164,7 +178,7 @@ LLM_CA_FILE = os.getenv("LLM_CA_FILE", "").strip() or None
 OLLAMA_URL = LLM_BASE_URL
 OLLAMA_MODEL = LLM_MODEL
 
-PROVIDER_API_KEY = os.getenv("PROVIDER_API_KEY", "")  # deprecated plaintext compatibility variable; not trusted directly
+PROVIDER_API_KEY = secret_env("PROVIDER_API_KEY", "")  # deprecated compatibility variable; not trusted directly
 _PROVIDER_CLIENT_STORE: CredentialStore | None = None
 
 def _provider_credential_store_path() -> str:
@@ -245,6 +259,14 @@ def _source_capabilities_for_identity(scoped_user_id: str | None) -> dict[str, b
     archived material may still exist in Nextcloud and remain discoverable there,
     while SunaQ deliberately stops offering and accepting that source scope.
     """
+    if is_src(PROVIDER_CONFIG):
+        return {
+            "documents": True,
+            "mailarchive": False,
+            "webarchive": False,
+            "chatarchive": False,
+            "web": False,
+        }
     identity = str(scoped_user_id or "").strip()
     store = _provider_client_store()
     user = store.get_canonical_user_for_identity(identity) if identity else None
@@ -552,7 +574,18 @@ def _build_provider_runtime_model(model: RuntimeModel) -> ProviderRuntimeModel:
             "answer": ANSWER_MODEL,
         },
         role_overrides=model.roles,
+        private_network_only=is_src(PROVIDER_CONFIG),
     )
+    architecture_errors = [
+        *validate_runtime_model(PROVIDER_CONFIG, model),
+        *validate_role_backends(PROVIDER_CONFIG, role_backends),
+    ]
+    if architecture_errors:
+        raise RuntimeError(
+            f"SunaQ model {model.model_id}: incompatible with architecture tier "
+            f"{architecture_tier(PROVIDER_CONFIG)!r}: "
+            + "; ".join(architecture_errors)
+        )
     return ProviderRuntimeModel(
         model=model,
         retrieval_planner=planner,
@@ -1909,16 +1942,25 @@ async def _derive_after_web_queries(
     if not evidence:
         return [fallback] if fallback else []
 
+    bounded_evidence = serialize_evidence_records(
+        [{"citation": "[INTERNAL]", "text": evidence}],
+        kind="web_after_internal_context",
+    )
     prompt = (
         f"STEUERANWEISUNG:\n{instruction or '(keine)'}\n\n"
         f"BENUTZERAUFTRAG:\n{question}\n\n"
         f"VORLAEUFIGE WEB-SUCHANFRAGE (nur Hinweis, nicht verbindlich):\n{fallback or '(leer)'}\n\n"
-        f"INTERNE EVIDENCE:\n{evidence}"
+        f"INTERNE_EVIDENCE_JSON:\n{bounded_evidence}"
     )
     try:
         raw = await _ollama_complete(
             [
-                {"role": "system", "content": _prompt("web_after_query", WEB_AFTER_QUERY_SYSTEM_PROMPT)},
+                {
+                    "role": "system",
+                    "content": guarded_evidence_prompt(
+                        _prompt("web_after_query", WEB_AFTER_QUERY_SYSTEM_PROMPT)
+                    ),
+                },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.0,
@@ -2410,6 +2452,15 @@ async def _rewrite_query_with_context(
     if not rewritten:
         return question, False
 
+    guarded_rewritten = preserve_explicit_quoted_phrases(question, rewritten)
+    if guarded_rewritten != rewritten:
+        log.info(
+            "Follow-up query guard: restored explicit quoted phrase syntax: before=%r after=%r",
+            rewritten[:240],
+            guarded_rewritten[:240],
+        )
+        rewritten = guarded_rewritten
+
     log.info(
         "Follow-up reference resolution: use_history=%s original=%r standalone=%r",
         use_history,
@@ -2681,7 +2732,7 @@ async def _rewrite_search_spec(
     async def run_once(extra: str = "") -> dict[str, Any]:
         raw = await _ollama_complete(
             [
-                {"role": "system", "content": _prompt("query_rewriter", QUERY_REWRITER_SYSTEM_PROMPT)},
+                {"role": "system", "content": guarded_evidence_prompt(_prompt("query_rewriter", QUERY_REWRITER_SYSTEM_PROMPT))},
                 {"role": "user", "content": prompt + extra},
             ],
             temperature=0.0,
@@ -2696,6 +2747,18 @@ async def _rewrite_search_spec(
         value = _extract_json_object(raw)
         spec = normalize_search_spec(value, original_query=question)
         if files_requested:
+            phrase_guarded_query = preserve_explicit_quoted_phrases(
+                question,
+                spec.get("elastic_query") or "",
+            )
+            if phrase_guarded_query != spec.get("elastic_query"):
+                log.info(
+                    "query rewrite guard: restored explicit quoted phrase syntax: before=%r after=%r",
+                    spec.get("elastic_query") or "",
+                    phrase_guarded_query,
+                )
+                spec["elastic_query"] = phrase_guarded_query
+
             guarded_elastic_query = _guard_generated_numeric_month_must(
                 spec.get("elastic_query") or "",
                 original_query=question,
@@ -2748,11 +2811,11 @@ async def _rewrite_search_spec(
 
 
 def _planner_result_context(results: list[SearchResult]) -> str:
-    """Bounded, ACL-safe hit picture for a later planner round."""
+    """Bounded, ACL-safe JSON hit picture for a later planner round."""
     if not results:
-        return "(keine sichtbaren Dokumenttreffer)"
-    blocks: list[str] = []
-    remaining = _retrieval_planner().context_max_chars
+        return serialize_evidence_records([], kind="planner_visible_results")
+
+    records: list[dict[str, Any]] = []
     for result in results[:20]:
         raw = result.raw or {}
         snippet = str(
@@ -2763,34 +2826,33 @@ def _planner_result_context(results: list[SearchResult]) -> str:
             or raw.get("graph_snippet")
             or ""
         ).strip()
-        graph_entities = ", ".join(str(x) for x in (raw.get("graph_entities") or [])[:8])
-        direct_relations = raw.get("graph_direct_relations") or []
-        indirect_chains = raw.get("graph_indirect_chains") or []
-        relation_text = ""
-        chain_text = ""
-        if direct_relations:
-            relation_text = json.dumps(direct_relations[:4], ensure_ascii=False, default=str)
-        if indirect_chains:
-            chain_text = json.dumps(indirect_chains[:2], ensure_ascii=False, default=str)
-        block = (
-            f"DOKUMENT {result.index}\n"
-            f"ID: {raw.get('document_id') or ''}\n"
-            f"TITEL: {result.title}\n"
-            f"GRAPH-ENTITIES: {graph_entities or '-'}\n"
-            f"DIREKTE-RELATIONEN: {relation_text or '-'}\n"
-            f"INDIREKTE-BELEGKETTEN: {chain_text or '-'}\n"
-            f"AUSSCHNITT: {snippet[:1800]}"
+        records.append(
+            {
+                "citation": f"[{result.index}]",
+                "document_id": str(raw.get("document_id") or "")[:512],
+                "title": str(result.title or "")[:512],
+                "graph_entities": [
+                    str(value)[:300]
+                    for value in (raw.get("graph_entities") or [])[:8]
+                ],
+                "graph_direct_relations": list(
+                    (raw.get("graph_direct_relations") or [])[:4]
+                ),
+                "graph_indirect_chains": list(
+                    (raw.get("graph_indirect_chains") or [])[:2]
+                ),
+                "text": snippet,
+            }
         )
-        if len(block) > remaining:
-            block = block[:remaining]
-        if not block:
-            break
-        blocks.append(block)
-        remaining -= len(block)
-        if remaining <= 0:
-            break
-    return "\n\n---\n\n".join(blocks)
 
+    rendered, _ = fit_evidence_records(
+        records,
+        kind="planner_visible_results",
+        max_total_chars=_retrieval_planner().context_max_chars,
+        per_record_max_chars=1800,
+        min_partial_chars=200,
+    )
+    return rendered
 
 def _planner_executor_probe(
     probe: dict[str, str],
@@ -3031,7 +3093,7 @@ async def _retrieval_planner_decision(
         "Erzeuge nur zusaetzliche Probes. Die Originalfrage wird vom System immer beibehalten."
     )
     planner_messages = [
-        {"role": "system", "content": _prompt("planner", RETRIEVAL_PLANNER_SYSTEM_PROMPT)},
+        {"role": "system", "content": guarded_evidence_prompt(_prompt("planner", RETRIEVAL_PLANNER_SYSTEM_PROMPT))},
         {"role": "user", "content": prompt},
     ]
     planner_model = _retrieval_planner().model or ANSWER_MODEL
@@ -3134,12 +3196,12 @@ async def _retrieval_planner_decision(
     }
 
 
+
 def _verification_context(
     results: list[SearchResult],
     *,
     start_index: int = 1,
 ) -> str:
-    blocks: list[str] = []
     per_doc = _retrieval_planner().verification_max_chars_per_document
     total_limit = 10**9
     if _role_remote("verifier"):
@@ -3160,24 +3222,32 @@ def _verification_context(
         else:
             per_doc = min(per_doc, REMOTE_VERIFIER_MAX_CHARS_PER_DOCUMENT)
             total_limit = REMOTE_LLM_MAX_TOTAL_CHARS
-    used = 0
-    for offset, result in enumerate(results):
-        index = start_index + offset
-        text = str(result.text or "").strip()[:per_doc]
-        block = (
-            f"[DOKUMENT {index}]\n"
-            f"Titel: {result.title}\n"
-            f"Inhalt:\n{text}"
-        )
-        if used + len(block) > total_limit:
-            remaining = total_limit - used
-            if remaining > 400:
-                blocks.append(block[:remaining])
-            break
-        blocks.append(block)
-        used += len(block)
-    return "\n\n---\n\n".join(blocks)
 
+    records: list[dict[str, Any]] = []
+    for offset, result in enumerate(results):
+        raw = result.raw or {}
+        index = start_index + offset
+        records.append(
+            {
+                "citation": f"[DOKUMENT {index}]",
+                "index": index,
+                "document_id": str(raw.get("document_id") or "")[:512],
+                "title": str(result.title or "")[:512],
+                "path": str(raw.get("path") or raw.get("file_path") or "")[:1024],
+                "source_origin": str(raw.get("source_origin") or "")[:128],
+                # Preserve OCR/document line structure explicitly inside the
+                # JSON evidence record.
+                "text_lines": str(result.text or "").strip().split("\n"),
+            }
+        )
+    rendered, _ = fit_evidence_line_records(
+        records,
+        kind="verification_candidates",
+        max_total_chars=total_limit,
+        per_record_max_chars=per_doc,
+        min_partial_chars=400,
+    )
+    return rendered
 
 def _observed_document_years(result: SearchResult) -> list[str]:
     """Return four-digit years visibly present in the reviewed title/body."""
@@ -3441,7 +3511,7 @@ async def _verify_exhaustive_candidates(
             f"KANDIDATEN (bereits Live-ACL-geprueft):\n{context}"
         )
         messages = [
-            {"role": "system", "content": _prompt("verifier", CANDIDATE_VERIFIER_SYSTEM_PROMPT)},
+            {"role": "system", "content": guarded_evidence_prompt(_prompt("verifier", CANDIDATE_VERIFIER_SYSTEM_PROMPT))},
             {"role": "user", "content": prompt},
         ]
 
@@ -3855,42 +3925,44 @@ async def _web_finalize_archive(
         return response.json()
 
 
+
 def _build_web_context(payload: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     sources = list(payload.get("sources") or [])
-    blocks: list[str] = []
-    kept: list[dict[str, Any]] = []
-    used = 0
+    records: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for source in sources:
         text = str(source.get("evidence_text") or "").strip()
         if not text:
             continue
-        index = len(kept) + 1
-        header = [
-            f"[W{index}] {source.get('title') or source.get('final_url') or 'Webquelle'}",
-            f"URL: {source.get('final_url') or source.get('url') or ''}",
-        ]
-        if source.get("publisher"):
-            header.append(f"Publisher: {source.get('publisher')}")
-        if source.get("published_at"):
-            header.append(f"Veröffentlicht: {source.get('published_at')}")
-        if source.get("retrieved_at"):
-            header.append(f"Abgerufen: {source.get('retrieved_at')}")
-        block = "\n".join(header) + "\n\n" + text[:PER_RESULT_MAX_CHARS]
-        if blocks and used + len(block) > CONTEXT_MAX_CHARS:
-            break
-        if not blocks and len(block) > CONTEXT_MAX_CHARS:
-            block = block[:CONTEXT_MAX_CHARS]
-        blocks.append(block)
-        used += len(block) + 6
+        index = len(candidates) + 1
         item = dict(source)
         item["index"] = index
-        kept.append(item)
-    return "\n\n---\n\n".join(blocks), kept
+        candidates.append(item)
+        records.append(
+            {
+                "citation": f"[W{index}]",
+                "index": index,
+                "title": str(source.get("title") or source.get("final_url") or "Webquelle")[:512],
+                "url": str(source.get("final_url") or source.get("url") or "")[:2048],
+                "publisher": str(source.get("publisher") or "")[:512],
+                "published_at": str(source.get("published_at") or "")[:128],
+                "retrieved_at": str(source.get("retrieved_at") or "")[:128],
+                "text": text,
+            }
+        )
 
+    rendered, included_count = fit_evidence_records(
+        records,
+        kind="public_web",
+        max_total_chars=CONTEXT_MAX_CHARS,
+        per_record_max_chars=PER_RESULT_MAX_CHARS,
+        min_partial_chars=400,
+    )
+    return rendered, candidates[:included_count]
 
 def _web_answer_messages(question: str, context: str) -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": _prompt("web_answer", WEB_ANSWER_SYSTEM_PROMPT)},
+        {"role": "system", "content": guarded_evidence_prompt(_prompt("web_answer", WEB_ANSWER_SYSTEM_PROMPT))},
         {
             "role": "user",
             "content": f"FRAGE:\n{question}\n\nWEB-EVIDENCE:\n{context}",
@@ -3905,7 +3977,7 @@ def _hybrid_web_answer_messages(
     web_context: str,
 ) -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": _prompt("hybrid_web_answer", HYBRID_WEB_ANSWER_SYSTEM_PROMPT)},
+        {"role": "system", "content": guarded_evidence_prompt(_prompt("hybrid_web_answer", HYBRID_WEB_ANSWER_SYSTEM_PROMPT))},
         {
             "role": "user",
             "content": (
@@ -4383,6 +4455,7 @@ async def _store_positive_research_findings(
         )
 
 
+
 def _build_context(
     results: list[SearchResult],
     *,
@@ -4390,19 +4463,12 @@ def _build_context(
     context_max_chars: int | None = None,
     preserve_all_results: bool = False,
 ) -> tuple[str, list[SearchResult]]:
-    """Build the LLM context and return exactly the results that reached it.
+    """Build structured JSON evidence and return exactly the included results.
 
-    Ordinary remote answers keep both the per-document and document-count caps.
-    For an already-verified exhaustive result set, ``preserve_all_results`` keeps
-    the same remote *total* character budget but distributes it across every
-    confirmed match.  This prevents a complete 12-document verification from
-    silently becoming a 7-document answer merely because the first documents
-    consumed the remote context budget.
+    The existing local/remote/profile budgets remain authoritative. Evidence is
+    serialized as JSON records so document text or metadata cannot syntactically
+    impersonate SunaQ-generated source boundaries.
     """
-    blocks: list[str] = []
-    included: list[SearchResult] = []
-    used = 0
-
     effective_per_result = int(
         PER_RESULT_MAX_CHARS if per_result_max_chars is None else per_result_max_chars
     )
@@ -4412,10 +4478,6 @@ def _build_context(
     effective_results = results
     profile_budget = _answer_context_budget()
     if profile_budget is not None:
-        # Normal answer-context calls use the provider defaults as sentinels:
-        # the selected SunaQ profile replaces those defaults rather than being
-        # clipped by them. Explicit specialist calls (/use, /elastic) still
-        # pass their own budgets and remain bounded by the smaller value.
         effective_per_result = (
             profile_budget["max_chars_per_document"]
             if per_result_max_chars is None
@@ -4471,62 +4533,41 @@ def _build_context(
             if not preserve_all_results:
                 effective_results = results[:REMOTE_ANSWER_MAX_DOCUMENTS]
 
-    def header_for(result: SearchResult) -> str:
-        source_date = str(result.raw.get("source_date") or "").strip()
-        document_date = str(result.raw.get("document_date") or "").strip()
-        date_line = ""
-        if source_date:
-            date_line += f"QUELLDATUM: {source_date}\n"
-        if document_date:
-            date_line += f"TECHNISCHES_DOKUMENTDATUM: {document_date}\n"
-        return f"[{result.index}] DATEI: {result.title}\n{date_line}"
-
-    # Exhaustive verified sets and explicit /use selections are deliberate
-    # document sets. Keep every selected document visible by balancing the
-    # unchanged total context budget across the set instead of allowing
-    # sequential truncation (local) or a document-count cap (remote).
-    if preserve_all_results and effective_results:
-        separator = "\n\n---\n\n"
-        headers = [header_for(result) for result in effective_results]
-        fixed_chars = sum(len(header) for header in headers) + len(separator) * max(0, len(headers) - 1)
-        text_budget = max(0, effective_total - fixed_chars)
-        fair_text_budget = min(effective_per_result, text_budget // len(effective_results))
-        for result, header in zip(effective_results, headers):
-            text = str(result.text or "")[:max(0, fair_text_budget)]
-            blocks.append(header + text)
-            included.append(result)
-        return separator.join(blocks), included
-
+    records: list[dict[str, Any]] = []
     for result in effective_results:
-        text = result.text[:max(1, effective_per_result)]
-        block = header_for(result) + text
+        raw = result.raw or {}
+        record: dict[str, Any] = {
+            "citation": f"[{result.index}]",
+            "title": str(result.title or "")[:512],
+            "text": str(result.text or ""),
+        }
+        optional_metadata = {
+            "document_id": str(raw.get("document_id") or "")[:512],
+            "path": str(raw.get("path") or raw.get("file_path") or "")[:1024],
+            "source_origin": str(raw.get("source_origin") or "")[:128],
+            "source_date": str(raw.get("source_date") or "")[:128],
+            "document_date": str(raw.get("document_date") or "")[:128],
+        }
+        record.update({key: value for key, value in optional_metadata.items() if value})
+        records.append(record)
 
-        if used + len(block) > effective_total:
-            remaining = effective_total - used
-            if remaining > 500:
-                blocks.append(block[:remaining])
-                included.append(result)
-            break
-
-        blocks.append(block)
-        included.append(result)
-        used += len(block)
-
-    return "\n\n---\n\n".join(blocks), included
+    context, included_count = fit_evidence_records(
+        records,
+        kind="documents",
+        max_total_chars=effective_total,
+        per_record_max_chars=effective_per_result,
+        preserve_all=preserve_all_results,
+        # JSON metadata consumes part of the historic character budget. Keep
+        # the final admitted ranked document when at least a useful excerpt fits.
+        min_partial_chars=200,
+    )
+    return context, list(effective_results[:included_count])
 
 
 def _build_review_context(
     results: list[SearchResult],
 ) -> tuple[str, list[SearchResult]]:
-    """Compact context for the control model; never spend the full answer budget.
-
-    A graph-ranked document may be relevant because of a passage that the ES
-    highlighter did not select.  Graph-focused snippets therefore take priority
-    for graph hits; ES/vector snippets remain complementary evidence.
-    """
-    blocks: list[str] = []
-    included: list[SearchResult] = []
-    used = 0
+    """Compact structured evidence for the control model."""
 
     effective_results = results
     effective_per_result = EVIDENCE_PER_RESULT_MAX_CHARS
@@ -4536,11 +4577,9 @@ def _build_review_context(
         effective_per_result = min(effective_per_result, REMOTE_LLM_MAX_CHARS_PER_DOCUMENT)
         effective_total = min(effective_total, REMOTE_LLM_MAX_TOTAL_CHARS)
 
+    records: list[dict[str, Any]] = []
     for result in effective_results:
-        raw = result.raw
-        # Keep the reason each retrieval arm surfaced the document.  In
-        # particular, never hide a graph-relevant passage merely because the
-        # same document also has an ES rank.
+        raw = result.raw or {}
         pieces: list[str] = []
         es_text = str(raw.get("es_snippet") or "").strip()
         vector_text = str(raw.get("vector_snippet") or "").strip()
@@ -4559,8 +4598,6 @@ def _build_review_context(
             if graph_entities:
                 graph_meta.append("Graph-Entities: " + ", ".join(graph_entities[:6]))
             prefix = ("; ".join(graph_meta) + "\n") if graph_meta else ""
-            # Relation queries benefit more from the graph-focused passage than
-            # from a generic keyword highlight, so it gets the first review slot.
             pieces.append("GRAPH:\n" + prefix + graph_text[:1200])
 
         if es_text:
@@ -4570,39 +4607,31 @@ def _build_review_context(
 
         enriched_text = str(result.text or "").strip()
         if bool(raw.get("context_enriched")) and enriched_text:
-            # The middleware has already fetched and query-enriched the actual
-            # document body.  This is stronger evidence than a highlighter
-            # fragment and must be what the control model primarily reviews.
             review_text = enriched_text
         else:
             review_text = "\n".join(pieces).strip() or enriched_text
-        review_text = review_text[:effective_per_result]
 
-        source_date = str(raw.get("source_date") or "").strip()
-        document_date = str(raw.get("document_date") or "").strip()
-        date_line = ""
-        if source_date:
-            date_line += f"QUELLDATUM: {source_date}\n"
-        if document_date:
-            date_line += f"TECHNISCHES_DOKUMENTDATUM: {document_date}\n"
-        block = (
-            f"[{result.index}] DATEI: {result.title}\n"
-            f"{date_line}"
-            f"{review_text}"
+        records.append(
+            {
+                "citation": f"[{result.index}]",
+                "document_id": str(raw.get("document_id") or "")[:512],
+                "title": str(result.title or "")[:512],
+                "path": str(raw.get("path") or raw.get("file_path") or "")[:1024],
+                "source_origin": str(raw.get("source_origin") or "")[:128],
+                "source_date": str(raw.get("source_date") or "")[:128],
+                "document_date": str(raw.get("document_date") or "")[:128],
+                "text": review_text,
+            }
         )
-        if used + len(block) > effective_total:
-            remaining = effective_total - used
-            if remaining > 400:
-                blocks.append(block[:remaining])
-                included.append(result)
-            break
 
-        blocks.append(block)
-        included.append(result)
-        used += len(block)
-
-    return "\n\n---\n\n".join(blocks), included
-
+    rendered, included_count = fit_evidence_records(
+        records,
+        kind="evidence_review",
+        max_total_chars=effective_total,
+        per_record_max_chars=effective_per_result,
+        min_partial_chars=400,
+    )
+    return rendered, list(effective_results[:included_count])
 
 def _select_results_by_indexes(
     results: list[SearchResult],
@@ -4682,7 +4711,7 @@ async def _evidence_decision(
     ) -> dict[str, Any]:
         raw = await _ollama_complete(
             [
-                {"role": "system", "content": _prompt("evidence", EVIDENCE_DECISION_SYSTEM_PROMPT)},
+                {"role": "system", "content": guarded_evidence_prompt(_prompt("evidence", EVIDENCE_DECISION_SYSTEM_PROMPT))},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.0,
@@ -4912,7 +4941,7 @@ def _render_rag_prompt(
             f"genau {int(selected_document_count)} Dokumenteinträge enthalten; fehlende Felder "
             "werden markiert, nicht durch Weglassen des Dokuments behandelt."
         )
-    return base + "\n\n" + guard
+    return guarded_evidence_prompt(base + "\n\n" + guard)
 
 
 def _rag_answer_messages(
@@ -5652,7 +5681,7 @@ async def _repair_missing_citations(
             [
                 {
                     "role": "system",
-                    "content": (
+                    "content": guarded_evidence_prompt(
                         "Du bist ein Citation-Integrity-Controller. Wähle nur bereits "
                         "vorhandene interne Quellenindizes aus. Antworte ausschließlich als JSON."
                     ),
@@ -6267,6 +6296,7 @@ async def health() -> dict[str, Any]:
         "status": overall,
         "version": VERSION,
         "model": _active_model_id(),
+        "architecture_tier": architecture_tier(PROVIDER_CONFIG),
         "rag_middleware": RAG_MIDDLEWARE_URL,
         "middleware": middleware,
         "llm": llm_status,
@@ -6364,7 +6394,17 @@ async def list_models(
         item = model.public_info()
         item["default"] = model.model_id == default_id
         data.append(item)
-    return {"object": "list", "data": data}
+    capabilities = _source_capabilities_for_identity(user_id)
+    return {
+        "object": "list",
+        "data": data,
+        "architecture_tier": architecture_tier(PROVIDER_CONFIG),
+        "capabilities": {
+            "source_scopes": [
+                name for name, enabled in capabilities.items() if enabled
+            ],
+        },
+    }
 
 
 @app.get("/v1/user-settings")
@@ -6400,6 +6440,11 @@ async def register_chat_archive(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    if is_src(PROVIDER_CONFIG):
+        raise HTTPException(
+            status_code=404,
+            detail="Chat archive registration is not available in Secure RAG Core (SRC)",
+        )
     client_id = _check_auth(authorization)
     external_user_id = str(request.headers.get("x-rag-user-id") or "").strip()
     if not external_user_id:
@@ -6615,6 +6660,19 @@ async def chat_completions(
         if special_command == "health":
             return _static_response(
                 "Der Systemstatus ist nur für die Administration verfügbar.",
+                completion_id,
+                body.stream,
+            )
+
+        architecture_error = request_capability_error(
+            PROVIDER_CONFIG,
+            retrieval_arms=retrieval_arms,
+            source_scopes=source_scopes,
+            web_requested=web_requested,
+        )
+        if architecture_error:
+            return _static_response(
+                architecture_error,
                 completion_id,
                 body.stream,
             )

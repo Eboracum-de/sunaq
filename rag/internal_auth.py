@@ -1,9 +1,10 @@
 """Machine credentials for trusted calls into the middleware API."""
 from __future__ import annotations
 
-import os
 import secrets
 from typing import Mapping
+
+from rag.secret_env import secret_env
 
 ENV_NAME = "RAG_INTERNAL_API_KEY"
 HEADER_NAME = "X-AKI-Internal-Key"
@@ -13,7 +14,7 @@ MIN_KEY_LENGTH = 32
 
 
 def _key(name: str) -> str:
-    return str(os.getenv(name, "") or "").strip()
+    return secret_env(name, "").strip()
 
 
 def internal_api_key() -> str:
