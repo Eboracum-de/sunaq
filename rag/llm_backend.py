@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 import httpx
 
 from rag.policy_hooks import PRE_MODEL_EGRESS, apply_policy_hook
+from rag.network_policy import pinned_private_target
 
 
 def _verify_value(verify_tls: bool, ca_file: str | None) -> bool | ssl.SSLContext:
@@ -57,6 +58,8 @@ class LLMBackend:
     api_key: str = ""
     verify_tls: bool = True
     ca_file: str | None = None
+    private_network_only: bool = False
+    trust_env: bool = True
 
     kind: ClassVar[str] = "base"
 
@@ -71,6 +74,16 @@ class LLMBackend:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
+
+    def _request_target(
+        self,
+        path: str,
+    ) -> tuple[str, dict[str, str], dict[str, str] | None]:
+        url = f"{self.base_url}{path}"
+        if not self.private_network_only:
+            return url, {}, None
+        pinned_url, host_header, extensions = pinned_private_target(url)
+        return pinned_url, {"Host": host_header}, extensions
 
     def _policy_messages(
         self,
@@ -125,6 +138,8 @@ class LLMBackend:
             "authenticated": bool(self.api_key),
             "verify_tls": bool(self.verify_tls),
             "ca_file": bool(self.ca_file),
+            "private_network_only": bool(self.private_network_only),
+            "trust_env": bool(self.trust_env),
         }
 
 
@@ -154,12 +169,19 @@ class OllamaBackend(LLMBackend):
         if response_format is not None:
             payload["format"] = response_format
 
+        target_url, target_headers, target_extensions = self._request_target("/api/chat")
         async with httpx.AsyncClient(
             timeout=timeout,
             headers=self.headers(),
             verify=self._verify,
+            trust_env=self.trust_env,
         ) as client:
-            response = await client.post(f"{self.base_url}/api/chat", json=payload)
+            response = await client.post(
+                target_url,
+                json=payload,
+                headers=target_headers or None,
+                extensions=target_extensions,
+            )
             response.raise_for_status()
             data = response.json()
 
@@ -199,15 +221,19 @@ class OllamaBackend(LLMBackend):
             pool=30.0,
         )
 
+        target_url, target_headers, target_extensions = self._request_target("/api/chat")
         async with httpx.AsyncClient(
             timeout=timeout,
             headers=self.headers(),
             verify=self._verify,
+            trust_env=self.trust_env,
         ) as client:
             async with client.stream(
                 "POST",
-                f"{self.base_url}/api/chat",
+                target_url,
                 json=payload,
+                headers=target_headers or None,
+                extensions=target_extensions,
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
@@ -350,10 +376,12 @@ class OpenAICompatibleBackend(LLMBackend):
             if candidate not in unique_formats:
                 unique_formats.append(candidate)
 
+        target_url, target_headers, target_extensions = self._request_target("/chat/completions")
         async with httpx.AsyncClient(
             timeout=timeout,
             headers=self.headers(),
             verify=self._verify,
+            trust_env=self.trust_env,
         ) as client:
             response = None
             for idx, candidate in enumerate(unique_formats):
@@ -361,8 +389,10 @@ class OpenAICompatibleBackend(LLMBackend):
                 if candidate is not None:
                     attempt["response_format"] = candidate
                 response = await client.post(
-                    f"{self.base_url}/chat/completions",
+                    target_url,
                     json=attempt,
+                    headers=target_headers or None,
+                    extensions=target_extensions,
                 )
                 if response.is_success:
                     break
@@ -424,15 +454,19 @@ class OpenAICompatibleBackend(LLMBackend):
             pool=30.0,
         )
 
+        target_url, target_headers, target_extensions = self._request_target("/chat/completions")
         async with httpx.AsyncClient(
             timeout=timeout,
             headers=self.headers(),
             verify=self._verify,
+            trust_env=self.trust_env,
         ) as client:
             async with client.stream(
                 "POST",
-                f"{self.base_url}/chat/completions",
+                target_url,
                 json=payload,
+                headers=target_headers or None,
+                extensions=target_extensions,
             ) as response:
                 response.raise_for_status()
                 async for line in response.aiter_lines():
@@ -469,6 +503,8 @@ def build_llm_backend(
     api_key: str = "",
     verify_tls: bool = True,
     ca_file: str | None = None,
+    private_network_only: bool = False,
+    trust_env: bool = True,
 ) -> LLMBackend:
     name = str(backend or "ollama").strip().lower()
     kwargs = {
@@ -477,6 +513,8 @@ def build_llm_backend(
         "api_key": api_key,
         "verify_tls": verify_tls,
         "ca_file": ca_file,
+        "private_network_only": private_network_only,
+        "trust_env": trust_env,
     }
     if name in {"ollama", "native_ollama"}:
         return OllamaBackend(**kwargs)
