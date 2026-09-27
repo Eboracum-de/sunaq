@@ -51,7 +51,7 @@ Implemented scope:
 
 - enforce `architecture.tier: src|erg` at startup and request boundaries;
 - require live ACL and Documents-only Elasticsearch/files retrieval in SRC;
-- require one retrieval round and local/private model/reranker roles in SRC;
+- permit at most one retrieval round in SRC; LLM roles may be local/private or explicitly administrator-configured remote endpoints with remote evidence caps, while rerankers remain local/private;
 - block archive/Web/vector/document-graph/Findings capabilities in SRC;
 - ship **core** and **workgroup** safe YAML capability presets;
 - support `--preset` / `--preset-file` without executing preset data as shell;

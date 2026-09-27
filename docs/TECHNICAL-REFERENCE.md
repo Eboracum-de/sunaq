@@ -61,8 +61,10 @@ Core FastAPI routes expose their assigned zone in OpenAPI as `x-aki-security-zon
 rc1.2 separates four concepts:
 
 - **SRC / ERG** are enforced architecture/capability tiers. SRC is the narrow
-  Documents-only Elasticsearch/files path with mandatory live ACL, one retrieval
-  round and local/private model processing; ERG is the extension envelope.
+  Documents-only Elasticsearch/files path with mandatory live ACL, at most one
+  retrieval round and local/private or administrator-approved remote LLM roles
+  (remote evidence caps apply); rerankers remain local/private. ERG is the
+  extension envelope.
 - **core / workgroup** are shipped capability presets. `core` selects the SRC
   invariant set; `workgroup` is a conservative Elasticsearch-centric ERG
   starting point.

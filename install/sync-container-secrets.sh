@@ -41,7 +41,14 @@ chown "$owner" "$new_secret_dir"
 is_secret_key() {
   case "$1" in
     RAG_INTERNAL_API_KEY|RAG_PROVIDER_INTERNAL_KEY|RAG_CREDENTIAL_MASTER_KEY) return 0 ;;
-    *_API_KEY|*_PASSWORD|*_TOKEN|*_SECRET) return 0 ;;
+    *_API_KEY|*_KEY|*_PASSWORD|*_TOKEN|*_SECRET|*_CREDENTIALS|*_AUTH_CONFIG) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+is_runtime_non_secret_key() {
+  case "$1" in
+    RAG_ADMIN_USER|RAG_MAINTENANCE_MODE|RAG_CREDENTIAL_ENCRYPTION) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -121,6 +128,12 @@ copy_non_secret_env() {
     if [[ "$key" == *_FILE ]] && is_secret_key "${key%_FILE}"; then
       continue
     fi
+    # runtime.env is credential-bearing. Only documented non-secret controls
+    # may be copied into process/container environments; every other runtime
+    # key is materialized as a file-backed secret below.
+    if [[ "$file" == "$RUNTIME_ENV" ]] && ! is_runtime_non_secret_key "$key"; then
+      continue
+    fi
 
     raw="${line#*=}"
     # Docker/Compose already understands dotenv quoting; retain it verbatim.
@@ -153,6 +166,14 @@ for file in "$PROVIDER_ENV" "$RUNTIME_ENV"; do
     [[ "$line" == *=* ]] || continue
     key="${line%%=*}"
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ "$file" == "$RUNTIME_ENV" ]]; then
+      [[ "$key" == "RAG_CREDENTIAL_MASTER_KEY_FILE" ]] && continue
+      is_runtime_non_secret_key "$key" && continue
+      # Fail closed for administrator-defined api_key_env names: runtime.env is
+      # the documented credential file, so unknown keys are secrets by default.
+      secret_names["$key"]=1
+      continue
+    fi
     is_secret_key "$key" || continue
     secret_names["$key"]=1
   done < "$file"

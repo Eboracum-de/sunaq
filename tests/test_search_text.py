@@ -49,6 +49,20 @@ def test_parenthesized_explicit_phrases_keep_occurrence_semantics():
     ) == '"Project Alpha 42"'
 
 
+def test_separately_quoted_single_word_keeps_positive_component():
+    assert preserve_explicit_quoted_phrases(
+        '-"Project Alpha" +"Alpha"',
+        "+Project +Alpha",
+    ) == '+Alpha -"Project Alpha"'
+
+
+def test_parenthesized_rewritten_phrase_is_not_split_into_lexical_fragments():
+    assert preserve_explicit_quoted_phrases(
+        '+"Project Alpha"',
+        '(+"Project Alpha")',
+    ) == '+"Project Alpha"'
+
+
 def test_preserved_phrase_compiles_as_one_nextcloud_query_token():
     tokens = nextcloud_query_tokens('"Project Alpha 42"')
     assert len(tokens) == 1

@@ -32,7 +32,19 @@ def normalize_query_quotes(text: str) -> str:
 
 
 _QUOTED_TOKEN_RE = re.compile(r'(?<![\w+-])([+-]?)"((?:\\.|[^"])*)"')
-_RAW_QUERY_TOKEN_RE = re.compile(r'[+-]?"(?:\\.|[^"])*"|\S+')
+_RAW_QUERY_TOKEN_RE = re.compile(r'[([{]*[+-]?"(?:\\.|[^"])*"[)\]}]*|\S+')
+_GROUPING_CHARS = "()[]{}"
+
+
+def _comparison_token(token: str) -> tuple[str, str]:
+    value = str(token or "").strip().strip(_GROUPING_CHARS).strip()
+    sign = value[:1] if value[:1] in {"+", "-"} else ""
+    if sign:
+        value = value[1:].strip()
+    value = value.strip(_GROUPING_CHARS).strip()
+    if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+        value = value[1:-1].replace(r'\"', '"')
+    return sign, value.strip(" \t\r\n.,;:!?()[]{}").casefold()
 
 
 def preserve_explicit_quoted_phrases(original_query: str, rewritten_query: str) -> str:
@@ -62,9 +74,10 @@ def preserve_explicit_quoted_phrases(original_query: str, rewritten_query: str) 
         for pos in range(match.start(), match.end()):
             outside[pos] = " "
     outside_words = {
-        token.strip(" \t\r\n.,;:!?()[]{}").lstrip("+-").casefold()
-        for token in re.findall(r"\S+", "".join(outside))
-        if token.strip(" \t\r\n.,;:!?()[]{}").lstrip("+-")
+        value
+        for token in _RAW_QUERY_TOKEN_RE.findall("".join(outside))
+        for _, value in [_comparison_token(token)]
+        if value
     }
 
     protected_components: set[str] = set()
@@ -84,16 +97,14 @@ def preserve_explicit_quoted_phrases(original_query: str, rewritten_query: str) 
     kept: list[str] = []
     for raw in _RAW_QUERY_TOKEN_RE.findall(rewritten):
         token = raw.strip()
-        signless = token[1:] if token[:1] in {"+", "-"} else token
-        if signless.startswith('"') and signless.endswith('"'):
-            value = signless[1:-1].replace(r'\"', '"')
-            if value.casefold() in protected_phrase_values:
+        _, value = _comparison_token(token)
+        if '"' in token and value:
+            if value in protected_phrase_values:
                 # Re-add below using exactly the user's occurrence marker.
                 continue
             kept.append(token)
             continue
 
-        value = signless.strip('"').strip(".,;:!?()[]{}").casefold()
         if value in protected_components:
             continue
         kept.append(token)

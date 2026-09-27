@@ -156,6 +156,23 @@ def test_src_rejects_multiple_retrieval_rounds():
     assert "one retrieval round" in validate_runtime_model(cfg, Model())[0]
 
 
+def test_src_validates_effective_retrieval_rounds_from_environment(monkeypatch):
+    cfg = _src_config()
+
+    class Model:
+        model_id = "legacy-rounds"
+        config = {"retrieval_planner": {}}
+
+        def section(self, name):
+            return self.config.get(name, {})
+
+    monkeypatch.setenv("MAX_RETRIEVAL_ROUNDS", "2")
+    assert "at most one retrieval round" in validate_runtime_model(cfg, Model())[0]
+
+    Model.config = {"retrieval_planner": {"max_retrieval_rounds": 1}}
+    assert validate_runtime_model(cfg, Model()) == []
+
+
 def test_erg_does_not_apply_src_restrictions():
     cfg = {"architecture": {"tier": "erg"}}
     assert validate_architecture_config(cfg) == []

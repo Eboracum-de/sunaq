@@ -60,7 +60,14 @@ def pinned_private_target(url: str) -> tuple[str, str, dict[str, str] | None]:
 
     parsed = urlparse(str(url or ""))
     hostname, addresses = resolve_private_endpoint(url)
-    address = addresses[0]
+    address = next(
+        (
+            value
+            for value in addresses
+            if ipaddress.ip_address(value).version == 4
+        ),
+        addresses[0],
+    )
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     default_port = 443 if parsed.scheme == "https" else 80
     display_host = hostname

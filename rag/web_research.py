@@ -281,11 +281,11 @@ def _is_public_ip(value: str) -> bool:
         address = ipaddress.ip_address(str(value or ""))
     except ValueError:
         return False
-    return not (
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_multicast
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return bool(address.is_global) and not (
+        address.is_multicast
         or address.is_reserved
         or address.is_unspecified
     )
@@ -512,7 +512,8 @@ class WebFetcher:
                 if not isinstance(current, str):
                     raise TypeError("pre_fetch policy hook must return str content")
 
-                targets = _validated_connect_targets(
+                targets = await asyncio.to_thread(
+                    _validated_connect_targets,
                     current,
                     self.allow_private,
                     allowed_ports=self.allowed_ports,

@@ -470,7 +470,9 @@ def test_super_light_core_services_use_generated_non_secret_env_only():
     assert 'MAIL_WORKER_ACTIVE' in installer
     sync = (ROOT / "install/sync-container-secrets.sh").read_text()
     assert "RAG_PROVIDER_INTERNAL_KEY" in sync
-    assert "*_API_KEY|*_PASSWORD|*_TOKEN|*_SECRET" in sync
+    assert "*_API_KEY|*_KEY|*_PASSWORD|*_TOKEN|*_SECRET|*_CREDENTIALS|*_AUTH_CONFIG" in sync
+    assert "is_runtime_non_secret_key" in sync
+    assert '[[ "$file" == "$RUNTIME_ENV" ]] && ! is_runtime_non_secret_key "$key"' in sync
     assert "runtime.container.env" in sync
     assert "service-secrets" in sync
     loader = (ROOT / "install/load-service-env.sh").read_text()

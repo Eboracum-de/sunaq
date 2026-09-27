@@ -18,6 +18,8 @@ import socket
 from typing import Any
 from urllib.parse import urlparse
 
+from rag.retrieval_planner import load_retrieval_planner_settings
+
 
 SRC = "src"
 ERG = "erg"
@@ -240,9 +242,18 @@ def validate_runtime_model(cfg: Mapping[str, Any], model: Any) -> list[str]:
         return []
     errors: list[str] = []
     try:
-        rounds = int(model.section("retrieval_planner").get("max_retrieval_rounds", 1))
-    except Exception:
-        rounds = 1
+        model_config = getattr(model, "config", None)
+        if isinstance(model_config, Mapping):
+            effective_config = dict(model_config)
+        else:
+            effective_config = {
+                "retrieval_planner": dict(model.section("retrieval_planner") or {})
+            }
+        rounds = int(
+            load_retrieval_planner_settings(effective_config).max_retrieval_rounds
+        )
+    except (TypeError, ValueError, AttributeError, KeyError):
+        rounds = 2
     if rounds > 1:
         errors.append(
             f"SRC permits at most one retrieval round; model "

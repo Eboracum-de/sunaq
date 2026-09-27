@@ -11,6 +11,8 @@ def test_public_web_blocks_loopback_link_local_and_ipv6_loopback():
     for url in (
         "http://127.0.0.1/admin",
         "http://169.254.169.254/latest/meta-data/",
+        "http://100.100.100.200/",
+        "http://[::ffff:100.100.100.200]/",
         "http://[::1]/",
     ):
         with pytest.raises(RuntimeError):
@@ -66,6 +68,7 @@ def test_web_fetcher_disables_environment_proxy_and_pins_connect_target():
 
     source = inspect.getsource(web_research.WebFetcher.fetch)
     assert "trust_env=False" in source
+    assert "asyncio.to_thread" in source
     assert "_validated_connect_targets" in source
     assert '"Host": host_header' in source
     assert '{"sni_hostname": sni_hostname}' in source

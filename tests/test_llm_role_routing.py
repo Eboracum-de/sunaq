@@ -2,6 +2,7 @@ import os
 from dataclasses import replace
 
 import rag.llm_roles as roles
+import rag.network_policy as network_policy
 import rag.openai_provider as provider
 
 
@@ -29,6 +30,20 @@ def test_role_backend_inherits_default_and_can_override(monkeypatch):
     assert built["answer"].backend_name == "openai"
     assert built["answer"].base_url == "https://api.example.test/v1"
     assert built["answer"].scope == "remote"
+
+
+def test_private_endpoint_pinning_prefers_validated_ipv4(monkeypatch):
+    monkeypatch.setattr(
+        network_policy,
+        "resolve_private_endpoint",
+        lambda url: ("model.internal", ["fd00::5", "10.0.0.5"]),
+    )
+    target, host_header, extensions = network_policy.pinned_private_target(
+        "https://model.internal/v1"
+    )
+    assert target == "https://10.0.0.5/v1"
+    assert host_header == "model.internal"
+    assert extensions == {"sni_hostname": "model.internal"}
 
 
 def test_src_private_network_guard_applies_only_to_local_roles(monkeypatch):

@@ -25,7 +25,10 @@ def test_service_secret_materializer_handles_quotes_empty_override_and_rotation(
         "RAG_INTERNAL_API_KEY='internal-machine'\n"
         "RAG_PROVIDER_INTERNAL_KEY=\"provider-runtime\"\n"
         "RAG_ADMIN_PASSWORD='admin pass'\n"
-        "LLM_API_KEY=\n",
+        "LLM_API_KEY=\n"
+        "OPENROUTER_KEY='openrouter-secret'\n"
+        "CUSTOM_CREDENTIAL='custom-secret'\n"
+        "RAG_MAINTENANCE_MODE=true\n",
         encoding="utf-8",
     )
 
@@ -47,6 +50,8 @@ def test_service_secret_materializer_handles_quotes_empty_override_and_rotation(
     assert (secrets / "RAG_ADMIN_PASSWORD").read_text() == "admin pass"
     # An explicitly empty runtime value overrides the older provider.env value.
     assert (secrets / "LLM_API_KEY").read_text() == ""
+    assert (secrets / "OPENROUTER_KEY").read_text() == "openrouter-secret"
+    assert (secrets / "CUSTOM_CREDENTIAL").read_text() == "custom-secret"
     assert not (secrets / "STALE_API_KEY").exists()
 
     container_env = (prefix / "runtime.container.env").read_text()
@@ -56,6 +61,11 @@ def test_service_secret_materializer_handles_quotes_empty_override_and_rotation(
     assert "provider-runtime" not in container_env
     assert "internal-machine" not in container_env
     assert "provider-old" not in container_env
+    assert "openrouter-secret" not in container_env
+    assert "custom-secret" not in container_env
+    assert "OPENROUTER_KEY_FILE=/run/sunaq-secrets/OPENROUTER_KEY" in container_env
+    assert "CUSTOM_CREDENTIAL_FILE=/run/sunaq-secrets/CUSTOM_CREDENTIAL" in container_env
+    assert "RAG_MAINTENANCE_MODE=true" in container_env
     assert "LLM_BASE_URL=http://127.0.0.1:11434" in container_env
 
     service_env = (prefix / "runtime.service.env").read_text()
