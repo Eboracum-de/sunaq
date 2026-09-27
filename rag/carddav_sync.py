@@ -26,6 +26,7 @@ from xml.etree import ElementTree as ET
 import httpx
 
 from rag.nextcloud_tls import nextcloud_verify_value
+from rag.secret_env import secret_env
 from rag.credential_store import (
     CanonicalUser,
     ContactSyncSettings,
@@ -51,7 +52,7 @@ NS = {"d": DAV, "card": CARD}
 def _env_or_cfg(cfg: dict[str, Any], direct_path: str, env_path: str, default: str = "") -> str:
     env_name = str(cfg_get(cfg, env_path, default="") or "").strip()
     if env_name:
-        value = os.getenv(env_name, "")
+        value = secret_env(env_name, "")
         if value:
             return value
     return str(cfg_get(cfg, direct_path, default=default) or default)

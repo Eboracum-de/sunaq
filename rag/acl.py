@@ -33,6 +33,7 @@ import xml.etree.ElementTree as ET
 import httpx
 
 from rag.credential_store import CredentialStore
+from rag.secret_env import secret_env
 from rag.nextcloud_tls import nextcloud_verify_value
 
 
@@ -326,7 +327,7 @@ class NextcloudLiveAcl:
             username_env = str(_cfg_get(self.cfg, "acl.username_env", default="NEXTCLOUD_USERNAME") or "NEXTCLOUD_USERNAME")
             password_env = str(_cfg_get(self.cfg, "acl.password_env", default="NEXTCLOUD_APP_PASSWORD") or "NEXTCLOUD_APP_PASSWORD")
             username = os.getenv(username_env, "").strip()
-            password = os.getenv(password_env, "")
+            password = secret_env(password_env, "")
             if not username or not password:
                 raise AclConfigurationError(
                     f"live ACL credentials missing ({username_env}/{password_env})"
@@ -361,7 +362,7 @@ class NextcloudLiveAcl:
         if username_env:
             username = os.getenv(username_env, "").strip()
         password_env = str(entry.get("password_env") or "").strip()
-        password = os.getenv(password_env, "") if password_env else ""
+        password = secret_env(password_env, "") if password_env else ""
         if not username or not password:
             raise AclIdentityError("Nextcloud credential mapping is incomplete")
         return NextcloudCredential(username, password)
