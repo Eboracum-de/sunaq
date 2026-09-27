@@ -1,6 +1,6 @@
 # Known limitations
 
-**Reference:** `0.8.6-rc1.1`
+**Reference:** `0.8.6-rc1.2`
 
 This file records current limits so that beta expectations match the code. Items
 listed here are not necessarily defects; several are deliberate scope boundaries.
@@ -34,7 +34,7 @@ listed here are not necessarily defects; several are deliberate scope boundaries
 ## Installation and deployment
 
 - Only `standard + native` and `super-light + dockerized` are supported/tested
-  deployment mappings in the 0.8.6-rc1 candidate.
+  deployment mappings in the 0.8.6-rc1.2 candidate.
 - Installer/rerun preflight validates the install source, non-empty install
   prefix, CA files and Docker availability before destructive refresh steps, and
   refuses a running existing SunaQ stack. Explicitly supplied Nextcloud and
@@ -45,7 +45,7 @@ listed here are not necessarily defects; several are deliberate scope boundaries
   archive the generated `install/last-install-command.sh` for reproducible reruns.
 - Super-Light intentionally relies on external Nextcloud, Elasticsearch and LLM
   services. Their availability and backup are outside the local Compose stack.
-- Super-Light still supplies several global service secrets through Compose environment files. A non-root account that can operate the Docker daemon/Compose stack can therefore render or inspect those values (for example with `docker-compose config`). Treat Docker-daemon access as privileged/root-equivalent, do not share full rendered Compose output, and restrict membership/access accordingly. Moving routine service-secret delivery to Docker secrets or file-mounted credentials remains deferred hardening.
+- rc1.2 uses file-backed runtime secret material for SunaQ API/provider/mail/Graph/model service credentials, so those values no longer need to appear in the normal container environment. The optional bundled OpenWebUI still receives its scoped provider-client key through its upstream-supported environment interface; `docker compose config` can therefore expose that one optional UI credential when OpenWebUI is enabled. Docker-daemon access remains root-equivalent, and `runtime.env`, generated secret files, local Compose `.env` files and backups remain sensitive.
 - Bundled nginx and OpenWebUI are opt-in in Super-Light. SunaQ Recherche is the
   reference slim Nextcloud UI for the current beta.
 - Super-Light prepares the SunaQ application/provider image during installation,
@@ -127,7 +127,7 @@ listed here are not necessarily defects; several are deliberate scope boundaries
 - Playwright PDF rendering is backgrounded, but the WebDAV archive write that creates the run directory, text snapshots, metadata/fetch-log material and initial `recherche.md` is still synchronous. On higher-latency Nextcloud/WebDAV paths this archive phase can dominate Web Research response time even when search/fetch/relevance are fast. This is a performance limitation, not an evidence or renderer failure.
 - Web pages, incoming mail and saved chats can contain adversarial or instruction-like
   text. Structured verifier/Graph schemas and evidence separation reduce risk, but
-  0.8.6 does not claim a complete prompt-injection defense. See `THREAT-MODEL.md`.
+  rc1.2 isolates retrieved content in server-generated JSON records and adds an immutable evidence guard, but no model-level mechanism can guarantee complete prompt-injection immunity. See `THREAT-MODEL.md`.
 
 ## SunaQ Recherche
 
@@ -136,6 +136,7 @@ listed here are not necessarily defects; several are deliberate scope boundaries
   remain in SunaQ Admin rather than being duplicated in SunaQ Recherche.
 
 ## Graph
+- rc1.2 provides no provenance-aware migration of a historical ERG Neo4j graph into SRC. During the RC line, converting an existing ERG installation to SRC requires an explicit full Neo4j reset and re-import of trusted CardDAV/administrator seeds. This avoids allowing older document-derived identities to influence SRC query expansion.
 
 - CardDAV seeds and SunaQ Research Findings are lightweight graph inputs. Full
   document graph extraction remains comparatively expensive and opt-in.
