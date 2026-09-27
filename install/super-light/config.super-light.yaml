@@ -1,3 +1,7 @@
+# Super-Light is the packaged Secure RAG Core (SRC) baseline.
+architecture:
+  tier: src
+
 # Super-Light installation profile for SunaQ 0.8.6-rc1.
 # Elasticsearch is the only document retrieval arm; Neo4j is used only for entity/alias expansion.
 health:
@@ -51,7 +55,7 @@ retrieval_policy:
     vector: disabled
     graph: disabled
   optional_default: include
-  web: planner  # disabled | explicit | planner
+  web: disabled  # SRC invariant
 
 sync_worker:
   enabled: false
@@ -233,7 +237,7 @@ chat_archive:
   root: SunaQ-Chats
 
 mail_metadata:
-  enabled: true
+  enabled: false
   timeout: 10
 mail:
   enabled: false

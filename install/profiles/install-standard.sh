@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Bootstrap a blank Linux VM into a usable SunaQ / Eboracum Research Gateway node.
-# 0.8.5-rc4.3 standard profile implementation.
+# 0.8.6-rc1.2 standard profile implementation.
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PREFIX="/opt/sunaq"
@@ -38,6 +38,9 @@ DOWNLOAD_RERANKER=0
 ASSUME_YES=0
 PLAN_ONLY=0
 X509_STRICT=0
+X509_STRICT_EXPLICIT=0
+PRESET_FILE=""
+PRESET_NAME=""
 
 usage() {
   cat <<USAGE
@@ -50,6 +53,8 @@ Options:
   --ca-certificate FILE     Trust one private CA certificate for Nextcloud; repeatable
   --elasticsearch-url URL   Override Elasticsearch URL in config.yaml
   --elasticsearch-index ID  Override Elasticsearch index in config.yaml
+  --preset core|workgroup   Apply a shipped capability preset
+  --preset-file FILE        Apply a safe YAML capability overlay
   --skip-system-packages    Do not install OS packages/Docker
   --with-qdrant             Install/start a local Qdrant container
   --with-neo4j              Install/start a local Neo4j container
@@ -95,6 +100,13 @@ while [[ $# -gt 0 ]]; do
     --ca-certificate) [[ $# -ge 2 ]] || { echo "--ca-certificate requires a file" >&2; exit 2; }; CA_CERTIFICATES+=("$2"); shift 2 ;;
     --elasticsearch-url) [[ $# -ge 2 ]] || { echo "--elasticsearch-url requires a URL" >&2; exit 2; }; ELASTICSEARCH_URL="$2"; shift 2 ;;
     --elasticsearch-index) [[ $# -ge 2 ]] || { echo "--elasticsearch-index requires an index" >&2; exit 2; }; ELASTICSEARCH_INDEX="$2"; shift 2 ;;
+    --preset)
+      [[ $# -ge 2 ]] || { echo "--preset requires core or workgroup" >&2; exit 2; }
+      case "$2" in core|workgroup) PRESET_NAME="$2"; PRESET_FILE="$SOURCE_DIR/install/presets/$2.yaml" ;; *) echo "Unknown preset: $2" >&2; exit 2 ;; esac
+      shift 2 ;;
+    --preset-file)
+      [[ $# -ge 2 ]] || { echo "--preset-file requires a readable YAML file" >&2; exit 2; }
+      PRESET_NAME="custom"; PRESET_FILE="$2"; shift 2 ;;
     --skip-system-packages) INSTALL_SYSTEM_PACKAGES=0; shift ;;
     --with-qdrant) WITH_QDRANT=1; shift ;;
     --with-neo4j) WITH_NEO4J=1; shift ;;
@@ -118,14 +130,22 @@ while [[ $# -gt 0 ]]; do
     --no-systemd) WITH_SYSTEMD=0; shift ;;
     --with-reranker-download) DOWNLOAD_RERANKER=1; shift ;;
     --no-reranker-download) DOWNLOAD_RERANKER=0; shift ;;
-    --x509-strict) X509_STRICT=1; shift ;;
-    --no-x509-strict) X509_STRICT=0; shift ;;
+    --x509-strict) X509_STRICT=1; X509_STRICT_EXPLICIT=1; shift ;;
+    --no-x509-strict) X509_STRICT=0; X509_STRICT_EXPLICIT=1; shift ;;
     --plan) PLAN_ONLY=1; shift ;;
     -y|--yes) ASSUME_YES=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
   esac
 done
+
+if [[ -n "$PRESET_FILE" && ! -r "$PRESET_FILE" ]]; then
+  echo "Preset file is not readable: $PRESET_FILE" >&2
+  exit 2
+fi
+if [[ -n "$PRESET_FILE" ]]; then
+  PRESET_FILE="$(cd "$(dirname "$PRESET_FILE")" && pwd)/$(basename "$PRESET_FILE")"
+fi
 
 # Fresh installs use /opt/sunaq. Existing 0.8.5 installations remain in place
 # unless --prefix is explicitly supplied.
@@ -325,6 +345,7 @@ Nextcloud URL override:   ${NEXTCLOUD_URL:-<preserve/configure in config.yaml>}
 Nextcloud private CA:      ${#CA_CERTIFICATES[@]} certificate(s) supplied on this run
 Elasticsearch URL:       ${ELASTICSEARCH_URL:-<preserve/configure in config.yaml>}
 Elasticsearch index:     ${ELASTICSEARCH_INDEX:-<preserve/configure in config.yaml>}
+Capability preset:       ${PRESET_NAME:-<none; preserve site configuration>}
 OpenWebUI:                $([[ $WITH_OPENWEBUI -eq 1 ]] && echo "install/start$([[ $OPENWEBUI_FROM_STATE -eq 1 ]] && echo ' (retained from existing install; use --no-openwebui to disable)')" || echo external/skip)
 Playwright renderer:      $([[ $PLAYWRIGHT_EXPLICIT -eq 1 ]] && ([[ $WITH_PLAYWRIGHT -eq 1 ]] && echo enable/build/start || echo disable/remove) || ([[ $WITH_PLAYWRIGHT -eq 1 ]] && echo "retain enabled state" || echo "preserve web.yaml state"))
 Web search service:       external/admin-managed (not bundled)
@@ -719,6 +740,43 @@ run_as_rag "$PREFIX/.venv/bin/python" -m pip install \
   'torch==2.13.0+cpu'
 run_as_rag "$PREFIX/.venv/bin/python" -m pip install -r "$PREFIX/requirements.txt"
 
+CONFIG_TX_DIR="$(mktemp -d "$PREFIX/runtime/.installer-config.XXXXXX")"
+cp -p "$PREFIX/config.yaml" "$CONFIG_TX_DIR/config.yaml"
+if [[ -f "$PREFIX/web.yaml" ]]; then
+  cp -p "$PREFIX/web.yaml" "$CONFIG_TX_DIR/web.yaml"
+else
+  : > "$CONFIG_TX_DIR/web.absent"
+fi
+CONFIG_TX_ACTIVE=1
+rollback_config_transaction() {
+  local rc=$?
+  set +e
+  if [[ "${CONFIG_TX_ACTIVE:-0}" -eq 1 && -d "${CONFIG_TX_DIR:-}" ]]; then
+    cp -p "$CONFIG_TX_DIR/config.yaml" "$PREFIX/config.yaml"
+    if [[ -f "$CONFIG_TX_DIR/web.yaml" ]]; then
+      cp -p "$CONFIG_TX_DIR/web.yaml" "$PREFIX/web.yaml"
+    elif [[ -f "$CONFIG_TX_DIR/web.absent" ]]; then
+      rm -f "$PREFIX/web.yaml"
+    fi
+    echo "Installer configuration validation failed; previous config.yaml/web.yaml restored." >&2
+  fi
+  rm -rf "${CONFIG_TX_DIR:-}"
+  exit "$rc"
+}
+trap rollback_config_transaction EXIT
+
+if [[ -n "$PRESET_FILE" ]]; then
+  log "Applying capability preset: ${PRESET_NAME:-custom}"
+  PRESET_STAGE="$PREFIX/runtime/install-preset.yaml"
+  cp "$PRESET_FILE" "$PRESET_STAGE"
+  chmod 0640 "$PRESET_STAGE"
+  chown "$RAG_USER:$RAG_GROUP" "$PRESET_STAGE"
+  run_as_rag "$PREFIX/.venv/bin/python" -m rag.config_preset \
+    --config "$PREFIX/config.yaml" \
+    --preset "$PRESET_STAGE"
+  rm -f "$PRESET_STAGE"
+fi
+
 log "Validating pinned ML runtime"
 run_as_rag "$PREFIX/.venv/bin/python" - <<'PYML'
 import torch
@@ -871,6 +929,9 @@ run_as_rag env PYTHONPATH="$PREFIX" RAG_CREDENTIAL_MASTER_KEY_FILE="$CREDENTIAL_
 chmod 600 "$PREFIX/runtime.env" "$PREFIX/runtime/users.sqlite"
 chown "$RAG_USER:$RAG_GROUP" "$PREFIX/runtime.env" "$PREFIX/runtime/users.sqlite"
 
+log "Synchronizing file-backed service secrets"
+bash "$PREFIX/install/sync-container-secrets.sh" "$PREFIX"
+
 ensure_env_key() {
   local file="$1" key="$2" value="$3"
   if grep -q "^${key}=" "$file" 2>/dev/null; then
@@ -924,16 +985,21 @@ chown "$RAG_USER:$RAG_GROUP" "$PREFIX/install/.env"
 # First-install component capability defaults. Existing site configuration is
 # preserved on reruns, but a fresh VM should not probe services the admin did
 # not select.
-run_as_rag "$PREFIX/.venv/bin/python" - "$PREFIX/config.yaml" "$PREFIX/web.yaml" "$WITH_QDRANT" "$WITH_NEO4J" "$MULTI_USER" "$ACL_OFF" "$ACL_MODE_EXPLICIT" "$FRESH_CONFIG" "$X509_STRICT" "$NEXTCLOUD_URL" "$NEXTCLOUD_CA_FILE" "$ELASTICSEARCH_URL" "$ELASTICSEARCH_INDEX" "$PLAYWRIGHT_EXPLICIT" "$WITH_PLAYWRIGHT" <<'PYCFG'
+run_as_rag "$PREFIX/.venv/bin/python" - "$PREFIX/config.yaml" "$PREFIX/web.yaml" "$WITH_QDRANT" "$WITH_NEO4J" "$MULTI_USER" "$ACL_OFF" "$ACL_MODE_EXPLICIT" "$FRESH_CONFIG" "$X509_STRICT" "$NEXTCLOUD_URL" "$NEXTCLOUD_CA_FILE" "$ELASTICSEARCH_URL" "$ELASTICSEARCH_INDEX" "$PLAYWRIGHT_EXPLICIT" "$WITH_PLAYWRIGHT" "$X509_STRICT_EXPLICIT" "$PRESET_NAME" <<'PYCFG'
 import sys, yaml
 from pathlib import Path
 config_path, web_path = Path(sys.argv[1]), Path(sys.argv[2])
 with config_path.open(encoding='utf-8') as f: cfg=yaml.safe_load(f) or {}
 fresh = bool(int(sys.argv[8]))
-cfg.setdefault('tls', {})['x509_strict'] = bool(int(sys.argv[9]))
+x509_strict = bool(int(sys.argv[9]))
 nextcloud_url, nextcloud_ca_file, elasticsearch_url, elasticsearch_index = sys.argv[10:14]
 playwright_explicit = bool(int(sys.argv[14]))
 playwright_enabled = bool(int(sys.argv[15]))
+x509_explicit = bool(int(sys.argv[16]))
+preset_name = str(sys.argv[17] or "")
+if x509_explicit or (fresh and not preset_name):
+    cfg.setdefault('tls', {})['x509_strict'] = x509_strict
+is_src = str((cfg.get('architecture') or {}).get('tier') or 'erg').strip().casefold() == 'src'
 if nextcloud_url:
     cfg.setdefault('nextcloud', {})['base_url'] = nextcloud_url
 if nextcloud_ca_file:
@@ -953,12 +1019,19 @@ if fresh and not bool(int(sys.argv[4])):
     cfg.setdefault('graph_queue', {})['enabled'] = False
     cfg.setdefault('sync', {}).setdefault('graph_queue', {})['enabled'] = False
 elif bool(int(sys.argv[4])):
-    # Neo4j/worker may be active for demand-driven answer evidence while bulk
-    # graph extraction during sync stays opt-in because it is expensive.
-    cfg.setdefault('graph_retrieval', {})['enabled'] = True
-    cfg.setdefault('graph_queue', {})['enabled'] = True
-    if fresh:
+    if is_src:
+        # SRC may keep Neo4j only as a clean seed/alias store. Document graph
+        # retrieval and graph-derived persistence remain disabled.
+        cfg.setdefault('graph_retrieval', {})['enabled'] = False
+        cfg.setdefault('graph_queue', {})['enabled'] = False
         cfg.setdefault('sync', {}).setdefault('graph_queue', {})['enabled'] = False
+    else:
+        # ERG may use demand-driven document graph evidence while bulk graph
+        # extraction during sync stays opt-in.
+        cfg.setdefault('graph_retrieval', {})['enabled'] = True
+        cfg.setdefault('graph_queue', {})['enabled'] = True
+        if fresh:
+            cfg.setdefault('sync', {}).setdefault('graph_queue', {})['enabled'] = False
 # Safe mode is the fresh-install default. Existing site choices are preserved
 # unless the administrator explicitly passes an ACL-mode flag.
 if fresh or bool(int(sys.argv[7])):
@@ -981,6 +1054,15 @@ if playwright_explicit:
     web.setdefault('archive', {}).setdefault('renderer', {})['enabled'] = playwright_enabled
 with web_path.open('w', encoding='utf-8') as f: yaml.safe_dump(web, f, sort_keys=False, allow_unicode=True)
 PYCFG
+
+log "Validating final SRC/ERG architecture configuration"
+if ! run_as_rag "$PREFIX/.venv/bin/python" -m rag.config_preset \
+  --config "$PREFIX/config.yaml" --validate-only; then
+  exit 2
+fi
+CONFIG_TX_ACTIVE=0
+rm -rf "$CONFIG_TX_DIR"
+trap - EXIT
 
 # Bootstrap TLS: encrypt external traffic by default even before the site
 # administrator installs a trusted certificate. Browsers will warn about this

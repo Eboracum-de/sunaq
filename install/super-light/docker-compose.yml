@@ -2,15 +2,14 @@ version: "2.4"
 
 services:
   api:
-    image: aki-rag:0.8.5-rc5.1
+    image: sunaq:0.8.6-rc1.2
     build:
       context: ../..
       dockerfile: install/super-light/Dockerfile.provider
     restart: unless-stopped
     network_mode: host
     env_file:
-      - ../../provider.env
-      - ../../runtime.env
+      - ../../runtime.container.env
     environment:
       RAG_API_HOST: "127.0.0.1"
       RAG_API_PORT: "8765"
@@ -18,20 +17,21 @@ services:
     volumes:
       - ../../config.yaml:/app/config.yaml:ro
       - ../../web.yaml:/app/web.yaml:ro
+      - ../../models:/app/models:ro
       - ../../runtime:/app/runtime
+      - ../../runtime/service-secrets:/run/sunaq-secrets:ro
     depends_on:
       - neo4j
 
   provider:
-    image: aki-rag:0.8.5-rc5.1
+    image: sunaq:0.8.6-rc1.2
     build:
       context: ../..
       dockerfile: install/super-light/Dockerfile.provider
     restart: unless-stopped
     network_mode: host
     env_file:
-      - ../../provider.env
-      - ../../runtime.env
+      - ../../runtime.container.env
     environment:
       PROVIDER_HOST: "127.0.0.1"
       PROVIDER_PORT: "8766"
@@ -40,32 +40,16 @@ services:
     volumes:
       - ../../config.yaml:/app/config.yaml:ro
       - ../../web.yaml:/app/web.yaml:ro
+      - ../../models:/app/models:ro
       - ../../runtime:/app/runtime
-
-  mail-worker:
-    image: aki-rag:0.8.5-rc5.1
-    build:
-      context: ../..
-      dockerfile: install/super-light/Dockerfile.provider
-    restart: unless-stopped
-    network_mode: host
-    env_file:
-      - ../../provider.env
-      - ../../runtime.env
-    command: ["python", "-m", "rag.mail_worker", "--config", "/app/config.yaml"]
-    volumes:
-      - ../../config.yaml:/app/config.yaml:ro
-      - ../../web.yaml:/app/web.yaml:ro
-      - ../../runtime:/app/runtime
-    depends_on:
-      - api
+      - ../../runtime/service-secrets:/run/sunaq-secrets:ro
 
 
   neo4j:
     image: ${NEO4J_IMAGE:-neo4j:5.26.29-community@sha256:d9dd3dc7d1c78fa959191ff02dbdcbefadceaf83eee23428fb92a58cac8ad3fe}
     restart: unless-stopped
     environment:
-      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:?set NEO4J_PASSWORD in .env}"
+      NEO4J_AUTH_FILE: "/run/secrets/neo4j_auth"
       NEO4J_server_memory_heap_initial__size: ${NEO4J_HEAP_INITIAL:-256m}
       NEO4J_server_memory_heap_max__size: ${NEO4J_HEAP_MAX:-512m}
       NEO4J_server_memory_pagecache_size: ${NEO4J_PAGECACHE:-256m}
@@ -75,35 +59,8 @@ services:
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
-
-  playwright-renderer:
-    build:
-      context: ../components/playwright-renderer
-    image: rag-playwright-renderer:0.2.2
-    restart: unless-stopped
-    init: true
-    ipc: host
-    ports:
-      - "127.0.0.1:${PLAYWRIGHT_PORT:-8090}:8080"
-    environment:
-      RENDER_NAV_TIMEOUT_MS: "30000"
-      RENDER_POSTLOAD_WAIT_MS: "750"
-      RENDER_MAX_PDF_BYTES: "52428800"
-      RENDER_ALLOWED_PORTS: "80,443"
-      RENDER_MAX_CONCURRENCY: "1"
-      RENDER_STATE_DIR: "/state"
-    volumes:
-      - playwright_state:/state
-    read_only: true
-    tmpfs:
-      - /tmp:size=512m,mode=1777
-      - /home/ragpw:size=256m,uid=10001,gid=10001,mode=0700
-    pids_limit: 512
-    security_opt:
-      - no-new-privileges:true
-      - "seccomp=${PLAYWRIGHT_SECCOMP_PROFILE:-unconfined}"
+      - ../../runtime/service-secrets/neo4j_auth:/run/secrets/neo4j_auth:ro
 
 volumes:
   neo4j_data:
   neo4j_logs:
-  playwright_state:

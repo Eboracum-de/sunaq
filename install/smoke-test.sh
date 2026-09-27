@@ -227,8 +227,29 @@ if curl -fsS "${api_auth_args[@]}" "http://${api_probe_host}:${RAG_API_PORT:-876
 else
   echo "[INFO] RAG API not running yet."
 fi
-if curl -fsS "http://${provider_probe_host}:${PROVIDER_PORT:-8766}/health" >/dev/null 2>&1; then
+provider_health_json="$(curl -fsS "http://${provider_probe_host}:${PROVIDER_PORT:-8766}/health" 2>/dev/null || true)"
+if [[ -n "$provider_health_json" ]]; then
   ok "Provider health"
+  if command -v jq >/dev/null 2>&1; then
+    provider_maintenance="$(printf '%s' "$provider_health_json" | jq -r '(.maintenance // false) or (.status == "maintenance")' 2>/dev/null || echo false)"
+    if [[ "$provider_maintenance" == "true" ]]; then
+      echo "[INFO] LLM role health deferred while provider is in maintenance mode."
+    else
+      llm_status="$(printf '%s' "$provider_health_json" | jq -r '.llm.status // "unknown"' 2>/dev/null || echo unknown)"
+      if [[ "$llm_status" == "ok" ]]; then
+        ok "LLM roles reachable"
+      else
+        bad "LLM roles not fully reachable (status=$llm_status)"
+        printf '%s' "$provider_health_json" | jq -r '
+          (.llm.roles // {}) | to_entries[] |
+          "       \(.key): status=\(.value.status // "unknown") backend=\(.value.backend // "—") model=\(.value.model // "—")" +
+          (if .value.error then " error=\(.value.error)" else "" end)
+        ' 2>/dev/null || true
+      fi
+    fi
+  else
+    warn "jq unavailable; LLM role health could not be evaluated from provider /health"
+  fi
 else
   echo "[INFO] Provider not running yet."
 fi
