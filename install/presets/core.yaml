@@ -1,0 +1,41 @@
+# SunaQ capability preset: core
+# Overlay for Secure RAG Core (SRC). No secrets belong in preset files.
+architecture:
+  tier: src
+acl:
+  enabled: true
+retrieval_policy:
+  internal:
+    files: required
+    vector: disabled
+    graph: disabled
+  optional_default: include
+  web: disabled
+qdrant:
+  enabled: false
+sync_worker:
+  enabled: false
+sync:
+  graph_queue:
+    enabled: false
+graph_queue:
+  enabled: false
+  auto_enqueue_cited_documents: false
+  worker:
+    enabled: false
+research_findings:
+  enabled: false
+graph_indexer:
+  enabled: false
+graph_entity_discovery:
+  enabled: false
+graph_relation_discovery:
+  enabled: false
+mail_metadata:
+  enabled: false
+mail:
+  enabled: false
+  worker:
+    enabled: false
+chat_archive:
+  enabled: false
