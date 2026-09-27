@@ -23,6 +23,7 @@ from urllib.parse import quote
 import httpx
 
 from rag.logging_utils import get_logger
+from rag.secret_env import secret_env
 from rag.credential_store import CredentialStore
 
 log = get_logger("worker")
@@ -224,7 +225,7 @@ def _cfg_value_or_env(cfg: dict[str, Any], *paths: str) -> str:
         if value is None or str(value).strip() == "":
             continue
         if path.endswith("_env"):
-            return str(os.getenv(str(value), "")).strip()
+            return secret_env(str(value), "").strip()
         return str(value).strip()
     return ""
 
@@ -250,7 +251,7 @@ class MailMetadataReader:
         # Explicit single-user compatibility fallback; no mail-specific secret in config.yaml.
         self.legacy_username = _cfg_value_or_env(cfg, "mail_metadata.username_env", "mail_metadata.username", "acl.username_env", "acl.username")
         password_env = str(cfg_get(cfg, "mail_metadata.password_env", "acl.password_env", default="") or "").strip()
-        self.legacy_password = str(os.getenv(password_env, "")).strip() if password_env else ""
+        self.legacy_password = secret_env(password_env, "").strip() if password_env else ""
         raw_url = str(cfg_get(cfg, "mail_metadata.webdav_url", default="") or "").strip().rstrip("/")
         self.legacy_base_url = raw_url
 

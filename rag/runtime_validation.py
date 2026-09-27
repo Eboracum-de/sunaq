@@ -7,6 +7,8 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from rag.credential_store import CredentialStore
+from rag.secret_env import secret_env
+from rag.architecture_policy import validate_architecture_config
 from rag.internal_auth import (
     ENV_NAME as INTERNAL_API_KEY_ENV,
     PROVIDER_ENV_NAME,
@@ -34,17 +36,18 @@ def _truthy(value: Any, default: bool = False) -> bool:
 def validate_security_config(cfg: dict[str, Any]) -> list[str]:
     """Return human-readable configuration errors; no network access is used."""
     errors: list[str] = []
+    errors.extend(validate_architecture_config(cfg))
     acl_enabled = _truthy(_get(cfg, "acl.enabled", True), True)
     mode = str(_get(cfg, "acl.identity_mode", "credential_store") or "").strip().lower()
     allow_insecure = _truthy(_get(cfg, "security.allow_insecure_nextcloud", False), False)
     base_url = str(_get(cfg, "nextcloud.base_url", "") or "").strip().rstrip("/")
 
-    internal_key = str(os.getenv(INTERNAL_API_KEY_ENV, "") or "").strip()
+    internal_key = secret_env(INTERNAL_API_KEY_ENV, "").strip()
     if len(internal_key) < MIN_KEY_LENGTH:
         errors.append(
             f"{INTERNAL_API_KEY_ENV} must be configured with at least {MIN_KEY_LENGTH} characters"
         )
-    provider_internal_key = str(os.getenv(PROVIDER_ENV_NAME, "") or "").strip()
+    provider_internal_key = secret_env(PROVIDER_ENV_NAME, "").strip()
     if len(provider_internal_key) < MIN_KEY_LENGTH:
         errors.append(
             f"{PROVIDER_ENV_NAME} must be configured with at least {MIN_KEY_LENGTH} characters"
@@ -115,7 +118,7 @@ def validate_security_config(cfg: dict[str, Any]) -> list[str]:
         es_user = str(_get(cfg, "elasticsearch.username", _get(cfg, "elasticsearch.user", "")) or "").strip()
         es_password_env = str(_get(cfg, "elasticsearch.password_env", "ELASTICSEARCH_PASSWORD") or "").strip()
         es_legacy_password = str(_get(cfg, "elasticsearch.password", "") or "")
-        if es_user and not ((es_password_env and os.getenv(es_password_env, "")) or es_legacy_password):
+        if es_user and not ((es_password_env and secret_env(es_password_env, "")) or es_legacy_password):
             errors.append(f"elasticsearch.username is set but password is missing ({es_password_env or 'elasticsearch.password'})")
         ca_file = str(_get(cfg, "elasticsearch.ca_file", "") or "").strip()
         if _truthy(_get(cfg, "elasticsearch.verify_tls", True), True) and ca_file and not Path(ca_file).exists():
