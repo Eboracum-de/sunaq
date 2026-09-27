@@ -50,6 +50,14 @@ class RagProxy {
         return $this->config->getAppValue('akirag', (string)$key, $default);
     }
 
+    private function userAgent() {
+        $version = trim((string)$this->config->getAppValue('sunaq', 'installed_version', ''));
+        if ($version === '') {
+            $version = 'unknown';
+        }
+        return 'SunaQ-Nextcloud/' . $version;
+    }
+
     private function allowInsecureHttp() {
         $value = strtolower(trim((string)$this->appConfigValue('allow_insecure_http', '0')));
         return in_array($value, ['1', 'true', 'yes', 'on'], true);
@@ -138,6 +146,7 @@ class RagProxy {
 
         $headers = [
             'Accept' => 'application/json',
+            'User-Agent' => $this->userAgent(),
             'Content-Type' => 'application/json',
             'Authorization' => 'Bearer ' . $apiKey,
             'X-RAG-User-ID' => $uid,
@@ -240,6 +249,7 @@ class RagProxy {
             $response = $client->get($baseUrl . '/v1/models', [
                 'headers' => [
                     'Accept' => 'application/json',
+                    'User-Agent' => $this->userAgent(),
                     'Authorization' => 'Bearer ' . $apiKey,
                     'X-RAG-User-ID' => $uid,
                 ],
@@ -301,6 +311,7 @@ class RagProxy {
             $response = $client->get($baseUrl . '/v1/user-settings', [
                 'headers' => [
                     'Accept' => 'application/json',
+                    'User-Agent' => $this->userAgent(),
                     'Authorization' => 'Bearer ' . $apiKey,
                     'X-RAG-User-ID' => $uid,
                 ],
@@ -352,6 +363,7 @@ class RagProxy {
             $response = $client->get($baseUrl . '/v1/status/' . rawurlencode($requestId), [
                 'headers' => [
                     'Accept' => 'application/json',
+                    'User-Agent' => $this->userAgent(),
                     'Authorization' => 'Bearer ' . $apiKey,
                     'X-RAG-User-ID' => $uid,
                 ],
@@ -407,6 +419,7 @@ class RagProxy {
             $response = $client->post($baseUrl . '/v1/archive/chat/register', [
                 'headers' => [
                     'Accept' => 'application/json',
+                    'User-Agent' => $this->userAgent(),
                     'Content-Type' => 'application/json',
                     'Authorization' => 'Bearer ' . $apiKey,
                     'X-RAG-User-ID' => $uid,

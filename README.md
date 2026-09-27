@@ -21,7 +21,7 @@ The central security invariant is deliberately simple:
 
 Every document candidate is checked live against Nextcloud for the authenticated user before it can become answer evidence. If an otherwise relevant document is not authorized, it is removed rather than replaced by a weaker result merely to fill the context window.
 
-> **Project status:** `0.8.6-rc1.1` is the current release-candidate baseline. See `RELEASE-NOTES-0.8.6-rc1.1.md`, `CHANGELOG.md`, `models/README.md`, `docs/BETA-OPERATIONS.md` and `docs/KNOWN-LIMITATIONS.md`.
+> **Project status:** `0.8.6-rc1.2` is the current development release-candidate, adding enforced SRC/ERG boundaries and hardening. See `CHANGELOG.md`, `models/README.md`, `docs/BETA-OPERATIONS.md` and `docs/KNOWN-LIMITATIONS.md`.
 
 
 ## Why this project exists
@@ -43,40 +43,40 @@ The project focuses on eight practical goals:
 
 ## Default architecture boundary
 
-A fresh Super-Light installation deliberately starts close to the
-**Secure RAG Core (SRC)** baseline:
+In `0.8.6-rc1.2`, a fresh Super-Light installation is the formal
+**Secure RAG Core (SRC)** package:
 
 ```text
 Nextcloud documents
        |
-FullTextSearch / Elasticsearch
+FullTextSearch / Elasticsearch (files only)
        |
-query rewrite / bounded retrieval
+query rewrite / one bounded retrieval round
        |
 LIVE NEXTCLOUD ACL
        |
-      LLM
+local or administrator-approved LLM roles
 ```
 
-Local model processing is preferred. External model endpoints can also be used
-where the administrator explicitly accepts and manages the resulting data egress.
+SRC is enforced rather than descriptive. Live ACL must be enabled; document
+evidence is Documents-only; vector/Qdrant, document-graph retrieval, Mail,
+Web/Web archive, Chat archive and Research Findings are unavailable. Model
+roles may be local or remote by explicit administrator choice; remote evidence
+caps still apply. Reranker processing remains inside the local/private trust
+boundary. Neo4j may
+still provide administrator-owned seed/alias context without becoming a document
+evidence arm.
 
-No Web Research, Playwright renderer, mail worker, chat-archive evidence or
-Research-Finding persistence is active until an administrator enables it. The
-same codebase therefore contains two deliberately separated capability layers:
+**ERG — Eboracum Research Gate** is the opt-in extension envelope for additional
+sources, derived stores, broader external egress surfaces and more complex
+research functions. Remote LLM use alone does not require ERG. Enabling an
+ERG-only capability is therefore an explicit architecture
+decision rather than an accidental drift away from SRC.
 
-- **A — Secure RAG Core (SRC):** Documents → Elasticsearch → live ACL → LLM.
-  Local processing is preferred; bounded external processing is possible when
-  the operator accepts the egress implications.
-- **B — Eboracum Research Gate (ERG):** an opt-in set of additional features and
-  capabilities such as Mail, live Web research and Web archiving, Chat archive,
-  semantic retrieval/reranking, Findings/Graph-Lite, full document graphization,
-  multiple retrieval rounds and other specialist functions.
-
-This split is intentional: **A is the shipped security and lifecycle baseline**.
-B increases capability, retained state, untrusted-input surface, egress,
-resource use and operational complexity. Those capabilities are therefore
-explicit administrator decisions rather than fresh-install defaults.
+Shipped YAML overlays `core` and `workgroup` can be selected with
+`--preset core|workgroup` or a site-specific `--preset-file FILE`.
+Existing installations without an `architecture.tier` remain ERG-compatible
+for upgrade safety; they are not retroactively labelled SRC.
 
 ### Prompt-injection boundary in the default profile
 
@@ -134,35 +134,23 @@ Graph/Findings persistence do not replace the deterministic application control 
 
 Elasticsearch, Qdrant and Neo4j are retrieval systems, not authorization systems. The live Nextcloud ACL check is intentionally downstream of candidate retrieval and upstream of document evidence sent to verifier or answer roles.
 
-## Architecture concept: SRC and ERG
+## Architecture tiers: SRC and ERG
 
-SunaQ distinguishes two intended capability envelopes:
+SunaQ distinguishes two enforced capability envelopes:
 
-- **SRC — Secure RAG Core:** the conservative Elasticsearch-centric baseline
-  with ordinary Nextcloud documents and live Nextcloud ACL. Local model
-  processing is preferred, but bounded external processing is compatible with
-  SRC where the administrator explicitly accepts and manages data egress.
-- **ERG — Eboracum Research Gate:** the opt-in extension space for additional
-  sources, derived state and more complex retrieval/graph functions. ERG is a
-  menu, not a requirement to enable everything.
+- **SRC — Secure RAG Core:** ordinary Nextcloud documents, Elasticsearch
+  `files` retrieval, mandatory live Nextcloud ACL, one retrieval round and
+  local or administrator-approved remote model processing. ERG-only sources and derived document stores
+  are rejected at startup/request boundaries.
+- **ERG — Eboracum Research Gate:** the extension space for additional sources,
+  vector retrieval, Findings/Graph-Lite, document graph
+  processing and future multi-round research. ERG is a menu; it does not imply
+  that every extension is enabled.
 
-**0.8.6-rc1.1 status:** this is architecture/design terminology, not yet a
-supported installer/configuration tier. Existing feature gates can be combined
-manually, but SunaQ does not yet validate the combination as SRC or ERG.
-First-class capability switches, safe text preset files and consistency
-validation are planned for `0.8.6-rc1.2`.
-
-The first planned presets are deliberately small: **core** and **workgroup**.
-Workgroup is intended to stay Elasticsearch-centric while adding Mail, live
-Web/Web archive with Playwright, Chat archive and Findings/Graph-Lite. Qdrant
-and full document-graph processing remain optional rather than mandatory ERG
-components.
-
-Historically, the shipped Super-Light package was essentially an Elasticsearch-centric SRC baseline plus several capabilities that now belong to the planned ERG workgroup preset, delivered in the tested dockerized deployment.
-
-This is independent of **Standard / Super-Light** deployment and
-**Schnell / Gründlich / Tief** research models. See
-[SRC and ERG target architecture](docs/SRC-ERG.md).
+The architecture tier is independent of **Standard / Super-Light** deployment
+and **Schnell / Gründlich / Tief** research models. Super-Light ships as SRC in
+rc1.2; the full reference configuration remains ERG for compatibility with
+existing installations. See [SRC and ERG architecture](docs/SRC-ERG.md).
 
 ## Deployment profiles
 
@@ -171,7 +159,7 @@ This is independent of **Standard / Super-Light** deployment and
 | **Super-Light** | lightweight, Elasticsearch-centric component profile | API, provider, Neo4j seed/alias context; optional Playwright/nginx | Nextcloud, FullTextSearch/Elasticsearch, LLM |
 | **Standard** | larger/hybrid retrieval installations | native middleware plus optional Qdrant, reranker, Neo4j, OpenWebUI | Nextcloud, Elasticsearch; model backends as configured |
 
-Profile and deployment mechanism are conceptually separate axes. For the 0.8.6-rc1.1 candidate, the regression-tested and supported mappings remain:
+Profile and deployment mechanism are conceptually separate axes. For the 0.8.6-rc1.2 candidate, the regression-tested and supported mappings remain:
 
 - `super-light + dockerized`
 - `standard + native`
@@ -222,13 +210,13 @@ See `docs/PRIVACY-ARCHITECTURE.md`, `docs/THREAT-MODEL.md` and `SECURITY.md` for
 
 The project intentionally keeps support for older installations in scope rather than requiring a current Linux/Python stack everywhere.
 
-Current 0.8.6-rc1.1 reference points:
+Current 0.8.6-rc1.2 reference points:
 
 - **SunaQ Recherche 0.3.4:** Nextcloud 23+
 - **Super-Light acceptance host:** openSUSE Leap 15.3
 - **Document retrieval:** existing Nextcloud FullTextSearch / Elasticsearch
 - **Internal PKI:** supported, including compatibility mode for older private certificate chains without disabling ordinary TLS verification
-- **Answer provider:** OpenAI-compatible; local and remote model roles are independently configurable
+- **Answer provider:** OpenAI-compatible; both SRC and ERG may use local or administrator-approved remote model roles
 
 Compatibility statements describe the current tested/project target, not a promise that every combination of Nextcloud, Elasticsearch, proxy and model backend is regression-tested.
 
@@ -242,13 +230,14 @@ Inspect the installation plan before changing the host:
 sudo ./install/install.sh \
   --profile super-light \
   --deployment dockerized \
+  --preset core \
   --nextcloud-url https://cloud.example.org/nextcloud \
   --elasticsearch-url http://10.0.0.20:9200 \
   --elasticsearch-index my_index \
   --plan
 ```
 
-Then install with the same arguments, removing `--plan` and adding the components you want. For an internal PKI, use repeatable `--ca-certificate FILE` arguments rather than disabling TLS verification. Fresh installs and installer reruns enter an explicit **maintenance mode** first: the OpenAI-compatible provider remains reachable and authenticates trusted client keys, but returns a maintenance message without loading the normal SunaQ/LLM pipeline. After configuration and checks, use `sudo /opt/sunaq/install/maintenance-mode.sh off` on a fresh 0.8.6 installation to start normal operation. Recognized legacy installations keep their existing prefix (for example `/opt/nextcloud-rag`) rather than being moved.
+Then install with the same arguments, removing `--plan` and adding only the components you want. Although Super-Light already ships from the SRC baseline, keeping `--preset core` explicit makes the saved installation command a reproducible declaration of the architecture contract rather than relying on defaults. For an internal PKI, use repeatable `--ca-certificate FILE` arguments rather than disabling TLS verification. Fresh installs and installer reruns enter an explicit **maintenance mode** first: the OpenAI-compatible provider remains reachable and authenticates trusted client keys, but returns a maintenance message without loading the normal SunaQ/LLM pipeline. After configuration and checks, use `sudo /opt/sunaq/install/maintenance-mode.sh off` on a fresh 0.8.6 installation to start normal operation. Recognized legacy installations keep their existing prefix (for example `/opt/nextcloud-rag`) rather than being moved.
 
 Detailed installation and acceptance steps are in `install/INSTALL.md` and `docs/BETA-OPERATIONS.md`.
 
@@ -264,9 +253,9 @@ OpenWebUI can be used as an external client through the provider interface, the 
 
 When SunaQ is selected as the model, client-side Knowledge/RAG/File-Context
 injection should be disabled: SunaQ is intended to remain the retrieval and
-evidence authority. Replayed client `user`/`assistant` history is still used
-in rc1.1 for bounded follow-up resolution and is therefore not authoritative
-provenance; authoritative server-side conversation state is an rc1.2 target.
+evidence authority. Replayed client `user`/`assistant` history is still used for bounded follow-up
+resolution and is therefore not authoritative provenance. Authoritative
+server-side conversation state is deferred to rc2.
 
 The same OpenAI-compatible boundary can be used by other local frontends, RAG systems, agents or research tools when an administrator deliberately registers them as trusted clients. A trusted-client key is an integration-server credential: keep it server-side and restrict externally reachable provider endpoints by network policy/reverse-proxy allowlists or equivalent controls where practical.
 
@@ -274,7 +263,7 @@ The API/provider boundary is intentional: front-end choice should not define the
 
 ## Optional scale-up path
 
-A Super-Light or SRC deployment can remain Elasticsearch-centric indefinitely. Where the workload justifies it, the same middleware can add:
+An SRC deployment can remain Elasticsearch-centric indefinitely. Where the workload justifies additional capabilities, the same middleware can move into the ERG envelope and add:
 
 - **Qdrant** for semantic/vector retrieval,
 - a **cross-encoder reranker**,
@@ -300,8 +289,9 @@ The graph layer is deliberately conservative: retrieved or LLM-derived observati
 - `docs/ROADMAP.md` — implemented 0.8.6 direction and explicitly deferred follow-up work
 - `docs/DEVELOPMENT.md` — repository layout and test baseline
 - `SECURITY.md` — security model and vulnerability reporting
-- `RELEASE-NOTES-0.8.6-rc1.1.md` — 0.8.6-rc1.1 hardening release notes
-- `RELEASE-NOTES-0.8.5-rc5.1.md` — current public-beta release notes
+- `RELEASE-NOTES-0.8.6-rc1.2.md` — current development release-candidate notes
+- `RELEASE-NOTES-0.8.6-rc1.1.md` — current public release-candidate notes
+- `RELEASE-NOTES-0.8.5-rc5.1.md` — earlier public-beta release notes
 - `RELEASE-NOTES-0.8.5-rc5.md` — preceding release-candidate notes
 - `CHANGELOG.md` — detailed development/change history
 - `CONTRIBUTING.md` — contribution and licensing policy
@@ -366,3 +356,12 @@ Please accept our apologies for any inconvenience caused by this decision.
 SunaQ is an independent project and is not affiliated with, sponsored by, or endorsed by Nextcloud GmbH or aki.io GmbH. Historical repository and compatibility identifiers may still use the earlier AKI naming during the 0.8.6 transition. “Nextcloud” is used descriptively to identify compatibility with the Nextcloud software platform. Nextcloud and related marks are trademarks of Nextcloud GmbH. References to aki.io are solely for identification and do not imply any affiliation, sponsorship, or endorsement.
 
 See `TRADEMARKS.md`.
+
+### Elasticsearch-only query wording
+
+Lexical retrieval remains sensitive to query form. For example,
+`Project Alpha 42` and `"Project Alpha 42"` are intentionally different
+searches: the quoted form keeps the words together as one phrase. Better
+entity/alias resolution should reduce this sensitivity; ERG deployments can
+additionally use Qdrant semantic retrieval as a complementary recall signal.
+

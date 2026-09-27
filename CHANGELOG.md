@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.6-rc1.2 – 2026-09-26
+
+- Replace delimiter-based retrieved-document context with server-generated JSON evidence records for answer, Candidate Verifier, Evidence Controller and Web relevance/answer paths. Add an immutable Python-side untrusted-evidence guard so profile/prompt overrides cannot remove the rule that retrieved content is data rather than instruction.
+- Harden live Web retrieval against SSRF/internal-network access by validating HTTP(S) destinations and redirects and binding the actual connection to the validated public IP. Convert the optional Playwright archive renderer to a network-free already-fetched-HTML snapshot renderer, blocking independent browser HTTP/WebSocket access.
+- Move SunaQ service credentials to file-backed runtime material for native and Dockerized deployments. Internal/provider keys, Elasticsearch, embeddings, role LLMs, Graph/Web credentials and Neo4j authentication can be loaded from secret files; Super-Light API/provider/mail services use generated non-secret environment files plus mounted secret files. Optional bundled OpenWebUI remains a documented scoped-key environment exception.
+- Introduce enforced `architecture.tier: src|erg`. SRC requires live ACL, Documents-only Elasticsearch/files retrieval, one retrieval round and a local/private reranker; LLM roles may be local/private or explicitly administrator-configured remote endpoints, with remote evidence caps still enforced. SRC rejects Web/Mail/Chat archives, Qdrant/vector, document-graph retrieval, Findings and document graphization. Omitted retrieval arms are normalized to `files`, deterministic filename/document-ID paths stay Documents-only and ERG-only internal endpoints are unavailable.
+- Package Super-Light as the formal SRC baseline. Keep the full reference configuration ERG for upgrade compatibility; configurations predating `architecture.tier` remain ERG-compatible rather than being retroactively labelled SRC. Historical ERG Neo4j data are not migrated into SRC during the RC line; operators reset the graph and rebuild trusted seeds.
+- Add safe YAML capability overlays `install/presets/core.yaml` and `install/presets/workgroup.yaml`, plus `--preset core|workgroup` and `--preset-file FILE` installer support. Presets are parsed as data only and validated against architecture invariants; explicit installer connection/TLS/index arguments remain authoritative.
+- Publish effective architecture/source capabilities through the provider so clients do not advertise unavailable SRC/ERG sources. Chat-archive registration is unavailable in SRC.
+- Add architecture, evidence-boundary and SSRF regression tests. Preserve the existing ranked-document/context-budget contract while accounting for JSON serialization overhead.
+- Update architecture/operations documentation for the enforced SRC/ERG split. Improved multi-round retrieval, authoritative server-side conversation history and broader Admin/maintenance UX are deferred to rc2.
+
 ## 0.8.6-rc1.1 – 2026-09-24
 
 - Harden request-local LLM role routing so a profile that changes an endpoint does not inherit a stale `local|remote` scope from the previous environment endpoint; remote evidence caps therefore remain effective unless the profile explicitly declares a scope.
