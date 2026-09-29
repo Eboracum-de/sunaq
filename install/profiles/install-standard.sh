@@ -771,7 +771,7 @@ if [[ -n "$PRESET_FILE" ]]; then
   cp "$PRESET_FILE" "$PRESET_STAGE"
   chmod 0640 "$PRESET_STAGE"
   chown "$RAG_USER:$RAG_GROUP" "$PRESET_STAGE"
-  run_as_rag "$PREFIX/.venv/bin/python" -m rag.config_preset \
+  run_as_rag env PYTHONPATH="$PREFIX" "$PREFIX/.venv/bin/python" -m rag.config_preset \
     --config "$PREFIX/config.yaml" \
     --preset "$PRESET_STAGE"
   rm -f "$PRESET_STAGE"
@@ -1056,7 +1056,7 @@ with web_path.open('w', encoding='utf-8') as f: yaml.safe_dump(web, f, sort_keys
 PYCFG
 
 log "Validating final SRC/ERG architecture configuration"
-if ! run_as_rag "$PREFIX/.venv/bin/python" -m rag.config_preset \
+if ! run_as_rag env PYTHONPATH="$PREFIX" "$PREFIX/.venv/bin/python" -m rag.config_preset \
   --config "$PREFIX/config.yaml" --validate-only; then
   exit 2
 fi
