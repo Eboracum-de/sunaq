@@ -41,3 +41,9 @@ def test_api_startup_has_nonfatal_schema_upgrade_fallback():
     assert "graph.ensure_schema()" in api
     assert "_initialize_neo4j_schema()" in api
     assert "Neo4j schema initialization deferred" in api
+
+
+def test_standard_installer_config_preset_uses_installed_tree_on_pythonpath():
+    script = (ROOT / "install/profiles/install-standard.sh").read_text()
+    invocation = 'run_as_rag env PYTHONPATH="$PREFIX" "$PREFIX/.venv/bin/python" -m rag.config_preset'
+    assert script.count(invocation) == 2
