@@ -1,23 +1,30 @@
-# Installation – 0.8.6-rc1.2 (draft)
+# Installation – 0.8.7-rc1
 
-All deployment variants use the single public entry point `install/install.sh`. Select `--profile standard` (default) or `--profile super-light`. The super-light profile is containerized and therefore does not require Python >=3.10 on the host; it is intended for older/smaller systems such as Leap 15.3.
+All deployment variants use the single public entry point `install/install.sh`.
+Architecture boundary, capability bundle and packaging are selected independently:
 
-Functional profile and deployment mechanism are conceptually separate. In the 0.8.6-rc1.2 candidate the supported mappings remain `standard -> native` and `super-light -> dockerized`; the latter is not a fork of the middleware.
+```text
+--architecture-tier src|erg-internal|erg-full  # normative policy boundary
+--preset core|workgroup|full                   # recommended capability bundle
+--deployment standard|dockerized               # host/native / containerized
+```
 
-Fresh 0.8.6 installations default to **`/opt/sunaq`**. A recognized existing
+The dockerized mode does not require Python >=3.10 on the host and is intended
+for older/smaller systems such as Leap 15.3. Historical `--profile standard`
+and `--profile super-light` remain compatibility aliases; `super-light`
+means exactly `dockerized + core`, not a fourth architecture tier.
+
+Fresh SunaQ installations default to **`/opt/sunaq`**. A recognized existing
 installation is deliberately kept at its current prefix (for example
 `/opt/sunaq`); the installer does not move site-owned runtime state.
 
-0.8.6-rc1.2 retains the rc1/rc1.1 research/client baseline and adds enforced
-SRC/ERG architecture tiers, structured untrusted-evidence handling, Web/Playwright
-SSRF hardening and file-backed service-secret delivery. Super-Light is the
-packaged SRC baseline; Standard remains the ERG-compatible reference profile.
+The 0.8.7-rc1 release-candidate line retains the 0.8.6 hardening baseline and adds the three-tier SRC / ERG Internal / ERG Full model, deterministic structured Files query compilation, resolver/retriever boundaries and ResearchRun decision/execution provenance. `--architecture-tier` selects the normative policy boundary, `core|workgroup|full` select recommended capability bundles, and `standard|dockerized` select deployment.
 The security and user-configuration model remains:
 
 - multi-user + live Nextcloud ACL is the safe installation default;
 - Nextcloud TLS verification is on by default;
-- an unsafe ACL/TLS configuration fails at API startup instead of silently
-  degrading;
+- an unsafe ACL/TLS configuration fails both the static smoke/config check and
+  API startup instead of silently degrading;
 - a verified Nextcloud account becomes the canonical user identity;
 - mail accounts, Web-research destinations and CardDAV seed settings are admin-managed per verified Nextcloud
   user in `runtime/users.sqlite`, not in `config.yaml`;
@@ -34,21 +41,16 @@ release. App passwords are encrypted inside the SQLite credential store and prot
 First inspect the plan:
 
 ```bash
-sudo ./install/install.sh --plan --with-openwebui --with-qdrant --with-neo4j
+sudo ./install/install.sh --deployment standard --architecture-tier src --preset core --plan
 ```
 
 For the tested topology with external Nextcloud and an administrator-managed LLM/embedding backend:
 
 ```bash
-sudo ./install/install.sh --with-openwebui --with-qdrant --with-neo4j
+sudo ./install/install.sh --deployment standard --architecture-tier src --preset core
 ```
 
-`--multi-user` is no longer required; it is the default. `--full` now installs
-all components still bundled by the middleware:
-
-```bash
-sudo ./install/install.sh --full
-```
+`--multi-user` is no longer required; it is the default. Select the normative boundary with `--architecture-tier src|erg-internal|erg-full`; use `--preset core|workgroup|full` for a recommended capability combination inside that boundary. The historical Standard component shorthands `--core` and `--full` are rejected because their names now conflict with preset names.
 
 Ollama is deliberately not installed or managed by this release. The administrator
 provides an Ollama or other compatible LLM/embedding backend separately and
@@ -86,38 +88,48 @@ The fresh-install default prefix is `/opt/sunaq` and the service user is `rag`. 
 
 ## 2. Installation modes
 
-### Architecture presets
+### Architecture tiers and capability presets
 
-Super-Light starts from the formal SRC configuration. For fresh Super-Light
-acceptance and reproducible operational records, the recommended command still
-spells this out as `--profile super-light --deployment dockerized --preset core`.
-The first two switches select the tested deployment mapping; `--preset core`
-selects and validates the formal SRC capability contract. This remains useful
-even though those choices match the packaged Super-Light defaults, because
-`install/last-install-command.sh` then records the intended architecture
-explicitly.
-
-Both supported installers also accept:
+The tier is the authoritative policy boundary. With no preset, optional components are off unless selected with positive `--with-*` switches. Presets are atomic shortcuts for a matching tier plus a component bundle:
 
 ```text
---preset core
---preset workgroup
+--architecture-tier src|erg-internal|erg-full
+--preset core       # src + Core capability baseline
+--preset workgroup  # erg-internal + internal ERG defaults
+--preset full       # erg-full + full ERG defaults
 --preset-file /path/to/site-preset.yaml
 ```
 
-Preset files are parsed as YAML data through `rag.config_preset`; they are not
-sourced as shell. The merge is validated against SRC/ERG invariants. Explicit
-installer connection, TLS and Elasticsearch-index arguments remain authoritative
-over preset values. Existing installations receive no preset change unless the
-operator explicitly selects one.
+Preferred examples are `--deployment standard --architecture-tier src --preset core` and
+`--deployment dockerized --architecture-tier src --preset core`; the same deployment choice also accepts the wider tiers and matching presets. The historical `--profile super-light`
+shortcut remains fixed to `dockerized + core` so old scripts keep their
+previous meaning.
 
-When an existing **ERG** RC installation is deliberately converted to
-`--preset core`, historical Neo4j contents are **not migrated**. Stop the
-installation, reset the graph with `python -m rag.graph --config
-/opt/sunaq/config.yaml reset --yes-really-delete-all`, then re-import only the
-wanted CardDAV/administrator seeds before normal SRC use. This destructive reset
-is intentional during the RC line and avoids carrying document-derived ERG
-entities into SRC query expansion.
+Deployment and architecture are independent axes. Dockerized and Standard can
+both package local Qdrant, Neo4j and the ERG resolver where the selected
+architecture permits those capabilities. The architecture tier controls what
+information/state is allowed; the deployment controls only how selected
+components are operated. Heavy local ML dependencies (for example a local
+cross-encoder reranker) remain a separate processing-packaging choice and are
+not implied by either deployment or architecture.
+
+Preset files are parsed as YAML data through `rag.config_preset`; they are not
+sourced as shell. The merge is validated against the three architecture
+envelopes. A named preset is treated as one shortcut rather than a menu to
+subtract from: if a component from Workgroup/Full is not wanted, select the
+architecture tier and list the wanted `--with-*` components instead.
+Connection, TLS and Elasticsearch-index arguments remain independently
+authoritative. Existing installations receive no
+preset change unless the operator explicitly selects one. Historical
+`architecture.tier: erg` is accepted as an upgrade alias for `erg_full`.
+
+When an existing ERG installation is deliberately converted to
+`--architecture-tier src` (or the matching `--preset core`), SunaQ-owned Qdrant/Neo4j/Findings state is outside the target
+SRC envelope and must be removed/reset according to site policy. For Neo4j the
+destructive helper remains `python -m rag.graph --config
+/opt/sunaq/config.yaml reset --yes-really-delete-all`. Do not re-import
+CardDAV/administrator graph seeds into SRC; use ERG Internal when local resolver
+state is required.
 
 
 ```text
@@ -126,28 +138,64 @@ entities into SRC query expansion.
 --acl-off      explicit diagnostic mode; never use for a shared document set
 ```
 
-Common connection/frontend/proxy switches now use the same names in Standard and Super-Light. On a recognized Standard rerun, the installer reports the existing SunaQ installation and verifies that native SunaQ processes, systemd units and local Docker Compose services are stopped before modifying files. If the running state cannot be determined reliably, the rerun aborts without changes. On rerun, an existing OpenWebUI/proxy selection is retained unless explicitly overridden with `--no-openwebui` / `--no-proxy`. Standard also accepts `--nextcloud-url`, `--elasticsearch-url`, `--elasticsearch-index`, `--proxy-http-port` and `--proxy-https-port`, so deployment scripts do not need profile-specific spellings.
+Common connection/frontend/proxy switches now use the same names in Standard and Dockerized. On a recognized Standard rerun, the installer reports the existing SunaQ installation and verifies that native SunaQ processes, systemd units and local Docker Compose services are stopped before modifying files. If the running state cannot be determined reliably, the rerun aborts without changes. On rerun, an existing OpenWebUI/proxy selection is retained unless explicitly overridden with `--no-openwebui` / `--no-proxy`. Standard also accepts `--nextcloud-url`, `--elasticsearch-url`, `--elasticsearch-index`, `--proxy-http-port` and `--proxy-https-port`, so deployment scripts do not need profile-specific spellings.
 
 Other useful flags:
 
 ```text
---with-qdrant       local Qdrant
---with-neo4j        local Neo4j
---core              legacy resource shorthand: Qdrant + Neo4j (not SRC)
---preset core|workgroup
-                    apply a shipped capability preset
+--with-qdrant       local Qdrant + vector-sync capability (ERG Internal/Full)
+--with-neo4j        local Neo4j (ERG Internal/Full)
+--with-resolver     local ERG resolver gateway
+--architecture-tier src|erg-internal|erg-full
+                    set the normative architecture boundary
+--preset core|workgroup|full
+                    apply a recommended tier + capability combination
 --preset-file FILE  apply a safe site-owned YAML capability overlay
 --with-openwebui    bundled OpenWebUI
---full              Qdrant + Neo4j + OpenWebUI
 --with-systemd      install/enable optional middleware units, do not start yet
---no-proxy          no bundled nginx
 --plan              show plan only
+
+On a recognized rerun, --no-qdrant/--no-neo4j/--no-resolver and the analogous
+frontend/proxy switches are removal/disable operations. They are intentionally
+not part of fresh-install composition.
 -y                  non-interactive after plan review
 ```
 
-Fresh installs and installer reruns deliberately return to **maintenance mode**. The OpenAI-compatible provider is started in a minimal maintenance implementation that still validates registered provider-client Bearer keys, but does not load the normal SunaQ/LLM pipeline.
+Fresh installs and installer reruns deliberately return to **maintenance mode**. Configured Sync- and Mail-worker processes default to runtime execution **paused** until explicitly released from the Admin UI. Missing or unreadable `runtime/worker-control.json` is fail-closed and therefore also means paused; an installer run seeds the file with both workers paused when it is absent. The OpenAI-compatible provider is started in a minimal maintenance implementation that still validates registered provider-client Bearer keys, but does not load the normal SunaQ/LLM pipeline.
 
-For **Super-Light**, the initial maintenance start intentionally brings up only
+The normal administration interface is deployment-independent:
+
+```bash
+sudo /opt/sunaq/start-all.sh
+sudo /opt/sunaq/stop-all.sh
+/opt/sunaq/status.sh
+sudo /opt/sunaq/install/maintenance-mode.sh on|off|status
+sudo /opt/sunaq/install/smoke-test.sh /opt/sunaq
+```
+
+These commands are the canonical operator contract for both deployment modes
+and dispatch internally according to the recorded `DEPLOYMENT_MODE`. The
+Dockerized installer installs the same top-level `start-all.sh`,
+`stop-all.sh` and `status.sh` entrypoints as Standard. Standard uses
+native/systemd processes plus selected local containers; Dockerized operates the
+generated Compose stack. The internal value `native` remains an implementation
+marker for Standard, but operator-facing status reports `standard`. Direct
+Compose commands and `install/dockerized/status-dockerized.sh` remain only
+low-level/compatibility interfaces; the latter forwards to the common
+`status.sh`.
+
+For Standard ERG installations the resolver gateway is now a regular local
+component on `127.0.0.1:8770`. Its local Neo4j adapter follows the installer
+selection; external OpenRegister/OpenPLZ adapters remain explicitly opt-in.
+SRC disables the resolver gateway. The legacy `install/resolver-prototype`
+tree is retained only as migration/history material.
+
+The bundled smoke test now runs `python -m rag.config_check` before endpoint
+health probes. This catches static contradictions such as an `http://`
+Nextcloud URL while `security.allow_insecure_nextcloud=false`, even when the
+maintenance provider itself is healthy.
+
+For **Dockerized**, the initial maintenance start intentionally brings up only
 the provider plus optional OpenWebUI/nginx. Leaving maintenance starts Neo4j and
 the normal API; Playwright starts only when explicitly installed with
 `--with-playwright`, and the mail worker is not started unless the administrator
@@ -159,6 +207,13 @@ Current rc1.2 operational note: the Neo4j image can still be first pulled at
 That is functional but not the intended long-term UX; a future installer cleanup
 should pull every selected runtime image before the maintenance hand-off so
 leaving maintenance is a fast, deterministic state transition.
+
+On a fresh ERG installation, Neo4j can also need noticeably longer than the other
+services for its first database/volume initialization. An immediate smoke/status
+run may therefore report Neo4j as unavailable even though startup is still
+progressing. If the Neo4j container remains running, wait for it to become ready
+and rerun the unchanged smoke/status check; the repeated check must pass before
+acceptance. A persistent failure is not considered normal first-start behavior.
 
 Selected infrastructure containers may already be prepared or running in the
 Standard profile; they do not receive user SunaQ traffic while the provider gate
@@ -173,7 +228,7 @@ explicit release changes, not side effects of a mutable tag.
 
 Edit `/opt/sunaq/config.yaml`. During this phase the provider returns only `SunaQ ist im Maintenance-Modus. Bitte versuchen Sie es später erneut.` after successful provider-key authentication.
 
-The operator switch uses the installation prefix reported by the installer plan. For a fresh 0.8.6 installation:
+The operator switch uses the installation prefix reported by the installer plan. For a fresh 0.8.7-rc1 installation:
 
 ```bash
 sudo /opt/sunaq/install/maintenance-mode.sh status
@@ -251,6 +306,8 @@ the public trust used for OpenAI, Hugging Face and unrelated HTTPS endpoints.
 `security.allow_insecure_nextcloud=true` exists only as an explicit lab escape
 hatch.
 
+For installer-driven lab setups, use the explicit switch `--allow-insecure-nextcloud` together with the `http://` URL. Without that switch, a supplied HTTP Nextcloud URL is rejected before installation work begins. `--no-x509-strict` is unrelated: it only disables the additional OpenSSL strict-RFC checks while ordinary TLS verification remains enabled.
+
 Edit `/opt/sunaq/provider.env` for the default backend connection and review `models/` for the user-visible SunaQ profiles. The shipped profiles route planner/verifier/evidence/answer roles through the configured backend unless a profile supplies an explicit role override. Keep API keys in root-protected runtime provisioning state; rc1.2 materializes file-backed runtime secrets for supported services. Embeddings remain independently configured in `config.yaml`.
 
 ## 4. Start and smoke test
@@ -292,11 +349,10 @@ Existing Apache/reverse proxy deployments should preferably keep the bundled ngi
 
 #### Same host as Nextcloud/Apache
 
-If Nextcloud's Apache already owns host ports 80/443, keep Apache as the public entry point and move only the bundled SunaQ nginx to unused internal host ports. Super-Light supports this directly:
+If Nextcloud's Apache already owns host ports 80/443, keep Apache as the public entry point and move only the bundled SunaQ nginx to unused internal host ports. Dockerized supports this directly:
 
 ```bash
 sudo ./install/install.sh \
-  --profile super-light \
   --deployment dockerized \
   --preset core \
   --nextcloud-url https://cloud.example.org/nextcloud \
@@ -474,7 +530,7 @@ optional Compose service. Use `--with-playwright` to set
 `127.0.0.1:8090` and record `LOCAL_PLAYWRIGHT=1`. Use `--no-playwright` to
 set the renderer disabled and remove the local container. If neither switch is
 passed on a rerun, the existing `web.yaml` setting remains authoritative.
-Super-Light now uses the same explicit lifecycle: fresh installs do not build or
+Dockerized now uses the same explicit lifecycle: fresh installs do not build or
 start the renderer. Pass `--with-playwright` to install/retain it or
 `--no-playwright` to stop/remove the local renderer container. Reruns without
 either switch preserve the recorded installation state.
@@ -487,20 +543,27 @@ The installable snapshot includes `start-sync-worker.sh`. It periodically invoke
 sync_worker:
   enabled: true
   poll_interval_seconds: 300
+  pause_check_documents: 25
   max_documents: 0
   enqueue_graph: false
 ```
 
-`start-all.sh` starts the worker when both `sync_worker.enabled` and `qdrant.enabled` are true. With systemd installation the corresponding unit is `rag-sync-worker.service`. Keep the legacy mail-specific Qdrant post-hook disabled in normal operation to avoid redundant runs.
+`start-all.sh` starts the worker when both `sync_worker.enabled` and `qdrant.enabled` are true. With systemd installation the corresponding unit is `rag-sync-worker.service`. Keep the legacy mail-specific Qdrant post-hook disabled in normal operation to avoid redundant runs. A running full sync observes Admin pause requests cooperatively at document-batch boundaries (`pause_check_documents`, default 25); it finishes the current batch, marks the run incomplete, and skips stale-document cleanup.
+
+Each successful sync writes a lightweight `runtime/sync-status.json` summary with scanned/eligible/excluded/deferred counts plus document/chunk totals from the sync state. The Admin Vector page reads this local file and performs only a cheap Elasticsearch `_count`; it does not scan Nextcloud or Elasticsearch on page load.
 
 ## 8. Per-user Mail sync
+
+Mail import is an **ERG Full** capability because it introduces and persists
+information from an external information source. It is not part of SRC or ERG
+Internal.
 
 `config.yaml` contains only the global mail worker policy:
 
 ```yaml
 mail:
   enabled: false
-  state_file: mail_state.sqlite
+  state_file: runtime/mail_state.sqlite
   poll_interval_seconds: 300
   worker:
     enabled: false
@@ -558,35 +621,29 @@ sudo -u rag ./.venv/bin/python -m rag.mail_sync --config config.yaml --user <nex
 
 ## 9. Per-user CardDAV contact seeds
 
-Contact seed administration is keyed by the verified Nextcloud account. The
-internal `canonical_user_id` remains an implementation key and is not required
-for normal operation. After a user has completed Login Flow, SunaQ Admin → Users
-→ Kontakt-DB can synchronize the selected CardDAV address books with the stored
+CardDAV-derived contact/entity state is an **ERG Internal/Full** capability
+because it persists local derived resolver/graph state. It is not available in
+strict SRC/Dockerized.
+
+For a Standard ERG installation, contact seed administration is keyed by the
+verified Nextcloud account. After a user has completed Login Flow, SunaQ Admin →
+Users → Kontakt-DB can synchronize selected CardDAV address books with the stored
 Nextcloud credential. No separate CardDAV password needs to be configured.
 
-Dockerized super-light CLI:
-
-```bash
-cd /opt/sunaq/install/super-light
-./contacts.sh list
-./contacts.sh status --user <nextcloud-login>
-./contacts.sh books --user <nextcloud-login>
-./contacts.sh sync --user <nextcloud-login>
-```
-
-Native equivalent:
+Native CLI:
 
 ```bash
 cd /opt/sunaq
 sudo -u rag ./.venv/bin/python -m rag.contacts sync --user <nextcloud-login>
 ```
 
+The legacy files under `install/dockerized/contacts.sh` and
+`seed-carddav.sh` now fail with an explicit architecture notice instead of
+pretending that SRC owns Neo4j/CardDAV resolver state.
+
 Use `--server URL` only when the same login exists on multiple Nextcloud
 instances. A disabled user/source, missing Nextcloud credential or empty address
-book is a clean no-op. The Admin-UI synchronization is synchronous in 0.8.4;
-there is no progress bar yet, but progress is logged and final counters/status are
-persisted. The legacy global `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_PASSWORD`
-CardDAV path is compatibility-only.
+book is a clean no-op.
 
 ## 10. Live ACL and no-backfill rule
 
@@ -602,7 +659,13 @@ re-enable/re-auth rather than deleted automatically.
 
 ## 11. Graph and normal sync
 
-When local Neo4j is selected, both installation profiles wait for the database and run the idempotent SunaQ schema initialization. The same step runs on an installer rerun, so an existing database receives missing non-destructive constraints, indexes and deterministic backfills; a new database is not required. The API also attempts this migration at startup for deployments managed outside the installer. See [the canonical Neo4j schema reference](../docs/NEO4J-SCHEMA.md).
+When local Neo4j is selected in a Standard ERG Internal/Full installation,
+the installer waits for the database and runs the idempotent SunaQ schema
+initialization. Dockerized SRC does not install or start Neo4j. The same schema
+step runs on a Standard installer rerun, so an existing database receives
+missing non-destructive constraints, indexes and deterministic backfills. The
+API also attempts this migration at startup for deployments managed outside the
+installer. See [the canonical Neo4j schema reference](../docs/NEO4J-SCHEMA.md).
 
 With Neo4j selected, graph retrieval and the asynchronous graph worker are
 available. Expensive whole-corpus graph extraction remains off during normal
@@ -684,7 +747,7 @@ Then:
 11. stop Elasticsearch temporarily and verify the user receives a service-unavailable message rather than a generic 500/502;
 12. verify normal document sync leaves bulk graph enqueue disabled and backend degradation never turns into an ACL fail-open.
 
-Blank-VM acceptance for `0.8.5-rc4.3` has been completed for both supported mappings. Super-Light/dockerized installed successfully and passed document search plus SunaQ Admin checks. Standard/native also completed installation and passed document search plus SunaQ Admin checks, including automatic startup of the optional Playwright renderer when selected with `--with-playwright`. Repeat the same checklist on the intended deployment host before exposing it to users.
+Blank-VM acceptance for `0.8.5-rc4.3` has been completed for both supported mappings. Dockerized/core installed successfully and passed document search plus SunaQ Admin checks. Standard/native also completed installation and passed document search plus SunaQ Admin checks, including automatic startup of the optional Playwright renderer when selected with `--with-playwright`. Repeat the same checklist on the intended deployment host before exposing it to users.
 
 
 ## 13. Administration reference
@@ -727,38 +790,45 @@ Qdrant, embedding backend and Nextcloud Live-ACL.
 
 Fresh installs create `runtime/credential-master.key` as `root:rag 0640`, add
 `RAG_CREDENTIAL_MASTER_KEY_FILE` and `RAG_CREDENTIAL_ENCRYPTION=required` to
-`runtime.env`, and verify the encrypted credential store. `0.8.6-rc1.2` is the current development release-candidate baseline; no upgrade path from unpublished internal snapshots is documented or supported.
+`runtime.env`, and verify the encrypted credential store. `0.8.7-rc1` is the current release-candidate baseline; it is not yet a tagged release contract. No upgrade path from unpublished internal snapshots is documented or supported.
 
 The master key must be backed up separately. The Admin UI can report encryption
 status and replace IMAP credentials, but does not reveal stored secrets or create
 the root-managed master key.
 
-## Profile vs deployment mode
+## Architecture tier, capability preset and deployment mode
 
-0.8.4 exposes profile and deployment as separate concepts. The tested combinations
-in this release are:
+The three concepts are separate:
 
 ```text
-profile=standard    deployment=native
-profile=super-light deployment=dockerized
+--architecture-tier src|erg-internal|erg-full
+--preset core|workgroup|full
+--deployment standard|dockerized
 ```
 
-The public installer accepts both axes explicitly, for example:
+`--profile standard`, `--profile super-light`, `--super-light` and
+`--deployment native` are compatibility aliases only. In particular,
+`--profile super-light` means exactly `--deployment dockerized --preset core`.
 
-```bash
-sudo ./install/install.sh --profile super-light --deployment dockerized --plan ...
-```
+Preset application selects component defaults, subject to final architecture validation. Workgroup/full select local Qdrant, Neo4j and the resolver as their recommended ERG bundle; Qdrant's sync capability is configured but runtime execution remains paused until the administrator releases it. For a smaller custom ERG footprint, omit the named preset and select the architecture tier plus only the desired positive `--with-*` components. `--with-qdrant` has the same capability meaning in Standard and Dockerized; only the service packaging differs.
 
-Other combinations are rejected rather than silently approximated. This keeps
-one middleware codebase while leaving room for a later `standard + dockerized`
-deployment without creating a fork.
+The presets are recommended bundles for the three information/data envelopes:
 
+- `core` / SRC: no SunaQ-owned persistent derived knowledge store and no
+  external information acquisition;
+- `workgroup` / ERG Internal: SunaQ-owned derived state from the authoritative
+  internal Nextcloud information space, but no Mail import, public Web,
+  Delegated Research or external resolver;
+- `full` / ERG Full: ERG Internal plus external information acquisition and
+  research egress.
+
+Model, reranker and embedding provider locality is orthogonal to the preset.
 ### Reproducible installer reruns
 
-The installer also refuses a non-empty `--prefix` that is not recognized as a SunaQ installation. This is a safety boundary because profile refreshes replace selected top-level paths such as `rag/`, `docs/` and `clients/`. A typo such as pointing `--prefix` at an unrelated application directory must therefore fail before any files are changed. Fresh installs should use a dedicated empty path; current installations carry `.aki-rag-installation` plus installer state for future reruns.
+The installer also refuses a non-empty `--prefix` that is not recognized as a SunaQ installation. This is a safety boundary because profile refreshes replace selected top-level paths such as `rag/`, `docs/` and `clients/`. A typo such as pointing `--prefix` at an unrelated application directory must therefore fail before any files are changed. Fresh installs should use a dedicated empty path; current installations carry `.sunaq-installation` plus installer state for future reruns. The legacy `.aki-rag-installation` marker remains recognized for in-place upgrades.
 
 
-Keep the exact installation command used for a host. The Super-Light installer now
+Keep the exact installation command used for a host. The Dockerized installer now
 records the wrapper invocation in:
 
 ```text
@@ -772,7 +842,7 @@ again, especially after moving certificates or changing external service address
 On a rerun the installer performs an early preflight before modifying the installation:
 it checks the installer source tree, the existing prefix, supplied CA file paths/PEM
 shape and an available Docker daemon when Docker is already installed. For an existing
-Super-Light installation, any running SunaQ service is a hard preflight error: stop
+Dockerized installation, any running SunaQ service is a hard preflight error: stop
 the stack before rerunning the installer so no refresh is attempted against live
 containers. A recognized but fully stopped stack is informational and remains the
 normal repair/rerun path. An unreachable Docker daemon or missing required input file
@@ -780,15 +850,25 @@ is also a hard error.
 
 Use `--plan` first when changing profile options, URLs, CA paths or optional services.
 Site-owned `config.yaml`, `provider.env`, `runtime.env`, runtime databases, credential
-master key and generated TLS material remain preserved on normal reruns.
-Preservation is intentional and is not a schema merge: newly introduced optional `config.yaml` keys are not inserted into an existing site configuration automatically. Review the release changelog/reference profile after an update and add wanted settings manually (for example RC5 `acl.prefilter.enabled`).
+master key and generated TLS material remain preserved on normal reruns. Before final validation,
+both installers run the centralized safe config upgrader. It materializes only non-optional
+operational defaults and compatibility migrations required for correct runtime behavior, and prints
+each change as `[MIGRATE] ...`. For the current RC this includes the persistent sync-state/status
+paths and `sync_worker.pause_check_documents`. Existing explicit administrator values are preserved.
 
-### Dockerized super-light with private CA
+This is deliberately not a general schema merge: newly introduced optional capabilities or policy
+choices are never enabled merely because a reference config gained a key. Such settings remain an
+explicit upgrade decision documented in the changelog/reference profile (for example
+`acl.prefilter.enabled`). A manual/source-only deployment that skips the installer should run
+`python -m rag.config_upgrade --config config.yaml --deployment native|dockerized` and then
+`python -m rag.config_check --config config.yaml`.
+
+### Dockerized with private CA
 
 ```bash
 sudo ./install/install.sh \
-  --profile super-light \
   --deployment dockerized \
+  --architecture-tier src \
   --preset core \
   --with-proxy \
   --ca-certificate /etc/pki/trust/anchors/Company_Root_CA.crt \

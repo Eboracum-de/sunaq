@@ -1,3 +1,4 @@
+from fastapi import BackgroundTasks
 from starlette.requests import Request
 
 from rag.openai_provider import (
@@ -58,7 +59,6 @@ def test_source_capabilities_follow_global_and_per_user_service_gates(monkeypatc
     assert provider._source_capabilities_for_identity(identity) == {
         "documents": True,
         "mailarchive": True,
-        "webarchive": True,
         "chatarchive": True,
         "web": True,
     }
@@ -77,10 +77,41 @@ def test_source_capabilities_follow_global_and_per_user_service_gates(monkeypatc
     assert provider._source_capabilities_for_identity(identity) == {
         "documents": True,
         "mailarchive": False,
-        "webarchive": False,
         "chatarchive": False,
         "web": False,
     }
+
+
+def test_delegated_web_engine_satisfies_web_capability_without_native_engine(monkeypatch, tmp_path):
+    import rag.openai_provider as provider
+    from rag.credential_store import CredentialStore, scope_identity
+    from rag.research.registry import DelegatedResearchSettings
+
+    store = CredentialStore(tmp_path / "users.sqlite")
+    identity = scope_identity("frontend-a", "alice-ext")
+    user = store.bind_identity(identity, "https://cloud.example", "alice")
+    store.set_web_settings(
+        user.canonical_user_id,
+        enabled=True,
+        archive_enabled=False,
+        target_path="Research/Web",
+    )
+
+    monkeypatch.setattr(provider, "_PROVIDER_CLIENT_STORE", store)
+    monkeypatch.setattr(provider, "_provider_web_config", lambda: {"enabled": False})
+    monkeypatch.setattr(
+        provider,
+        "DELEGATED_RESEARCH_SETTINGS",
+        DelegatedResearchSettings(
+            enabled=True,
+            provider="openai",
+            delegate_web_only=True,
+            model="gpt-test",
+        ),
+    )
+
+    capabilities = provider._source_capabilities_for_identity(identity)
+    assert capabilities["web"] is True
 
 
 def test_disabled_requested_sources_are_rejected_as_server_policy(monkeypatch):
@@ -89,7 +120,6 @@ def test_disabled_requested_sources_are_rejected_as_server_policy(monkeypatch):
     monkeypatch.setattr(provider, "_source_capabilities_for_identity", lambda identity: {
         "documents": True,
         "mailarchive": False,
-        "webarchive": False,
         "chatarchive": False,
         "web": False,
     })
@@ -345,6 +375,7 @@ def test_unbound_openwebui_user_gets_nextcloud_login_link(monkeypatch):
         provider.chat_completions(
             body,
             _request({"x-openwebui-user-id": "owui-user-123"}),
+            BackgroundTasks(),
             authorization=None,
         )
     )
@@ -402,5 +433,23 @@ def test_followup_helper_returns_empty_list_without_llm(monkeypatch):
         }],
         stream=False,
     )
-    response = asyncio.run(provider.chat_completions(body, request, authorization="Bearer ignored"))
+    response = asyncio.run(
+        provider.chat_completions(
+            body, request, BackgroundTasks(), authorization="Bearer ignored"
+        )
+    )
     assert response["choices"][0]["message"]["content"] == '{"follow_ups":[]}'
+
+
+def test_streaming_followup_suggestions_are_exposed_via_request_status():
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "rag" / "openai_provider.py").read_text(
+        encoding="utf-8"
+    )
+    setter = source[
+        source.index("def _set_suggestions("):
+        source.index("def _suggestions(", source.index("def _set_suggestions("))
+    ]
+    assert 'state["suggestions"] = [dict(item) for item in clean]' in setter
+    assert 'state["updated_at"] = time.time()' in setter

@@ -187,6 +187,7 @@ async def test_web_relevance_uses_json_records_and_immutable_guard(monkeypatch):
     gate.num_ctx = 4096
     gate.num_predict = 200
     gate.max_sources = 5
+    gate.batch_size = 8
     gate.min_score = 0.5
     gate.preview_chars = 1200
 
@@ -258,7 +259,7 @@ def test_line_evidence_preserves_document_newline_structure_and_budget():
             "citation": "[DOKUMENT 1]",
             "index": 1,
             "title": "example.pdf",
-            "text_lines": ["Eboracum GmbH", "Im Vogelsang 9", "", "Kaufvertrag", "Ende"],
+            "text_lines": ["Example GmbH", "Musterweg 9", "", "Kaufvertrag", "Ende"],
         }
     ]
     rendered, count = fit_evidence_line_records(
@@ -271,8 +272,8 @@ def test_line_evidence_preserves_document_newline_structure_and_budget():
     payload = json.loads(rendered)
     assert count == 1
     assert payload["records"][0]["text_lines"] == [
-        "Eboracum GmbH",
-        "Im Vogelsang 9",
+        "Example GmbH",
+        "Musterweg 9",
         "",
         "Kaufvertrag",
         "Ende",
@@ -305,11 +306,11 @@ async def test_candidate_verifier_uses_line_preserving_json_evidence(monkeypatch
     result = provider.SearchResult(
         index=1,
         title="contract.pdf",
-        text="Eboracum GmbH\nIm Vogelsang 9\n\nKaufvertrag",
+        text="Example GmbH\nMusterweg 9\n\nKaufvertrag",
         raw={"document_id": "files:1", "path": "/docs/contract.pdf"},
     )
     await provider._verify_exhaustive_candidates(
-        "Vogelsang 280",
+        "Musterweg 280",
         [result],
         candidate_limit=1,
         compact=True,
@@ -323,8 +324,8 @@ async def test_candidate_verifier_uses_line_preserving_json_evidence(monkeypatch
     record = payload["records"][0]
     assert "text" not in record
     assert record["text_lines"] == [
-        "Eboracum GmbH",
-        "Im Vogelsang 9",
+        "Example GmbH",
+        "Musterweg 9",
         "",
         "Kaufvertrag",
     ]

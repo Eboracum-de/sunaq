@@ -3,6 +3,7 @@ from pathlib import Path
 import yaml
 
 import rag.mail_worker as worker
+from rag.runtime_control import set_worker_enabled
 
 
 def _write(path: Path, data: dict):
@@ -26,9 +27,10 @@ def test_worker_once_disabled_is_clean_noop(tmp_path, monkeypatch):
     assert called == []
 
 
-def test_worker_once_enabled_runs_same_mail_sync_path(tmp_path, monkeypatch):
+def test_worker_once_enabled_runs_same_mail_sync_path_after_runtime_release(tmp_path, monkeypatch):
     cfg = tmp_path / "config.yaml"
     _write(cfg, {"mail": {"enabled": True, "worker": {"enabled": True, "poll_interval_seconds": 60}}})
+    set_worker_enabled("mail_worker", True, config_path=cfg)
     called = []
     monkeypatch.setattr(worker, "_run_sync_once", lambda path: called.append(path) or 0)
     assert worker.run_worker(cfg, once=True) == 0

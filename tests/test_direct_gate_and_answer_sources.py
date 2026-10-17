@@ -1,5 +1,7 @@
 import asyncio
 
+from fastapi import BackgroundTasks
+
 from starlette.requests import Request
 
 import rag.openai_provider as provider
@@ -112,6 +114,7 @@ def test_greeting_does_not_call_retrieval_or_query_rewrite(monkeypatch):
         provider.chat_completions(
             body,
             _request({"x-openwebui-user-id": "user-1"}),
+            BackgroundTasks(),
             authorization="Bearer ignored",
         )
     )
@@ -145,6 +148,7 @@ def test_passive_source_scopes_do_not_disable_direct_gate(monkeypatch):
         provider.chat_completions(
             body,
             _request({"x-openwebui-user-id": "user-1"}),
+            BackgroundTasks(),
             authorization="Bearer ignored",
         )
     )
@@ -178,9 +182,42 @@ def test_time_question_gets_runtime_context_without_retrieval(monkeypatch):
         provider.chat_completions(
             body,
             _request({"x-openwebui-user-id": "user-1"}),
+            BackgroundTasks(),
             authorization="Bearer ignored",
         )
     )
     content = response["choices"][0]["message"]["content"]
     assert content == "Es ist 12:34 Uhr."
     assert "**Quellen:**" not in content
+
+
+def test_conversation_id_prefers_sunaq_header_over_openwebui_header():
+    body = provider.ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Hallo"}],
+        stream=False,
+        user="user-identity",
+    )
+    request = _request({
+        "x-rag-conversation-id": "sunaq-chat-1",
+        "x-openwebui-chat-id": "openwebui-chat-2",
+    })
+    assert provider._conversation_id(request, body) == "sunaq-chat-1"
+
+
+def test_conversation_id_accepts_native_openwebui_header():
+    body = provider.ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Hallo"}],
+        stream=False,
+        user="user-identity",
+    )
+    request = _request({"x-openwebui-chat-id": "550e8400-e29b-41d4-a716-446655440000"})
+    assert provider._conversation_id(request, body) == "550e8400-e29b-41d4-a716-446655440000"
+
+
+def test_conversation_id_does_not_reuse_openai_user_field():
+    body = provider.ChatCompletionRequest(
+        messages=[{"role": "user", "content": "Hallo"}],
+        stream=False,
+        user="user-identity",
+    )
+    assert provider._conversation_id(_request(), body) is None

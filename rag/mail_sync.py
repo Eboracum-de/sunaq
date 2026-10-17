@@ -539,12 +539,19 @@ class StateDB:
                 live_uid INTEGER NOT NULL,
                 backfill_before_uid INTEGER NOT NULL,
                 legacy_last_uid INTEGER NOT NULL DEFAULT 0,
+                applied_not_before TEXT,
                 initialized_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (account, mailbox)
             )
             """
         )
+        columns = {
+            str(row[1])
+            for row in self.db.execute("PRAGMA table_info(mail_sync_state)").fetchall()
+        }
+        if "applied_not_before" not in columns:
+            self.db.execute("ALTER TABLE mail_sync_state ADD COLUMN applied_not_before TEXT")
         self.db.commit()
 
     def _legacy_cursor(self, account: str, mailbox: str, uidvalidity: int) -> int:
@@ -604,8 +611,8 @@ class StateDB:
                 """
                 INSERT INTO mail_sync_state(
                     account, mailbox, uidvalidity, live_uid, backfill_before_uid,
-                    legacy_last_uid, initialized_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    legacy_last_uid, applied_not_before, initialized_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                 """,
                 (account, mailbox, uidvalidity, live_uid, backfill_before_uid, legacy_last_uid),
             )
@@ -615,6 +622,53 @@ class StateDB:
             account, mailbox, live_uid, backfill_before_uid, legacy_last_uid,
         )
         return live_uid, backfill_before_uid, legacy_last_uid
+
+    def cutoff_scope(self, account: str, mailbox: str) -> str | None:
+        row = self.db.execute(
+            """
+            SELECT applied_not_before
+            FROM mail_sync_state WHERE account=? AND mailbox=?
+            """,
+            (account, mailbox),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return str(row[0])
+
+    def set_cutoff_scope(
+        self, account: str, mailbox: str, not_before: str, *, persist: bool = True,
+    ) -> None:
+        if not persist:
+            return
+        self.db.execute(
+            """
+            UPDATE mail_sync_state
+            SET applied_not_before=?,updated_at=CURRENT_TIMESTAMP
+            WHERE account=? AND mailbox=?
+            """,
+            (not_before, account, mailbox),
+        )
+        self.db.commit()
+
+    def reopen_backfill(
+        self,
+        account: str,
+        mailbox: str,
+        before_uid: int,
+        *,
+        persist: bool = True,
+    ) -> None:
+        if not persist:
+            return
+        self.db.execute(
+            """
+            UPDATE mail_sync_state
+            SET backfill_before_uid=?,updated_at=CURRENT_TIMESTAMP
+            WHERE account=? AND mailbox=?
+            """,
+            (int(before_uid), account, mailbox),
+        )
+        self.db.commit()
 
     def save_live(self, account: str, mailbox: str, uidvalidity: int, live_uid: int) -> None:
         self.db.execute(
@@ -1133,6 +1187,49 @@ def sync_mailbox(
         live_uid, backfill_before_uid, legacy_last_uid = state.load_or_initialize(
             state_account, mailbox, validity, mailbox_max_uid, persist=not dry_run
         )
+
+        # A completed UID backfill does not by itself detect a later expansion
+        # of not_before. IMAP UIDs are not chronological by INTERNALDATE, so a
+        # broader date scope must reopen the historical scan instead of trying
+        # to derive a UID boundary from the date.
+        current_scope = cutoff.isoformat() if cutoff else ""
+        applied_scope = state.cutoff_scope(state_account, mailbox)
+        if applied_scope is None:
+            state.set_cutoff_scope(
+                state_account, mailbox, current_scope, persist=not dry_run
+            )
+            applied_scope = current_scope
+
+        def scope_is_broader(new_value: str, old_value: str) -> bool:
+            if new_value == old_value:
+                return False
+            if not new_value:
+                return bool(old_value)
+            if not old_value:
+                return False
+            return _parse_iso_date(new_value) < _parse_iso_date(old_value)
+
+        if current_scope != applied_scope:
+            if scope_is_broader(current_scope, applied_scope):
+                backfill_before_uid = live_uid + 1
+                state.reopen_backfill(
+                    state_account,
+                    mailbox,
+                    backfill_before_uid,
+                    persist=not dry_run,
+                )
+                log.info(
+                    "Mail-Cutoff erweitert account=%s mailbox=%s %s -> %s; "
+                    "historischer Backfill wird einmal neu geöffnet",
+                    account_name,
+                    mailbox,
+                    applied_scope or "<all>",
+                    current_scope or "<all>",
+                )
+            state.set_cutoff_scope(
+                state_account, mailbox, current_scope, persist=not dry_run
+            )
+            applied_scope = current_scope
 
         live_pending = [uid for uid in eligible_uids if uid > live_uid]
         backfill_pending = [

@@ -1,10 +1,10 @@
 # SunaQ technical reference
 ## Technical documentation and command reference
 
-**Version:** `0.8.6-rc1.2` (draft)  
-**Updated:** 25 September 2026
+**Version:** `0.8.7-rc1` development reference  
+**Updated:** 9 October 2026
 
-This file is the consolidated technical reference for the current release-candidate snapshot. Internal development and migration drafts are not part of the release documentation. Where older notes conflict with the current implementation, this reference together with `config.yaml`, `models/*/profile.yaml`, `models/README.md`, `web.yaml`, `provider.env.example` and `versions.lock.yaml` describes the intended baseline.
+This file is the consolidated technical reference for the current retrieval-architecture development line. It is not a tagged release contract. Where older notes conflict with the current implementation, this reference together with `config.yaml`, `models/*/profile.yaml`, `models/README.md`, `web.yaml`, `provider.env.example` and `versions.lock.yaml` describes the intended branch baseline. Design rationale lives in `docs/WHITEPAPER.md`; architecture-tier policy lives in `docs/SRC-ERG.md`.
 
 ---
 
@@ -44,7 +44,7 @@ Without a user UI, `/` redirects to `/rag-admin/`.
 
 ### Internal API trust boundary
 
-Port `8765` is an internal FastAPI service and is loopback-bound by the supported profiles. The current 0.8.6 line enforces explicit route zones through central FastAPI dependencies:
+Port `8765` is an internal FastAPI service and is loopback-bound by the supported profiles. The current 0.8.7-rc1 line enforces explicit route zones through central FastAPI dependencies:
 
 - `PUBLIC`: no internal machine credential; currently only `/live`;
 - `INTERNAL`: requires `X-AKI-Internal-Key` / `RAG_INTERNAL_API_KEY`;
@@ -56,31 +56,35 @@ The bundled provider sends both internal and provider-role credentials. Bundled 
 
 Core FastAPI routes expose their assigned zone in OpenAPI as `x-aki-security-zone`, and CI verifies the route/zone mapping. `X-RAG-User-ID` remains an identity lookup key used only after the trusted-provider boundary; it is **not** caller authentication. Direct access to port 8765 is unsupported. Native startup rejects non-loopback `RAG_API_HOST` unless `RAG_ALLOW_REMOTE_INTERNAL_API=true` is explicitly configured.
 
-### Architecture, preset, component-profile and deployment axes
+### Architecture, preset, model-profile and deployment axes
 
-rc1.2 separates four concepts:
+0.8.7-rc1 separates four independent concepts:
 
-- **SRC / ERG** are enforced architecture/capability tiers. SRC is the narrow
-  Documents-only Elasticsearch/files path with mandatory live ACL, at most one
-  retrieval round and local/private or administrator-approved remote LLM roles
-  (remote evidence caps apply); rerankers remain local/private. ERG is the
-  extension envelope.
-- **core / workgroup** are shipped capability presets. `core` selects the SRC
-  invariant set; `workgroup` is a conservative Elasticsearch-centric ERG
-  starting point.
-- **Super-Light / Standard** are component/resource profiles. Super-Light ships
-  as formal SRC in rc1.2; Standard remains the ERG-compatible reference profile.
-- **native / dockerized** are deployment mechanisms. The supported mappings
-  remain `standard+native` and `super-light+dockerized`.
+- **SRC / ERG Internal / ERG Full** are enforced retrieval/data-plane trust
+  envelopes. SRC is Documents-only Files/Elasticsearch with mandatory live ACL
+  and one retrieval round. ERG Internal permits locally controlled derived
+  state/capabilities. ERG Full additionally permits explicitly granted external
+  research/resolution.
+- **core / workgroup / full** are shipped capability presets mapping to those
+  three envelopes.
+- **SunaQ model packages** such as Standard/Thorough/Deep (current German labels: Schnell/Gründlich/Tief) define request-local
+  retrieval/verifier/answer budgets and role routing. They do not select the
+  architecture tier.
+- **standard / dockerized** are deployment/packaging mechanisms.
 
-Installers accept `--preset core|workgroup` and `--preset-file FILE`.
+The axes are intentionally orthogonal. A preset must not silently install or
+disable infrastructure. In particular, `workgroup` and `full` permit vector
+retrieval as optional but do not set `qdrant.enabled`; the deployment's Qdrant
+availability is preserved. Their baseline document-graph retrieval policy is
+disabled even when Neo4j is enabled for resolver/Findings functions.
+
+Installers accept `--preset core|workgroup|full` and
+`--deployment standard|dockerized`. Historical aliases remain for upgrade
+compatibility where documented by the installer.
+
 Preset files are YAML data merged through `rag.config_preset`; they are never
 sourced as shell. Explicit connection/TLS/index installer arguments are applied
-after the preset and therefore win.
-
-The existing Standard-installer option `--core` is a **legacy resource
-shorthand for Qdrant + Neo4j**. It is unrelated to `--preset core` and must not
-be used as terminology for the SRC boundary.
+after the preset and remain authoritative.
 
 ---
 
@@ -92,9 +96,9 @@ be used as terminology for the SRC boundary.
 sudo ./install/install.sh --plan --full
 ```
 
-## 2.2 Standard/native installer options
+## 2.2 Standard installer options
 
-The public wrapper accepts `--profile standard|super-light` and `--deployment native|dockerized`. In the 0.8.6-rc1.2 line the supported and regression-tested combinations are `standard+native` and `super-light+dockerized`. Profile and deployment remain explicit, conceptually separate axes even though other combinations are not yet supported. Common connection/frontend/proxy switches use the same names in both profiles. Profile-specific resource switches remain separate because Super-Light deliberately has no Qdrant/reranker arm. On rerun, prior OpenWebUI/proxy selections are retained unless an explicit `--no-...` override is supplied. The options below belong to the standard/native profile.
+The public wrapper now prefers `--deployment standard|dockerized` plus `--preset core|workgroup|full`. Historical `--profile standard`, `--profile super-light` and `--deployment native` remain compatibility aliases. Common connection/frontend/proxy switches use the same names in both deployments. Resource/service availability remains deployment-owned while the preset defines the capability envelope. On rerun, prior OpenWebUI/proxy selections are retained unless an explicit `--no-...` override is supplied. The options below belong to the Standard deployment.
 
 | Option | Meaning |
 |---|---|
@@ -103,12 +107,12 @@ The public wrapper accepts `--profile standard|super-light` and `--deployment na
 | `--nextcloud-url URL` | override the Nextcloud base URL in `config.yaml` |
 | `--elasticsearch-url URL` | override the Elasticsearch endpoint in `config.yaml` |
 | `--elasticsearch-index ID` | override the Elasticsearch index in `config.yaml` |
-| `--preset core\|workgroup` | apply a shipped capability preset; explicit connection/TLS/index arguments win |
+| `--preset core\|workgroup\|full` | apply a shipped capability preset; explicit connection/TLS/index arguments win |
 | `--preset-file FILE` | apply a site-owned safe YAML capability overlay |
 | `--skip-system-packages` | do not install OS packages/Docker |
 | `--with-qdrant` | install/start local Qdrant |
 | `--with-neo4j` | install/start local Neo4j |
-| `--core` | legacy Standard-installer resource shorthand: Qdrant + Neo4j; unrelated to the rc1.2 `core` capability preset |
+| `--core` | legacy Standard-installer resource shorthand: Qdrant + Neo4j; unrelated to the `core`/SRC capability preset |
 | `--with-openwebui` | install/start or retain the pinned OpenWebUI build |
 | `--no-openwebui` | explicitly disable/remove the OpenWebUI container; persistent volume is retained |
 | `--full` | Qdrant + Neo4j + OpenWebUI |
@@ -133,16 +137,16 @@ No longer bundled:
 
 Both can be operated externally and configured as backends.
 
-## 2.3 Super-Light/dockerized installer options
+## 2.3 Dockerized installer options
 
-Super-Light has a separate CLI because it configures the external Nextcloud/FullTextSearch connection while building the containerized middleware. `--nextcloud-url` and `--elasticsearch-url` are required when the installer starts the stack; they may be omitted together with `--no-start`.
+Dockerized uses the same public installer wrapper while configuring the external Nextcloud/FullTextSearch connection and building the containerized middleware. `--nextcloud-url` and `--elasticsearch-url` are required when the installer starts the stack; they may be omitted together with `--no-start`.
 
 | Option | Meaning |
 |---|---|
 | `--nextcloud-url URL` | canonical Nextcloud base URL, preferably HTTPS |
 | `--elasticsearch-url URL` | existing Nextcloud FullTextSearch Elasticsearch endpoint |
 | `--elasticsearch-index ID` | FullTextSearch index name; default `my_index` |
-| `--preset core\|workgroup` | apply a shipped capability preset; Super-Light defaults to core/SRC |
+| `--preset core\|workgroup\|full` | apply a shipped capability preset; deployment and architecture remain independent |
 | `--preset-file FILE` | apply a site-owned safe YAML capability overlay inside the provider container |
 | `--prefix PATH` | installation directory; default `/opt/sunaq` |
 | `--skip-system-packages` | do not install Docker/curl/jq/openssl |
@@ -163,8 +167,8 @@ Example:
 
 ```bash
 sudo ./install/install.sh \
-  --profile super-light \
   --deployment dockerized \
+  --preset core \
   --nextcloud-url https://cloud.example.org/nextcloud \
   --elasticsearch-url http://10.0.0.20:9200 \
   --elasticsearch-index my_index \
@@ -175,17 +179,17 @@ For a host where Nextcloud/Apache already owns 80/443, use alternate internal ng
 
 ## 2.4 Reference installation
 
-Standard/native:
+Standard:
 
 ```bash
 sudo ./install/install.sh --plan --with-openwebui --with-qdrant --with-neo4j
 sudo ./install/install.sh       --with-openwebui --with-qdrant --with-neo4j
 ```
 
-Super-Light/dockerized:
+Dockerized:
 
 ```bash
-sudo ./install/install.sh --profile super-light --plan \
+sudo ./install/install.sh --deployment dockerized --preset core --plan \
   --nextcloud-url https://cloud.example.org/nextcloud \
   --elasticsearch-url http://10.0.0.20:9200 \
   --elasticsearch-index my_index
@@ -195,7 +199,7 @@ Before first start, review at least `config.yaml`, `provider.env` and `runtime.e
 
 ## 2.5 Maintenance mode
 
-The RC5 line introduced an explicit operator-controlled maintenance state; rc1.1 retains it. Fresh installs and installer reruns set:
+SunaQ retains an explicit operator-controlled maintenance state across both deployment mechanisms. Fresh installs and installer reruns set:
 
 ```text
 RAG_MAINTENANCE_MODE=true
@@ -223,7 +227,7 @@ While maintenance is **on**:
 
 This is intentionally not an unauthenticated bypass. If the provider-client registry is unavailable, the maintenance provider fails closed rather than accepting arbitrary callers.
 
-For **Super-Light/dockerized**, `maintenance-mode.sh off` starts Neo4j and the API, plus Playwright only when it was explicitly installed with `--with-playwright`. The mail worker is not part of the baseline startup. The wrapper waits for Neo4j/schema initialization and only then recreates the normal provider. If schema/startup readiness fails, it restores `RAG_MAINTENANCE_MODE=true` and returns to the maintenance provider.
+For **Dockerized**, `maintenance-mode.sh off` converges the configured service set for the selected tier/preset. Neo4j, Qdrant, resolver, workers, Playwright and frontend/proxy services are started only when selected; Playwright remains explicit `--with-playwright`. The wrapper waits for selected dependency readiness where required and recreates the normal provider only after startup succeeds. If normal startup fails, it restores `RAG_MAINTENANCE_MODE=true` and returns to the maintenance provider.
 
 For **Standard/native**, the wrapper performs the corresponding systemd/native process switch. Systemd-managed switching requires root.
 
@@ -329,15 +333,27 @@ Qdrant is a retrieval store, not an authorization authority. Keep it on loopback
 
 ### Retrieval, query rewrite and optional rounds
 
-The normal retrieval contract is deliberately small. Round 1 rewrites the user question once into a SearchSpec:
+The current planner contract is **backend-neutral structured intent**. The
+planner describes what should be retrieved; deterministic middleware owns
+Elasticsearch/Qdrant/backend syntax.
+
+Round 1 rewrites the user question into a SearchSpec such as:
 
 ```json
 {
-  "elastic_query": "+examplehost +2025 +invoice",
   "semantic_query": "invoices from examplehost in 2025",
   "entities": ["examplehost"],
-  "concepts": ["invoice"],
-  "constraints": [{"kind": "year", "value": "2025"}],
+  "entity_hints": [],
+  "concepts": ["Rechnung"],
+  "concept_groups": [
+    {
+      "required": true,
+      "terms": ["Rechnung", "Invoice"]
+    }
+  ],
+  "constraints": [
+    {"kind": "year", "value": "2025"}
+  ],
   "verification_requirements": [
     "The document itself is an invoice from examplehost.",
     "The relevant year is 2025."
@@ -345,52 +361,80 @@ The normal retrieval contract is deliberately small. Round 1 rewrites the user q
 }
 ```
 
-A compact Neo4j seed/alias context is supplied before the rewrite. `elastic_query` is a human-style Nextcloud full-text expression, **not raw Elasticsearch JSON DSL**. The API parses it and deterministically constructs the Elasticsearch request body. `semantic_query` is sent only to Qdrant when the vector arm is enabled.
+The current planner response schema does **not** contain `elastic_query`.
+Compatibility models/API paths may still accept the legacy field, but structured
+intent is authoritative on the normal path.
 
-`entities`, `concepts`, `constraints` and `verification_requirements` are analytical side products for Graph-Lite, verifier and provenance; they do not silently rewrite `elastic_query`.
+For Files retrieval, `plan_from_search_spec()` converts semantic intent into
+deterministic lexical groups:
 
-Elasticsearch retrieval can optionally apply the implemented ACL metadata
-prefilter before later ranking work. Its first version uses Nextcloud
-owner/direct-user/group metadata; Circle membership is not yet evaluated. If the
-required identity/group context is unavailable, the prefilter is skipped rather
-than denying otherwise visible evidence. It is only a retrieval optimization:
-the final live WebDAV ACL remains authoritative.
+- each explicit entity becomes a required lexical group;
+- each `concept_groups[]` item is OR over its terms;
+- `required: true` becomes a MUST(OR(...)) group;
+- `required: false` becomes an optional ranking/context group;
+- safe literals such as explicit years, identifiers and filenames may be added
+  deterministically from the original user request.
 
-Backend results are fused, deduplicated and optionally reranked. The current
-normal path then applies live Nextcloud ACL and the Candidate Verifier. ACL
-denials do not trigger adaptive replacement searches, so the visible candidate
-window may become smaller. A fixed pre-rerank ACL pool remains a documented
-future optimization and is distinct from the implemented metadata prefilter.
+Example:
 
-After Candidate Verification, SunaQ can optionally run **Evidence Control**.
-The current rc1.2 shipped profiles set `evidence_control.mode: off`; this does
-not disable the Candidate Verifier.
+```text
+entities = ["Jane Doe"]
+concept group = required ["CV", "résumé", "curriculum vitae", "professional background"]
 
-The configuration split above is part of the 0.8.6 model-package contract; see
-section 3.2 for loading, precedence, custom profiles, role routing and prompts.
+compiled Files logic:
+MUST "Jane Doe"
+MUST (CV OR résumé OR "curriculum vitae" OR "professional background")
+```
 
-The current shipped budgets are:
+SearchSpec lexical terms are compiled against the proven Nextcloud
+FullTextSearch field semantics (`content OR title`). The direct `/elastic`
+diagnostic path remains the place for explicit Nextcloud-style lexical syntax.
+
+`semantic_query` is a natural-language semantic request. It is executed only
+when the effective vector arm is granted **and** Qdrant infrastructure is
+available. ERG vector retrieval complements lexical recall; it is not a
+requirement for correct Files semantics.
+
+Elasticsearch retrieval can optionally apply the ACL metadata prefilter over
+owner/direct-user/group metadata. This remains only a performance/recall
+optimization. It is not authorization; final live WebDAV ACL is authoritative.
+
+The normal private-document order is:
+
+```text
+structured intent
+ -> deterministic backend compilation
+ -> retrieval / optional fusion / dedup / rerank
+ -> LIVE NEXTCLOUD ACL
+ -> Candidate Verifier
+ -> optional Evidence Control
+ -> answer context
+```
+
+ACL denials do not trigger adaptive replacement retrieval merely to refill a
+window. This avoids turning authorization outcomes into an adaptive search
+oracle.
+
+The current shipped profile budgets are:
 
 | Profile | Verification window | Answer documents | Answer total chars |
 | --- | ---: | ---: | ---: |
-| Schnell / `sunaq-standard` | 10 | 10 | 25,000 |
-| Gründlich / `sunaq-thorough` | 30 | 30 | 100,000 |
-| Tief / `sunaq-deep` | 50 | 50 | 200,000 |
+| Standard (Schnell) / `sunaq-standard` | 10 | 10 | 25,000 |
+| Thorough (Gründlich) / `sunaq-thorough` | 30 | 30 | 100,000 |
+| Deep (Tief) / `sunaq-deep` | 50 | 50 | 200,000 |
 
-All three currently use `max_retrieval_rounds: 1`, Evidence Review off and
-planner thinking off. This keeps the current shipped profile comparison primarily focused on breadth and budget.
+All three packaged profiles currently set `max_retrieval_rounds: 1`, Evidence
+Control off and planner thinking off. Deployment/site overlays and remote hard
+caps may reduce the effective verifier window at runtime.
 
-Administrator-controlled remote hard ceilings remain separate from profile
-budgets. Legacy/non-packaged compatibility requests retain the older restrictive
-remote caps.
+Profiles and prompt packs are read at process startup. Restart API/provider
+after editing them. Installer reruns preserve an existing model-package
+directory as administrator-owned configuration and add only missing shipped
+packages.
 
-Profiles and prompt packs are read at process startup. Restart API/provider after
-editing them. Installer reruns preserve an existing model-package directory as
-administrator-owned configuration and add only missing shipped packages.
-
-The SearchSpec path logs the generated `elastic_query`, the actual
-Elasticsearch JSON request body and a compact hit list without document contents.
-
+The API log can include the compiled Elasticsearch request and pre-ACL raw-hit
+diagnostics for operators. Those diagnostics are **not** copied into portable
+ResearchRun provenance.
 
 ### Qdrant sync
 
@@ -431,6 +475,39 @@ causes the prefilter to be skipped, while every final candidate still requires
 the live WebDAV check.
 
 Request-dependent `files_accesscontrol` policies can depend on source address, URL, time or user agent. Operators that rely on such rules should include their actual policy shapes in acceptance testing so the middleware request context matches the intended Nextcloud policy.
+
+### ResearchRun retrieval provenance
+
+For archived conversations/research runs the Provider writes three distinct
+retrieval artifacts:
+
+```text
+retrieval-decision.v2.json
+retrieval-execution.v1.json
+documents.json
+```
+
+`retrieval-decision.v2.json` is pre-retrieval decision provenance. It records
+the structured planner proposal, deterministic policy resolution and bounded
+effective plan. It does not contain backend query syntax.
+
+`retrieval-execution.v1.json` records actual execution. Executed backend queries
+may be included, but private candidate provenance starts strictly after live
+Nextcloud ACL. Therefore the record contains only ACL-authorized candidate
+documents, authorized ranks, verifier decisions for those documents and final
+selection. It deliberately excludes:
+
+- raw Elasticsearch/Qdrant hit counts;
+- identities of denied candidates;
+- pre-ACL Elasticsearch/RRF/vector ranks;
+- backend scores whose gaps could reveal hidden candidates.
+
+`documents.json` records the authorized documents that actually reached the
+answer context. It uses the same authorized-rank projection and does not copy
+pre-ACL backend ranks/scores.
+
+Protected API/provider logs may contain richer diagnostics for operators. These
+are not portable user-visible ResearchRun provenance.
 
 ### Neo4j / Graph
 
@@ -473,7 +550,7 @@ reranker:
   fallback_backend: none
 ```
 
-Super-Light intentionally disables the reranker:
+The shipped 0.8.7-rc1 profiles disable the reranker by default:
 
 ```yaml
 reranker:
@@ -483,11 +560,11 @@ reranker:
 
 This does **not** disable candidate deduplication. `dedup.enabled:true` remains an independent preprocessing step and prevents PDF/ODT/copy variants or near-identical text from consuming multiple candidate slots.
 
-Super-Light uses the same selected SunaQ profile budgets; its deployment override disables unavailable heavyweight capabilities such as local reranking/graph document retrieval rather than defining a separate six-document normal window.
+Dockerized uses the same selected SunaQ profile budgets. Deployment overrides are reserved for packaging-specific differences and must not redefine the architecture tier or silently change the profile's verification window.
 
-### RetrievalRecord
+### Local RetrievalRecord diagnostics
 
-Disabled by default. Optional configuration:
+Separate from Nextcloud ResearchRun provenance, optional local RetrievalRecord files are disabled by default:
 
 ```yaml
 retrieval_record:
@@ -495,7 +572,7 @@ retrieval_record:
   directory: "runtime/retrieval-records"
 ```
 
-Records contain structured retrieval/evidence metadata, not complete document bodies.
+These local records contain structured retrieval/evidence metadata, not complete document bodies. They are operator/development diagnostics and must not be confused with the post-ACL portability guarantees of `retrieval-execution.v1.json`.
 
 ### Periodic ES → Qdrant synchronization
 
@@ -546,7 +623,7 @@ A model package can contain:
 
 - the nine request-local configuration sections listed in 3.1;
 - `deployment_overrides` for capability-preserving differences such as
-  Super-Light disabling graph-document retrieval or a local reranker;
+  deployment-specific packaging differences such as disabling an unavailable graph-document retriever or local reranker;
 - `roles` for `default`, `planner`, `verifier`, `evidence` and
   `answer`, independently selecting the underlying LLM backend/model;
 - `prompts` pointing to files inside that model directory;
@@ -570,16 +647,16 @@ order:
 5. apply the matching `deployment_overrides.<deployment.profile>` last;
 6. compile model-specific role routing and prompt files.
 
-The shipped Schnell profile enables `legacy_config_overlay: true` only to
+The shipped Standard (Schnell) profile enables `legacy_config_overlay: true` only to
 preserve deliberately tuned 0.8.5 Standard installations. Fresh 0.8.6
 `config.yaml` files no longer contain these request-local sections, so the
-bridge is inert. Gründlich, Tief and administrator-created profiles are isolated
+bridge is inert. Thorough (Gründlich), Deep (Tief) and administrator-created profiles are isolated
 from legacy global tuning unless they explicitly opt into such behaviour.
 
 If no packaged model exists at all, SunaQ falls back to the legacy single-model
 compatibility path and uses global `config.yaml` settings.
 
-### Current rc1.2 shipped profiles
+### Current shipped profiles
 
 | Profile | Search/final window | Verification window | Answer context |
 | --- | ---: | ---: | ---: |
@@ -1008,23 +1085,44 @@ An internal null result therefore does not automatically trigger a public reques
 
 ---
 
-# 8. Web archive
+# 8. Web Evidence in the Chat ResearchRun
 
-Multi-user archive targets are stored per canonical user in Admin UI/`users.sqlite`. Nextcloud WebDAV remains the write-authorization authority.
+Persisted Web Evidence is part of the current chat/research lifecycle. There is
+no separate user-facing Webarchive source or per-user Webarchive target for new
+research runs. The provider creates the ResearchRun below the user's configured
+Chat archive and passes that bounded path to the Web arm; the Web arm validates
+that the path belongs to the same user's active Chat archive before writing.
 
 Layout:
 
 ```text
-<archive-root>/2026-09/09-191542-abcd/
-    recherche.md
-    fetch-log.jsonl
-    01-source.txt
-    .01-source.metadata.json
-    01-source.pdf
-    02-source.txt
-    .02-source.metadata.json
-    02-source.pdf
+<chat-root>/<conversation-id>/runs/<run-id>/
+    run.json
+    retrieval-decision.v2.json
+    retrieval-execution.v1.json
+    documents.json
+    trace.jsonl
+    web/
+        evidence.json
+        <web-subrun>/
+            recherche.md
+            fetch-log.jsonl
+            01-source.txt
+            .01-source.metadata.json
+            01-source.pdf
+            02-source.txt
+            .02-source.metadata.json
+            02-source.pdf
 ```
+
+`web/evidence.json` is the bounded provenance/evidence record actually supplied
+to the answer path. It is written as part of the Chat ResearchRun when Chat
+archiving is active.
+
+`web.yaml: archive.enabled` controls the additional full Web snapshot material
+(text/raw/PDF/render metadata). It does not grant Live-Web access and it does not
+create a second archive lifecycle. With Chat archiving disabled, Live-Web may
+still run when allowed, but Web Evidence remains ephemeral.
 
 The `.txt` snapshot includes, among other fields:
 
@@ -1042,19 +1140,32 @@ The `.txt` snapshot includes, among other fields:
 - query;
 - extracted text.
 
-`fetch-log.jsonl` writes one JSON record for every search result actually requested, including requested/final URL, HTTP status, redirect count, fetch error, content hash and the full relevance decision. Rejected research paths therefore remain auditable.
+`fetch-log.jsonl` writes one JSON record for every search result actually
+requested, including requested/final URL, HTTP status, redirect count, fetch
+error, content hash and the full relevance decision. Rejected research paths
+therefore remain auditable inside the ResearchRun when full snapshots are
+enabled.
 
-`write_metadata_json:true` creates a hidden metadata sidecar (`.NN-source.metadata.json`) for each selected source.
+`write_metadata_json:true` creates a hidden metadata sidecar
+(`.NN-source.metadata.json`) for each selected source.
 
-When `archive.renderer.enabled:true`, selected HTML sources are rendered after the synchronous text/metadata archive step through a bounded in-process background queue. The sidecar moves from `render.status=pending` to `complete` or `failed`. Renderer failures are fail-open and do not change text evidence or the already delivered answer.
+When `archive.renderer.enabled:true`, selected HTML sources are rendered after
+the synchronous text/metadata snapshot step through a bounded in-process
+background queue. Renderer failures are fail-open and do not change text
+evidence or the already delivered answer.
 
-The shared Playwright renderer defaults to a 1440×900 desktop viewport and A4 Landscape. Optional consent/overlay cleanup is deliberately best-effort. With `persist_state:true`, browser storage is reused per requested host so ordinary cookie choices need not be repeated every run.
+The renderer is intended for public sources. Login walls, paywalls, CAPTCHAs
+and access controls are not bypassed. `write_raw_html:true` stores only the
+main original HTML response; it is not a complete WARC/browser capture.
 
-The archive renderer is intended for public sources. Login walls, paywalls, CAPTCHAs and access controls are not bypassed.
+Archived `.txt` sources can be reused immediately through `/use:W1` without
+waiting for Elasticsearch synchronization. Access again uses the current user's
+WebDAV credential.
 
-`write_raw_html:true` stores the main original HTML response. This is **not** a complete WARC/browser capture with subresources. A Playwright PDF is also only a visual snapshot, not a forensic capture.
-
-Archived `.txt` sources can be reused immediately through `/use:W1` without waiting for later Elasticsearch synchronization. Access again uses the current user's WebDAV credential.
+For upgrade compatibility, historic standalone Webarchive roots and
+`source_origin=web_archive` remain readable. The legacy `/webarchive` source
+directive is normalized to `/chatarchive`; new persisted Web files are
+classified as `chat_archive`.
 
 ---
 
@@ -1479,10 +1590,10 @@ sudo -u rag ./.venv/bin/python -m rag.contacts books --user alice
 sudo -u rag ./.venv/bin/python -m rag.contacts sync --user alice
 ```
 
-Dockerized Super-Light:
+Dockerized:
 
 ```bash
-cd /opt/sunaq/install/super-light
+cd /opt/sunaq/install/dockerized
 ./contacts.sh list
 ./contacts.sh status --user alice
 ./contacts.sh books --user alice
@@ -1695,14 +1806,14 @@ Global secrets such as `LLM_API_KEY`, `WEB_SEARCH_API_KEY`, `ELASTICSEARCH_PASSW
 
 Nextcloud TLS verification is the default. `nextcloud.verify_tls` and
 `nextcloud.ca_file` are the canonical policy for Login Flow, live ACL, CardDAV,
-mail WebDAV and web archive. `security.allow_insecure_nextcloud=true` is a lab
+mail WebDAV and Chat-ResearchRun Web Evidence. `security.allow_insecure_nextcloud=true` is a lab
 escape hatch only.
 
 Both supported installers accept repeatable `--ca-certificate <PEM>` options.
 They build a Nextcloud-specific CA bundle and point `nextcloud.ca_file` at it;
 the native profile does not set global `SSL_CERT_FILE` or
 `REQUESTS_CA_BUNDLE`, so unrelated public HTTPS clients retain their normal
-trust store. Super-Light additionally adds supplied anchors to its container
+trust store. Dockerized additionally adds supplied anchors to its container
 system trust bundle. Private CAs for Elasticsearch/LLM/Web remain independently
 configurable through their corresponding CA/verify settings.
 
@@ -1791,21 +1902,20 @@ For latency measurements, record the WebDAV SEARCH time separately from total an
 
 # 22. Current feature/freeze status
 
-**Implemented in the current 0.8.6-rc1.2 candidate:**
+**Implemented on the current 0.8.7-rc1 development branch:**
 
-- common middleware core with the supported mappings `standard+native` and
-  `super-light+dockerized`;
-- SunaQ research profiles Schnell/Gründlich/Tief with per-user entitlement,
+- common middleware core supporting both `standard` and `dockerized` deployment,
+  with architecture tier and capability preset selected independently;
+- SunaQ research profiles Standard/Thorough/Deep (Schnell/Gründlich/Tief) with per-user entitlement,
   request-local budgets, prompt packs and role-specific LLM routing;
-- Query Rewriter/SearchSpec + Elasticsearch, optional Qdrant and Neo4j
-  seed/alias expansion;
+- backend-neutral Query Rewriter/SearchSpec intent with deterministic Files/Elasticsearch compilation, optional Qdrant semantic recall and ERG resolver/query-context paths;
 - optional Elasticsearch ACL metadata prefilter over owner/direct-user/group
   metadata, with live Nextcloud WebDAV ACL remaining the final authorization
   boundary;
 - bounded Candidate Verification without adaptive post-denial backfill;
 - deterministic follow-up actions and identity-scoped request progress;
-- SunaQ Recherche **0.3.4** for Nextcloud 23+;
-- Brave/SearXNG Web Research and optional Nextcloud-backed Mail/Web/Chat archives;
+- SunaQ Recherche **0.3.16** for Nextcloud 23+;
+- Brave/SearXNG Web Research and optional Nextcloud-backed Mail and Chat archives (including persisted Web Evidence);
 - authenticated source-capability filtering: optional sources are available only
   while the global service gate and the canonical user's gate are both enabled,
   and unavailable controls stay hidden in the bundled client;
@@ -1813,26 +1923,25 @@ For latency measurements, record the WebDAV SEARCH time separately from total an
 - one administrator-selected chat-archive path plus per-user enable/disable gate
   below the global `chat_archive.enabled` switch;
 - HTTPS-by-default credential-bearing SunaQ Recherche transport;
-- fresh-install minimal defaults: Web/Web archive, chat-archive evidence/writes,
+- fresh-install minimal defaults: Live-Web, chat-archive evidence/Web snapshots,
   Research-Finding persistence and mail worker remain off until enabled;
-- enforced SRC/ERG architecture tiers, including mandatory ACL/Documents-only
-  SRC invariants, safe core/workgroup presets and client capability publication;
+- enforced SRC / ERG Internal / ERG Full architecture tiers, including mandatory ACL/Documents-only SRC invariants, core/workgroup/full presets and client capability publication;
+- `retrieval-decision.v2.json` plus post-live-ACL `retrieval-execution.v1.json` ResearchRun provenance;
 - structured JSON evidence with an immutable server-side untrusted-evidence
   guard, SSRF/internal-network Web/Playwright protection and file-backed service
   secret handling;
 - maintenance/recovery tooling inherited from earlier release candidates and
   retained in the current line.
 
-**Intentionally outside the current rc1.2 baseline:**
+**Still intentionally outside the current 0.8.7-rc1 baseline:**
 
-- authoritative server-side conversation state (rc2);
+- full server-authoritative conversation-state migration as a released/stable contract;
 - configured policy/inspection adapters for the rc1.1 hook scaffold;
-- evaluated/tuned additional profile-specific retrieval rounds (rc2);
+- evaluated/tuned additional profile-specific retrieval rounds;
 - planner/model Thinking as a default profile differentiator;
 - a generic side-effect/action execution layer;
 - complete browser/WARC/WACZ capture;
 - automatic global fact materialization from QueryFrames;
-- `standard+dockerized` as a released deployment path.
 
 See `models/README.md`, `SRC-ERG.md`, `KNOWN-LIMITATIONS.md` and `ROADMAP.md`.
 
@@ -1840,8 +1949,8 @@ See `models/README.md`, `SRC-ERG.md`, `KNOWN-LIMITATIONS.md` and `ROADMAP.md`.
 
 `rag/policy_hooks.py` defines the common `ALLOW | BLOCK | QUARANTINE | MODIFY`
 contract and the stages `outbound_query`, `pre_fetch`, `post_fetch`,
-`pre_persist` and `pre_model_egress`. The rc1.1/rc1.2 line wires these into Web
-search/fetch/Playwright, Web-archive writes, IMAP message/attachment import,
+`pre_persist` and `pre_model_egress`. The current line wires these into Web
+search/fetch/Playwright, Chat-ResearchRun Web Evidence writes, IMAP message/attachment import,
 Mail-archive writes and LLM/embedding backend calls.
 
 No evaluator is installed by default, so every hook is an ALLOW-only no-op.
@@ -1854,8 +1963,7 @@ inside each caller.
 
 # 23. Release validation
 
-The rc1.2 candidate retains the release-tested 0.8.6-rc1/rc1.1 behavior where
-compatible and adds boundary-focused regression coverage for:
+The current 0.8.7-rc1 release-candidate branch builds on the 0.8.6 hardening line and adds boundary-focused regression coverage for:
 JSON evidence isolation and immutable evidence guards, Web/Playwright SSRF
 controls, file-backed secret loading, SRC/ERG startup/request invariants,
 Documents-only deterministic SRC lookup paths and safe capability preset parsing.
@@ -1863,7 +1971,7 @@ Documents-only deterministic SRC lookup paths and safe capability preset parsing
 The current branch is not considered release-validated merely because individual
 development commits pass tests. Promotion requires the final repository CI,
 manifest/hygiene checks and review state to be green on the release head, followed
-by the intended installation/acceptance checks for the supported deployment path.
+by the intended installation/acceptance checks for the supported deployment paths.
 
 Registry images recorded in the Compose lock set are digest-pinned. The locally
 built Playwright renderer currently uses a version-tag-pinned Microsoft base image
@@ -1956,18 +2064,21 @@ For operational and review questions also see:
 
 ## Lexical query semantics and hybrid correction
 
-The Elasticsearch files arm intentionally preserves Nextcloud-style lexical
-syntax. Unquoted words are independent lexical anchors; a quoted multi-word
-string is a phrase constraint. Consequently, `Project Alpha 42` and
-`"Project Alpha 42"` can produce different candidate sets in files-only
-operation. The query rewriter may normalize or add search anchors, but explicit
-user-entered quoted phrases and their `+` / `-` occurrence markers are
-restored deterministically before the Elasticsearch request is compiled.
+Normal SearchSpec Files retrieval no longer asks the LLM to author a
+Nextcloud-style Boolean query. The planner emits backend-neutral semantic intent
+and deterministic middleware compiles entities, required/optional concept
+groups and safe literal constraints into the Elasticsearch request.
 
-This wording sensitivity is most visible in Elasticsearch-only deployments.
-Richer entity resolution and alias coverage should reduce it by supplying better
-canonical lexical anchors. Where ERG enables Qdrant, semantic vector retrieval
-provides an independent recall signal and can compensate for lexical variation
-or OCR wording differences. It does not replace explicit phrase semantics, live
-Nextcloud ACL enforcement, or downstream evidence verification.
+The direct `/elastic` diagnostic path still exposes explicit Nextcloud-style
+lexical semantics for manual testing. Quoted phrases and occurrence markers
+therefore remain relevant to direct lexical diagnostics, but they are not the
+normal planner/backend contract.
 
+In Files-only SRC deployments, lexical quality is a first-class requirement.
+Where ERG enables Qdrant, semantic vector retrieval provides an independent
+recall signal for wording variation, OCR noise and genuinely semantic gaps. It
+does not replace deterministic Files semantics, live Nextcloud ACL or Candidate
+Verification.
+
+For rationale and examples see `docs/WHITEPAPER.md` and
+`docs/RETRIEVAL-ARCHITECTURE.md`.

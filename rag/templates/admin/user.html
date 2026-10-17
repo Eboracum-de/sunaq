@@ -19,7 +19,7 @@
 <dt>Nextcloud Credential</dt><dd>{{ 'vorhanden' if has_nextcloud_credential else 'fehlt / Re-Auth erforderlich' }}</dd>
 <dt>Client Bindings</dt><dd>{% if bindings %}{% for b in bindings %}<div class="mono smalltext">{{ b.rag_user_id }}</div>{% endfor %}{% else %}—{% endif %}</dd>
 </dl>
-<p class="muted">Das Nextcloud-App-Passwort bleibt an das jeweilige Trusted-Client-Binding gebunden. Mail-, Web- und Kontakt-Einstellungen hängen am verifizierten Nextcloud-Benutzer.</p>
+<p class="muted">Das Nextcloud-App-Passwort bleibt an das jeweilige Trusted-Client-Binding gebunden.{% if not src_mode %} ERG-spezifische Benutzerkonfigurationen hängen am verifizierten Nextcloud-Benutzer.{% endif %}</p>
 <details class="topgap"><summary>Interne Identität (Diagnose)</summary><p class="mono smalltext">{{ user.canonical_user_id }}</p></details>
 <form method="post" action="{{ request.app.url_path_for('admin_user_reauth', canonical_user_id=user.canonical_user_id) }}">
 <button class="danger-outline">Nextcloud Re-Auth erzwingen</button>
@@ -54,6 +54,7 @@
 <p class="muted smalltext">Mindestens ein Modell muss erlaubt sein; das Standardmodell muss zu den erlaubten Modellen gehören.</p>
 </section>
 
+{% if chat_archive_available %}
 <section>
 <h2>Chatarchiv</h2>
 {% if not chat_engine_enabled %}<div class="alert warning">Das Chatarchiv ist global in <code>config.yaml</code> deaktiviert. Die Benutzerkonfiguration kann vorbereitet werden; wirksam wird sie erst nach globaler Freigabe.</div>{% endif %}
@@ -65,7 +66,9 @@
 </form>
 <p class="muted smalltext">Der Pfad ist relativ zum Dateien-Wurzelverzeichnis des jeweiligen Nextcloud-Benutzers. SunaQ liest nicht parallel aus mehreren Chatarchiven.</p>
 </section>
+{% endif %}
 
+{% if findings_available %}
 <section>
 <h2>Research Findings</h2>
 <p class="muted">Die Berechtigung zur Recherche und die Berechtigung zur Änderung des gemeinsamen Graph-Lite-Wissens sind getrennt. Self-Service ist global {{ 'aktiv' if user_self_service_enabled else 'deaktiviert' }}; eine Sitzung läuft maximal {{ (curation_session_max_seconds / 3600)|round(2) }} Stunden.</p>
@@ -74,7 +77,9 @@
 <div><button>Findings-Berechtigung speichern</button></div>
 </form>
 </section>
+{% endif %}
 
+{% if contacts_available %}
 <section>
 <h2>Kontakt-DB</h2>
 <p class="muted">CardDAV-Kontakte dieses Nextcloud-Benutzers können als Seeds in Neo4j übernommen werden. Das bereits gespeicherte Nextcloud-Credential wird verwendet; eine kanonische UUID ist für die Bedienung nicht erforderlich.</p>
@@ -113,19 +118,26 @@
 </form>
 <p class="muted smalltext">Fehlt ein Credential oder sind keine Kontakte vorhanden, wird nichts importiert; dies ist kein Stack-Fehler. Erweiterte Provenienz/Rollback-Funktionen bleiben unter „Kontaktquellen“ verfügbar.</p>
 </section>
+{% endif %}
 
+{% if web_research_available %}
 <section>
 <h2>Web Research</h2>
 {% if not web_engine_enabled %}<div class="alert warning">Die globale Web-Recherche ist in web.yaml derzeit deaktiviert. Die Benutzerkonfiguration kann trotzdem vorbereitet werden; wirksam wird sie erst nach globaler Freigabe.</div>{% endif %}
-<p class="muted">Der Admin entscheidet, ob Web-Recherche für diesen Nutzer aktiv ist und wohin archiviert wird. Schreibrechte prüft weiterhin Nextcloud mit dem Benutzer-Credential. Der Zielpfad ist für Web-Evidence reserviert und wird aus normalem internem Retrieval ausgeschlossen.</p>
+<p class="muted">Der Admin entscheidet nur, ob Live-Web-Recherche für diesen Nutzer aktiv ist. Persistierte Web-Evidence gehört zum jeweiligen Chat/Research-Run und verwendet dessen Chatarchiv-Lifecycle; einen separaten Webarchiv-Zielpfad gibt es nicht mehr.</p>
+{% if web_snapshot_engine_enabled %}
+<div class="alert success">Web-Snapshots sind global aktiviert und werden bei aktivem Chatarchiv im jeweiligen Research-Run gespeichert.</div>
+{% else %}
+<div class="alert warning">Vollständige Web-Snapshots (Text/PDF/HTML) sind in web.yaml deaktiviert. Live-Web-Recherche bleibt möglich; bei aktivem Chatarchiv bleibt der begrenzte Evidence-/Provenance-Record weiterhin im Research-Run erhalten.</div>
+{% endif %}
 <form class="stack-form" method="post" action="{{ request.app.url_path_for('admin_user_web', canonical_user_id=user.canonical_user_id) }}">
 <label><span><input type="checkbox" name="enabled" {% if web_settings and web_settings.enabled %}checked{% endif %}> Web-Recherche für diesen Benutzer aktiv</span></label>
-<label><span><input type="checkbox" name="archive_enabled" {% if web_settings and web_settings.archive_enabled %}checked{% endif %}> Evidence in Nextcloud archivieren</span></label>
-<label>Nextcloud-Zielpfad<input name="target_path" value="{{ web_settings.target_path if web_settings and web_settings.target_path else 'RAG/Webarchiv' }}"></label>
 <div><button>Web-Konfiguration speichern</button></div>
 </form>
 </section>
+{% endif %}
 
+{% if mail_available %}
 <section>
 <h2>Mail Sync</h2>
 {% if not mail_engine_enabled %}<div class="alert warning">Die globale Mail-Funktion ist derzeit deaktiviert. Kontodaten können vorbereitet werden; Hintergrund-Polling wird zusätzlich über mail.worker.enabled gesteuert.</div>{% endif %}
@@ -211,4 +223,5 @@
 </form>
 {% endif %}
 </section>
+{% endif %}
 {% endblock %}

@@ -33,6 +33,10 @@ style('sunaq', 'style');
         </main>
 
         <div id="sunaq-status" class="sunaq-status" aria-live="polite"></div>
+        <details id="sunaq-retrieval-strategy" class="sunaq-retrieval-strategy" hidden>
+            <summary>Suchstrategie</summary>
+            <pre id="sunaq-retrieval-strategy-content"></pre>
+        </details>
 
         <form id="sunaq-form" class="sunaq-composer">
             <div class="sunaq-composer-box">
@@ -51,7 +55,6 @@ style('sunaq', 'style');
                         <div class="sunaq-scopes" aria-label="Quellen">
                             <label class="sunaq-scope-chip"><input type="checkbox" name="sunaq-scope" value="documents" checked><span>Dokumente</span></label>
                             <label class="sunaq-scope-chip" hidden><input type="checkbox" name="sunaq-scope" value="mailarchive"><span>Mail</span></label>
-                            <label class="sunaq-scope-chip" hidden><input type="checkbox" name="sunaq-scope" value="webarchive"><span>Webarchiv</span></label>
                             <label class="sunaq-scope-chip" hidden><input type="checkbox" name="sunaq-scope" value="chatarchive"><span>Chats</span></label>
                             <label class="sunaq-scope-chip" hidden><input type="checkbox" name="sunaq-scope" value="web"><span>Web</span></label>
                         </div>

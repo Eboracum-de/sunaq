@@ -1,0 +1,5 @@
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+neo4j==5.28.4
+httpx>=0.27,<1
+openregister-sdk==3.9.0

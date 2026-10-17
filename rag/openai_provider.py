@@ -50,21 +50,35 @@ import time
 import threading
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import urlparse
 from typing import Any, AsyncIterator
 
 import httpx
 import yaml
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 
 from rag.version import VERSION
 from rag.search_text import normalize_query_quotes, preserve_explicit_quoted_phrases
 from rag.research_log import ResearchLog
+from rag.research_archive import ResearchArchive, ResearchRun
+from rag.dossier_outbox import DossierOutbox
+from rag.openregister_graph import persist_openregister_research
+from rag.resolver_client import (
+    enrich_candidate,
+    entity_context_from_resolver,
+    load_resolver_settings,
+    merge_entity_context,
+    resolve_search_spec,
+)
+from rag.embeddings import ollama_model_name_equal
 from rag.llm_backend import build_llm_backend
 from rag.llm_roles import build_role_backends
 from rag.architecture_policy import (
+    allowed_resolver_sources,
+    allows_external_research,
     architecture_tier,
     is_src,
     request_capability_error,
@@ -76,7 +90,27 @@ from rag.logging_utils import get_logger
 from rag.credential_store import CredentialStore, scope_identity
 from rag.internal_auth import provider_api_headers
 from rag.tls_compat import configure_tls_compat
+from rag.network_policy import validated_public_connect_targets
+from rag.nextcloud_links import (
+    NextcloudVersionProbe,
+    build_nextcloud_source_url,
+    document_id_from_nextcloud_url,
+)
 from rag.retrieval_policy import configured_internal_arms, load_retrieval_policy
+from rag.retrieval.contracts import (
+    CapabilityGrant,
+    ErgRetrievalRequest,
+    RetrievalBudgetGrant,
+    RetrievalIdentity,
+    SrcRetrievalRequest,
+)
+from rag.retrieval.decision import build_retrieval_decision_record
+from rag.retrieval.erg import MiddlewareErgRetriever
+from rag.retrieval.middleware import (
+    MiddlewareRetrievalClient,
+    MiddlewareSearchRequest,
+    MiddlewareSrcRetriever,
+)
 from rag.retrieval_planner import (
     detect_bounded_document_set,
     detect_exhaustive_intent,
@@ -90,6 +124,7 @@ from rag.retrieval_planner import (
     semanticize_query,
 )
 from rag.elastic_query import nextcloud_query_tokens
+from rag.planner import get_words
 from rag.search_spec import (
     fingerprint as search_spec_fingerprint,
     normalize_search_spec,
@@ -104,6 +139,13 @@ from rag.evidence_boundary import (
     serialize_evidence_records,
 )
 from rag.secret_env import secret_env
+from rag.research.backends import WebBackend, load_research_backend_registry
+from rag.research import (
+    DelegatedResearchProvider,
+    DelegatedResearchRequest,
+    build_delegated_research_provider,
+    load_delegated_research_settings,
+)
 
 
 log = get_logger("provider")
@@ -126,6 +168,11 @@ SUNAQ_MODEL_REGISTRY = load_model_registry(PROVIDER_CONFIG)
 RETRIEVAL_PLANNER = load_retrieval_planner_settings(PROVIDER_CONFIG)
 RETRIEVAL_POLICY = load_retrieval_policy(PROVIDER_CONFIG)
 CONFIGURED_INTERNAL_ARMS = configured_internal_arms(PROVIDER_CONFIG)
+RESOLVER_SETTINGS = load_resolver_settings(PROVIDER_CONFIG)
+_RESEARCH_ARCHIVE: ResearchArchive | None = None
+_DOSSIER_OUTBOX: DossierOutbox | None = None
+_DOSSIER_WRITER_TASK: asyncio.Task[Any] | None = None
+
 
 
 def _config_truthy(value: Any, default: bool = False) -> bool:
@@ -144,7 +191,7 @@ RETRIEVAL_RECORD_DIRECTORY = Path(
     str(_RETRIEVAL_RECORD_CONFIG.get("directory") or "runtime/retrieval-records")
 )
 
-MODEL_ID = os.getenv("PROVIDER_MODEL_ID", "nextcloud-hybrid-rag")
+MODEL_ID = os.getenv("PROVIDER_MODEL_ID", "sunaq")
 MODEL_NAME = os.getenv("PROVIDER_MODEL_NAME", "SunaQ")
 RAG_MIDDLEWARE_URL = os.getenv("RAG_MIDDLEWARE_URL", "http://127.0.0.1:8765").rstrip("/")
 
@@ -167,6 +214,32 @@ LLM_MODEL = os.getenv("LLM_MODEL", _LEGACY_OLLAMA_MODEL)
 ANSWER_MODEL = os.getenv("ANSWER_MODEL", LLM_MODEL)
 FOLLOWUP_MODEL = os.getenv("FOLLOWUP_MODEL", LLM_MODEL)
 
+DELEGATED_RESEARCH_SETTINGS = load_delegated_research_settings(
+    PROVIDER_CONFIG,
+    fallback_model=ANSWER_MODEL,
+)
+RESEARCH_BACKEND_REGISTRY = load_research_backend_registry(PROVIDER_CONFIG)
+for _profile in SUNAQ_MODEL_REGISTRY.list():
+    _binding = _profile.section("research").get("web_backend")
+    if _binding and _binding != "none":
+        try:
+            RESEARCH_BACKEND_REGISTRY.get(str(_binding).strip())
+        except ValueError as exc:
+            raise RuntimeError(
+                f"SunaQ model {_profile.model_id!r}: {exc}"
+            ) from exc
+_DELEGATED_RESEARCH_PROVIDERS: dict[str, DelegatedResearchProvider] = {}
+_DELEGATED_RESEARCH_PROVIDER: DelegatedResearchProvider | None = None
+_DELEGATED_RESEARCH_PROVIDER_READY = False
+log.info(
+    "Delegated research config: active=%s provider=%s model=%s delegate_web_only=%s base_url=%s",
+    DELEGATED_RESEARCH_SETTINGS.active,
+    DELEGATED_RESEARCH_SETTINGS.provider,
+    DELEGATED_RESEARCH_SETTINGS.model or "-",
+    DELEGATED_RESEARCH_SETTINGS.delegate_web_only,
+    DELEGATED_RESEARCH_SETTINGS.base_url or "-",
+)
+
 LLM_API_KEY = secret_env("LLM_API_KEY", "")
 LLM_VERIFY_TLS = os.getenv("LLM_VERIFY_TLS", "true").lower() in {
     "1", "true", "yes", "on"
@@ -180,6 +253,39 @@ OLLAMA_MODEL = LLM_MODEL
 
 PROVIDER_API_KEY = secret_env("PROVIDER_API_KEY", "")  # deprecated compatibility variable; not trusted directly
 _PROVIDER_CLIENT_STORE: CredentialStore | None = None
+
+
+def _research_backend_for_model(model: Any | None = None) -> WebBackend | None:
+    """Resolve a model's administrator-approved Web backend, or legacy default."""
+    if not allows_external_research(PROVIDER_CONFIG):
+        return None
+    model = model or _active_runtime_model().model
+    return RESEARCH_BACKEND_REGISTRY.resolve(
+        model,
+        legacy=DELEGATED_RESEARCH_SETTINGS,
+        native_enabled=_config_truthy(_provider_web_config().get("enabled"), False),
+    )
+
+
+def _delegated_research_provider(
+    backend: WebBackend | None = None,
+) -> DelegatedResearchProvider | None:
+    """Build and cache a delegated adapter by registered backend ID, lazily."""
+    global _DELEGATED_RESEARCH_PROVIDER, _DELEGATED_RESEARCH_PROVIDER_READY
+    if backend is None:
+        backend = _research_backend_for_model()
+    if backend is None or not backend.delegated or backend.settings is None:
+        return None
+    if backend.backend_id not in _DELEGATED_RESEARCH_PROVIDERS:
+        instance = build_delegated_research_provider(backend.settings)
+        if instance is None:
+            return None
+        _DELEGATED_RESEARCH_PROVIDERS[backend.backend_id] = instance
+    instance = _DELEGATED_RESEARCH_PROVIDERS[backend.backend_id]
+    _DELEGATED_RESEARCH_PROVIDER = instance
+    _DELEGATED_RESEARCH_PROVIDER_READY = True
+    return instance
+
 
 def _provider_credential_store_path() -> str:
     config_path = Path(os.getenv("RAG_CONFIG_FILE", "config.yaml"))
@@ -224,6 +330,52 @@ CHAT_ARCHIVE_ENABLED = os.getenv("CHAT_ARCHIVE_ENABLED", _chat_archive_default).
 }
 
 
+def _research_archive() -> ResearchArchive:
+    global _RESEARCH_ARCHIVE
+    if _RESEARCH_ARCHIVE is None:
+        _RESEARCH_ARCHIVE = ResearchArchive(
+            PROVIDER_CONFIG,
+            enabled=CHAT_ARCHIVE_ENABLED,
+        )
+    return _RESEARCH_ARCHIVE
+
+
+def _dossier_outbox() -> DossierOutbox:
+    global _DOSSIER_OUTBOX
+    if _DOSSIER_OUTBOX is None:
+        _DOSSIER_OUTBOX = DossierOutbox(PROVIDER_CONFIG)
+    return _DOSSIER_OUTBOX
+
+
+def _enqueue_dossier_write(
+    operation: str,
+    run: ResearchRun,
+    *,
+    label: str,
+    **payload: Any,
+) -> int | None:
+    """Durably commit a ResearchRun metadata write before returning the answer."""
+    try:
+        return _dossier_outbox().enqueue(
+            operation,
+            run,
+            label=label,
+            payload=payload,
+        )
+    except Exception as exc:
+        # Provenance remains fail-open for the user-facing answer, but unlike the
+        # old BackgroundTask path this failure is explicit at the durable commit
+        # boundary and can be diagnosed immediately.
+        log.error(
+            "Dossier outbox enqueue failed: run=%s operation=%s error=%s: %s",
+            run.run_id,
+            operation,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
 def _provider_web_config() -> dict[str, Any]:
     """Return the static Web capability configuration from web.yaml."""
     try:
@@ -252,7 +404,9 @@ def _chat_archive_state(scoped_user_id: str | None) -> tuple[str, bool]:
     return target_path, bool(CHAT_ARCHIVE_ENABLED and user_enabled)
 
 
-def _source_capabilities_for_identity(scoped_user_id: str | None) -> dict[str, bool]:
+def _source_capabilities_for_identity(
+    scoped_user_id: str | None, *, model: Any | None = None,
+) -> dict[str, bool]:
     """Return the optional source capabilities actually enabled for this user.
 
     Capability-off is a SunaQ boundary, not merely a producer/worker switch:
@@ -263,7 +417,6 @@ def _source_capabilities_for_identity(scoped_user_id: str | None) -> dict[str, b
         return {
             "documents": True,
             "mailarchive": False,
-            "webarchive": False,
             "chatarchive": False,
             "web": False,
         }
@@ -273,7 +426,6 @@ def _source_capabilities_for_identity(scoped_user_id: str | None) -> dict[str, b
 
     mail_enabled = False
     web_user_enabled = False
-    web_archive_user_enabled = False
     if user is not None and user.enabled:
         mail_enabled = bool(
             _config_truthy((PROVIDER_CONFIG.get("mail") or {}).get("enabled"), False)
@@ -287,35 +439,28 @@ def _source_capabilities_for_identity(scoped_user_id: str | None) -> dict[str, b
         )
         web_settings = store.get_web_settings(user.canonical_user_id)
         web_user_enabled = bool(web_settings is not None and web_settings.enabled)
-        web_archive_user_enabled = bool(
-            web_settings is not None
-            and web_settings.enabled
-            and web_settings.archive_enabled
-        )
 
-    web_cfg = _provider_web_config()
-    web_global_enabled = _config_truthy(web_cfg.get("enabled"), False)
-    web_archive_global_enabled = bool(
-        web_global_enabled
-        and _config_truthy((web_cfg.get("archive") or {}).get("enabled"), False)
-    )
+    try:
+        selected_backend = _research_backend_for_model(model)
+    except ValueError as exc:
+        log.warning("Research backend unavailable for selected model: %s", exc)
+        selected_backend = None
+    model_caps = (model or _active_runtime_model().model).section("capabilities")
     _, chat_enabled = _chat_archive_state(identity)
     return {
-        "documents": True,
-        "mailarchive": mail_enabled,
-        "webarchive": bool(web_archive_global_enabled and web_archive_user_enabled),
-        "chatarchive": chat_enabled,
+        "documents": bool(model_caps.get("documents", True)),
+        "mailarchive": bool(mail_enabled and model_caps.get("mailarchive", True)),
+        "chatarchive": bool(chat_enabled and model_caps.get("chatarchive", True)),
         "web": bool(
             RETRIEVAL_POLICY.web != "disabled"
-            and web_global_enabled
             and web_user_enabled
+            and selected_backend is not None
         ),
     }
 
 
 _SOURCE_CAPABILITY_LABELS = {
     "mailarchive": "Mailarchiv",
-    "webarchive": "Webarchiv",
     "chatarchive": "Chatarchiv",
     "web": "Web-Recherche",
 }
@@ -355,6 +500,14 @@ def _provider_config_nextcloud_base_url() -> str:
 
 
 NEXTCLOUD_BASE_URL = _provider_config_nextcloud_base_url()
+
+_NEXTCLOUD_VERSION_PROBE = NextcloudVersionProbe(NEXTCLOUD_BASE_URL, PROVIDER_CONFIG)
+
+
+def _nextcloud_major_version() -> int | None:
+    """Return the cached Nextcloud major version used for UI-link compatibility."""
+    return _NEXTCLOUD_VERSION_PROBE.major_version()
+
 ALLOW_GENERAL_KNOWLEDGE = os.getenv("ALLOW_GENERAL_KNOWLEDGE", "false").lower() in {
     "1", "true", "yes", "on"
 }
@@ -366,12 +519,17 @@ DIRECT_ANSWER_PROMPT_FILE = os.getenv("DIRECT_ANSWER_PROMPT_FILE", "direct_answe
 FOLLOWUP_REWRITE_PROMPT_FILE = os.getenv("FOLLOWUP_REWRITE_PROMPT_FILE", "followup_rewrite.txt")
 NATURAL_INSTRUCTION_PROMPT_FILE = os.getenv("NATURAL_INSTRUCTION_PROMPT_FILE", "natural_instruction.txt")
 WEB_AFTER_QUERY_PROMPT_FILE = os.getenv("WEB_AFTER_QUERY_PROMPT_FILE", "web_after_queries.txt")
+WEB_QUERY_PROMPT_FILE = os.getenv("WEB_QUERY_PROMPT_FILE", "web_queries.txt")
 WEB_ANSWER_PROMPT_FILE = os.getenv("WEB_ANSWER_PROMPT_FILE", "web_answer.txt")
 HYBRID_WEB_ANSWER_PROMPT_FILE = os.getenv("HYBRID_WEB_ANSWER_PROMPT_FILE", "hybrid_web_answer.txt")
 WEB_GATE_PROMPT_FILE = os.getenv("WEB_GATE_PROMPT_FILE", "web_gate.txt")
 RETRIEVAL_PLANNER_PROMPT_FILE = os.getenv("RETRIEVAL_PLANNER_PROMPT_FILE", "retrieval_planner.txt")
 QUERY_REWRITER_PROMPT_FILE = os.getenv("QUERY_REWRITER_PROMPT_FILE", "query_rewriter.txt")
 CANDIDATE_VERIFIER_PROMPT_FILE = os.getenv("CANDIDATE_VERIFIER_PROMPT_FILE", "candidate_verifier.txt")
+CANDIDATE_VERIFIER_COMMON_POLICY_FILE = os.getenv(
+    "CANDIDATE_VERIFIER_COMMON_POLICY_FILE",
+    "candidate_verifier_common_policy.txt",
+)
 
 # Cosmetic source rendering for normal answers. Kept out of config.yaml on
 # purpose; these are provider/UI presentation knobs rather than retrieval policy.
@@ -385,6 +543,13 @@ ELASTIC_ANALYZE_LIMIT = max(1, int(os.getenv("ELASTIC_ANALYZE_LIMIT", "20")))
 ELASTIC_LIST_LIMIT = max(1, int(os.getenv("ELASTIC_LIST_LIMIT", "50")))
 ELASTIC_MAX_EVIDENCE_CHARS = max(8000, int(os.getenv("ELASTIC_MAX_EVIDENCE_CHARS", "120000")))
 ELASTIC_STREAM_MAX_SECONDS = float(os.getenv("ELASTIC_STREAM_MAX_SECONDS", "360"))
+EXTERNAL_ARTIFACT_MAX_BYTES = max(
+    1024 * 1024,
+    int(os.getenv(
+        "EXTERNAL_ARTIFACT_MAX_BYTES",
+        os.getenv("REGISTER_DOCUMENT_MAX_BYTES", str(25 * 1024 * 1024)),
+    )),
+)
 
 # Optional public-web capability. UI-specific tools are deliberately ignored: a
 # client may only grant this capability through our neutral API header. This
@@ -640,6 +805,14 @@ def _set_suggestions(items: list[dict[str, str]] | tuple[dict[str, str], ...]) -
             item["model"] = model
         clean.append(item)
     _ACTIVE_SUGGESTIONS.set(tuple(clean))
+    request_id = _ACTIVE_PROGRESS_ID.get()
+    owner = _ACTIVE_PROGRESS_OWNER.get()
+    if request_id:
+        with _PROGRESS_LOCK:
+            state = _PROGRESS_STATES.get(request_id)
+            if state is not None and str(state.get("owner") or "") == str(owner or ""):
+                state["suggestions"] = [dict(item) for item in clean]
+                state["updated_at"] = time.time()
 
 
 def _suggestions() -> list[dict[str, str]]:
@@ -741,7 +914,7 @@ def _set_progress(
         previous = _PROGRESS_STATES.get(request_id) or {}
         if previous and str(previous.get("owner") or "") != str(owner or ""):
             return
-        _PROGRESS_STATES[request_id] = {
+        next_state = {
             "request_id": request_id,
             "owner": str(owner or ""),
             "stage": str(stage or "").strip(),
@@ -750,6 +923,36 @@ def _set_progress(
             "created_at": float(previous.get("created_at") or now),
             "updated_at": now,
         }
+        if isinstance(previous.get("retrieval_decision"), dict):
+            next_state["retrieval_decision"] = dict(previous["retrieval_decision"])
+        _PROGRESS_STATES[request_id] = next_state
+
+
+def _set_progress_retrieval_decision(
+    request_id: str,
+    owner: str,
+    decision: dict[str, Any],
+) -> None:
+    """Attach an allowlisted strategy record to the identity-scoped status state."""
+    request_id = str(request_id or "").strip()
+    if not request_id or not _PROGRESS_ID_RE.fullmatch(request_id):
+        return
+    now = time.time()
+    with _PROGRESS_LOCK:
+        _cleanup_progress_locked(now)
+        previous = _PROGRESS_STATES.get(request_id) or {}
+        if previous and str(previous.get("owner") or "") != str(owner or ""):
+            return
+        state = dict(previous)
+        state.update({
+            "request_id": request_id,
+            "owner": str(owner or ""),
+            "model": str(state.get("model") or _active_model_id()),
+            "created_at": float(state.get("created_at") or now),
+            "updated_at": now,
+            "retrieval_decision": dict(decision),
+        })
+        _PROGRESS_STATES[request_id] = state
 
 
 def _progress(stage: str, label: str) -> None:
@@ -937,6 +1140,7 @@ DIRECT_ANSWER_SYSTEM_PROMPT = _load_prompt(DIRECT_ANSWER_PROMPT_FILE)
 FOLLOWUP_REWRITE_SYSTEM_PROMPT = _load_prompt(FOLLOWUP_REWRITE_PROMPT_FILE)
 NATURAL_INSTRUCTION_SYSTEM_PROMPT = _load_prompt(NATURAL_INSTRUCTION_PROMPT_FILE)
 WEB_AFTER_QUERY_SYSTEM_PROMPT = _load_prompt(WEB_AFTER_QUERY_PROMPT_FILE)
+WEB_QUERY_SYSTEM_PROMPT = _load_prompt(WEB_QUERY_PROMPT_FILE)
 EVIDENCE_DECISION_SYSTEM_PROMPT = _load_prompt(EVIDENCE_DECISION_PROMPT_FILE)
 WEB_ANSWER_SYSTEM_PROMPT = _load_prompt(WEB_ANSWER_PROMPT_FILE)
 HYBRID_WEB_ANSWER_SYSTEM_PROMPT = _load_prompt(HYBRID_WEB_ANSWER_PROMPT_FILE)
@@ -944,11 +1148,24 @@ WEB_GATE_SYSTEM_PROMPT = _load_prompt(WEB_GATE_PROMPT_FILE)
 RETRIEVAL_PLANNER_SYSTEM_PROMPT = _load_prompt(RETRIEVAL_PLANNER_PROMPT_FILE)
 QUERY_REWRITER_SYSTEM_PROMPT = _load_prompt(QUERY_REWRITER_PROMPT_FILE)
 CANDIDATE_VERIFIER_SYSTEM_PROMPT = _load_prompt(CANDIDATE_VERIFIER_PROMPT_FILE)
+CANDIDATE_VERIFIER_COMMON_POLICY = _load_prompt(CANDIDATE_VERIFIER_COMMON_POLICY_FILE)
 
 def _prompt(name: str, default: str) -> str:
     """Return the active SunaQ model prompt override or the global default."""
     value = _active_runtime_model().model.prompts.get(str(name or "").strip().lower())
     return value if value is not None else default
+
+
+def _candidate_verifier_prompt() -> str:
+    """Compose profile tuning with the non-optional verifier contract.
+
+    Model packages are intentionally administrator-owned after first install, so
+    an existing profile prompt may lag behind a shipped provider update.  Keep
+    profile-specific verifier tuning, but append the common correctness contract
+    from the refreshed global prompts directory on every request.
+    """
+    profile_prompt = _prompt("verifier", CANDIDATE_VERIFIER_SYSTEM_PROMPT).strip()
+    return profile_prompt + "\n\n" + CANDIDATE_VERIFIER_COMMON_POLICY
 
 
 FOLLOWUP_REWRITE_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -991,6 +1208,46 @@ NATURAL_INSTRUCTION_RESPONSE_SCHEMA: dict[str, Any] = {
         "list_mode", "force", "context_reset",
     ],
 }
+
+WEB_QUERY_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "mode": {
+            "type": "string",
+            "enum": ["focused", "exploratory"],
+        },
+        "queries": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": WEB_AFTER_MAX_QUERIES,
+        },
+    },
+    "required": ["mode", "queries"],
+    "additionalProperties": False,
+}
+
+
+def _web_query_repair_schema(target_queries: int) -> dict[str, Any]:
+    target = max(1, min(int(target_queries), WEB_AFTER_MAX_QUERIES))
+    return {
+        "type": "object",
+        "properties": {
+            "mode": {
+                "type": "string",
+                "enum": ["exploratory"],
+            },
+            "queries": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": target,
+                "maxItems": target,
+            },
+        },
+        "required": ["mode", "queries"],
+        "additionalProperties": False,
+    }
+
 
 WEB_AFTER_QUERY_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1057,7 +1314,27 @@ QUERY_FRAME_SCHEMA: dict[str, Any] = {
             "maxItems": 16,
             "items": {"type": "string"},
         },
+        "concept_groups": {
+            "type": "array",
+            "maxItems": 12,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "required": {"type": "boolean"},
+                    "terms": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 12,
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["required", "terms"],
+                "additionalProperties": False,
+            },
+        },
     },
+    # concept_groups is optional here for the legacy multi-probe planner schema;
+    # the active SearchSpec schema below requires it explicitly.
     "required": ["intent", "entities", "relations", "constraints", "concepts"],
     "additionalProperties": False,
 }
@@ -1068,10 +1345,43 @@ SEARCH_SPEC_RESPONSE_SCHEMA: dict[str, Any] = {
     "properties": {
         "stop": {"type": "boolean"},
         "reason": {"type": "string"},
-        "elastic_query": {"type": "string"},
         "semantic_query": {"type": "string"},
         "entities": {"type": "array", "maxItems": 16, "items": {"type": "string"}},
+        "entity_hints": {
+            "type": "array",
+            "maxItems": 16,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["person", "organization", "location", "address"],
+                    },
+                },
+                "required": ["text", "kind"],
+                "additionalProperties": False,
+            },
+        },
         "concepts": {"type": "array", "maxItems": 16, "items": {"type": "string"}},
+        "concept_groups": {
+            "type": "array",
+            "maxItems": 12,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "required": {"type": "boolean"},
+                    "terms": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 12,
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["required", "terms"],
+                "additionalProperties": False,
+            },
+        },
         "constraints": {
             "type": "array",
             "maxItems": 12,
@@ -1090,8 +1400,8 @@ SEARCH_SPEC_RESPONSE_SCHEMA: dict[str, Any] = {
         },
     },
     "required": [
-        "stop", "reason", "elastic_query", "semantic_query", "entities",
-        "concepts", "constraints", "verification_requirements"
+        "stop", "reason", "semantic_query", "entities", "concepts",
+        "concept_groups", "constraints", "verification_requirements"
     ],
     "additionalProperties": False,
 }
@@ -1206,6 +1516,7 @@ NORMAL_VERIFY_RESPONSE_SCHEMA: dict[str, Any] = {
                         "type": "string",
                         "enum": ["match", "uncertain", "reject"],
                     },
+                    "reason": {"type": "string"},
                     "relation_binding": {
                         "type": "string",
                         "enum": ["direct", "reference_only", "contradicted", "unclear"],
@@ -1245,7 +1556,7 @@ NORMAL_VERIFY_RESPONSE_SCHEMA: dict[str, Any] = {
                     },
                 },
                 "required": [
-                    "index", "status", "relation_binding",
+                    "index", "status", "reason", "relation_binding",
                     "relations", "constraints", "mentioned_entities"
                 ],
                 "additionalProperties": False,
@@ -1322,6 +1633,40 @@ research_log = ResearchLog(
 # Role-aware backend registry is initialized above after all legacy model
 # overrides are loaded. ``llm_backend`` remains the default-backend alias.
 app = FastAPI(title="SunaQ", version=VERSION)
+
+@app.on_event("startup")
+async def _start_dossier_writer() -> None:
+    """Start the single durable ResearchRun delivery loop."""
+    global _DOSSIER_WRITER_TASK
+    if not CHAT_ARCHIVE_ENABLED:
+        return
+    outbox = _dossier_outbox()
+    if not outbox.enabled:
+        log.warning("Dossier writer disabled while chat archive is enabled")
+        return
+    if _DOSSIER_WRITER_TASK is None or _DOSSIER_WRITER_TASK.done():
+        _DOSSIER_WRITER_TASK = asyncio.create_task(
+            outbox.run(_research_archive()),
+            name="sunaq-dossier-writer",
+        )
+
+
+@app.on_event("shutdown")
+async def _stop_dossier_writer() -> None:
+    global _DOSSIER_WRITER_TASK
+    task = _DOSSIER_WRITER_TASK
+    _DOSSIER_WRITER_TASK = None
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+
+
 
 
 class ChatCompletionRequest(BaseModel):
@@ -1459,7 +1804,11 @@ def _research_call(method: str, *args: Any, **kwargs: Any) -> Any:
         return None
 
 
-def _write_retrieval_record(record: dict[str, Any]) -> None:
+def _write_retrieval_record(
+    record: dict[str, Any],
+    *,
+    kind: str = "",
+) -> None:
     """Persist one query/evidence record atomically without document bodies.
 
     Query frames are search hypotheses; evidence frames are document-derived.
@@ -1473,8 +1822,12 @@ def _write_retrieval_record(record: dict[str, Any]) -> None:
         directory = RETRIEVAL_RECORD_DIRECTORY / now.strftime("%Y-%m-%d")
         directory.mkdir(parents=True, exist_ok=True)
         query_id = re.sub(r"[^A-Za-z0-9._-]+", "_", str(record.get("query_id") or uuid.uuid4()))[:160]
-        target = directory / f"{query_id}.json"
-        temporary = directory / f".{query_id}.{os.getpid()}.tmp"
+        record_kind = str(kind or "").strip().casefold()
+        if record_kind and not re.fullmatch(r"[a-z0-9_-]{1,40}", record_kind):
+            raise ValueError("invalid retrieval record kind")
+        stem = query_id + (f".{record_kind}" if record_kind else "")
+        target = directory / f"{stem}.json"
+        temporary = directory / f".{stem}.{os.getpid()}.tmp"
         temporary.write_text(
             json.dumps(record, ensure_ascii=False, indent=2, default=str) + "\n",
             encoding="utf-8",
@@ -1489,13 +1842,26 @@ def _write_retrieval_record(record: dict[str, Any]) -> None:
         log.warning("RetrievalRecord archive failed: %s: %s", type(exc).__name__, exc)
 
 
+_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+
+
 def _conversation_id(request: Request, body: ChatCompletionRequest) -> str | None:
-    return (
-        request.headers.get("x-openwebui-chat-id")
-        or request.headers.get("x-chat-id")
-        or request.headers.get("x-rag-conversation-id")
-        or body.user
-    )
+    """Return the frontend conversation identifier without conflating it with user identity.
+
+    SunaQ's native header has priority. OpenWebUI's native chat-id header is
+    accepted without requiring frontend-specific remapping. Clients that send
+    neither remain stateless.
+    """
+    del body  # OpenAI's body.user identifies a user, not a conversation.
+    for header in (
+        "x-rag-conversation-id",
+        "x-openwebui-chat-id",
+        "x-open-webui-chat-id",
+    ):
+        value = str(request.headers.get(header) or "").strip()
+        if value and _CONVERSATION_ID_RE.fullmatch(value):
+            return value
+    return None
 
 
 def _raw_documents(results: list[SearchResult]) -> list[dict[str, Any]]:
@@ -1529,6 +1895,72 @@ def _raw_documents(results: list[SearchResult]) -> list[dict[str, Any]]:
             "document_date": raw.get("document_date"),
         })
     return documents
+
+
+def _authorized_document_records(results: list[SearchResult]) -> list[dict[str, Any]]:
+    """Project ACL-authorized documents without pre-ACL ranks or scores."""
+    records: list[dict[str, Any]] = []
+    for fallback_rank, result in enumerate(results, start=1):
+        raw = result.raw or {}
+        authorized_rank = int(result.index or fallback_rank)
+        records.append({
+            "authorized_rank": authorized_rank,
+            "document_id": str(raw.get("document_id") or ""),
+            "title": str(raw.get("title") or result.title or ""),
+            "path": str(raw.get("path") or raw.get("file_path") or ""),
+            "source_url": str(raw.get("source_url") or ""),
+            "source_origin": str(raw.get("source_origin") or ""),
+            "document_date": raw.get("document_date"),
+        })
+    return records
+
+
+def _authorized_verifier_records(
+    verification: dict[str, Any] | None,
+    authorized_results: list[SearchResult],
+) -> list[dict[str, Any]]:
+    """Return verifier decisions only for the already ACL-authorized pool."""
+    rank_by_id = {
+        str((result.raw or {}).get("document_id") or ""): int(result.index or fallback_rank)
+        for fallback_rank, result in enumerate(authorized_results, start=1)
+        if str((result.raw or {}).get("document_id") or "")
+    }
+    records: list[dict[str, Any]] = []
+    for item in ((verification or {}).get("reviewed_documents") or []):
+        if not isinstance(item, dict):
+            continue
+        document_id = str(item.get("document_id") or "")
+        if not document_id or document_id not in rank_by_id:
+            continue
+        records.append({
+            "authorized_rank": rank_by_id[document_id],
+            "document_id": document_id,
+            "title": str(item.get("title") or ""),
+            "path": str(item.get("path") or ""),
+            "status": str(item.get("status") or "uncertain"),
+            "relation_binding": str(item.get("relation_binding") or "unclear"),
+            "reason": str(item.get("reason") or "")[:500],
+        })
+    return records
+
+
+def _retrieval_execution_payload(
+    *,
+    query_id: str,
+    rounds: list[dict[str, Any]],
+    verifier_decisions: list[dict[str, Any]],
+    selected_results: list[SearchResult],
+) -> dict[str, Any]:
+    """Build provenance that starts strictly after the live-ACL boundary."""
+    return {
+        "schema": "sunaq.retrieval_execution.v1",
+        "query_id": str(query_id or ""),
+        "created_at": datetime.now().astimezone().isoformat(),
+        "authorization_boundary": "post_live_acl",
+        "rounds": list(rounds),
+        "verifier_decisions": list(verifier_decisions),
+        "selected_documents": _authorized_document_records(selected_results),
+    }
 
 
 def _cited_numbers(answer: str, results: list[SearchResult]) -> set[int]:
@@ -1924,6 +2356,93 @@ def _normalize_after_web_queries(
     return queries
 
 
+def _normalize_web_query_plan(
+    value: dict[str, Any],
+    fallback_query: str,
+) -> tuple[str, list[str]]:
+    mode = str(value.get("mode") or "focused").strip().lower()
+    if mode not in {"focused", "exploratory"}:
+        mode = "focused"
+    return mode, _normalize_after_web_queries(value, fallback_query)
+
+
+async def _derive_web_queries(
+    *,
+    question: str,
+    fallback_query: str,
+) -> list[str]:
+    """Compile focused or exploratory queries for a native Web-only turn.
+
+    Open-ended research must not accidentally collapse to one brittle exact
+    query. The planner therefore classifies the request explicitly. For an
+    exploratory request, the normal contract is three complementary queries
+    (or the configured lower maximum). A single contract-repair call is allowed
+    before any public Web search is executed.
+    """
+    fallback = normalize_query_quotes(str(fallback_query or question)).strip() or question
+    target_exploratory_queries = min(3, WEB_AFTER_MAX_QUERIES)
+
+    async def compile_plan(
+        extra_instruction: str = "",
+        *,
+        response_schema: dict[str, Any] | None = None,
+    ) -> tuple[str, list[str]]:
+        user_content = f"BENUTZERAUFTRAG:\n{question}\n\nFALLBACK-QUERY:\n{fallback}"
+        if extra_instruction:
+            user_content += f"\n\nVERTRAGS-HINWEIS:\n{extra_instruction}"
+        raw = await _ollama_complete(
+            [
+                {
+                    "role": "system",
+                    "content": _prompt("web_query", WEB_QUERY_SYSTEM_PROMPT),
+                },
+                {
+                    "role": "user",
+                    "content": user_content,
+                },
+            ],
+            temperature=0.0,
+            max_tokens=WEB_AFTER_QUERY_MAX_TOKENS,
+            think=False,
+            model=WEB_AFTER_QUERY_MODEL,
+            role="planner",
+            response_format=response_schema or WEB_QUERY_RESPONSE_SCHEMA,
+        )
+        return _normalize_web_query_plan(_extract_json_object(raw), fallback)
+
+    try:
+        mode, queries = await compile_plan()
+        if (
+            mode == "exploratory"
+            and target_exploratory_queries > 1
+            and len(queries) < target_exploratory_queries
+        ):
+            log.warning(
+                "Web-only query planner returned insufficient exploratory fan-out: "
+                "queries=%d target=%d; retrying compiler once",
+                len(queries),
+                target_exploratory_queries,
+            )
+            retry_mode, retry_queries = await compile_plan(
+                f"Du hast die Anfrage als exploratory klassifiziert. Liefere jetzt genau "
+                f"{target_exploratory_queries} unterschiedliche, komplementaere Web-Suchqueries. "
+                "Keine neuen Namen, Rollen, Beziehungen oder Fakten erfinden.",
+                response_schema=_web_query_repair_schema(target_exploratory_queries),
+            )
+            if retry_mode == "exploratory" and retry_queries:
+                mode, queries = retry_mode, retry_queries
+
+        log.info("Derived Web-only queries: mode=%s queries=%s", mode, queries)
+        return queries
+    except Exception as exc:
+        log.warning(
+            "Web-only query derivation failed; using fallback query: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+        return [fallback] if fallback else []
+
+
 async def _derive_after_web_queries(
     *,
     instruction: str,
@@ -2117,7 +2636,7 @@ def _parse_retrieval_directives(text: str) -> ParsedDirectives:
         rest = rest[match.end():].lstrip()
 
         if command in {"documents", "mailarchive", "webarchive", "chatarchive"}:
-            source_scopes.add(command)
+            source_scopes.add("chatarchive" if command == "webarchive" else command)
             source_scopes_explicit = True
         elif command in {"files", "vector", "graph"}:
             selectors.add(command)
@@ -2482,6 +3001,47 @@ async def _rewrite_query_if_needed(
     return rewritten
 
 
+def _use_internal_erg_retriever(
+    retrieval_arms: set[str] | None,
+    source_scopes: set[str] | None,
+) -> bool:
+    """Use the typed ERG adapter when only local derived document arms are selected."""
+    arms = {
+        str(value).strip().casefold()
+        for value in (retrieval_arms or set())
+        if str(value).strip()
+    }
+    scopes = {
+        str(value).strip().casefold()
+        for value in (source_scopes or set())
+        if str(value).strip()
+    }
+    return bool(
+        arms
+        and arms <= {"vector", "graph"}
+        and (not scopes or scopes == {"documents"})
+        and not is_src(PROVIDER_CONFIG)
+    )
+
+
+def _use_src_documents_retriever(
+    retrieval_arms: set[str] | None,
+    source_scopes: set[str] | None,
+) -> bool:
+    """Return True only for the strict ordinary-documents/files capability."""
+    arms = {
+        str(value).strip().casefold()
+        for value in (retrieval_arms or set())
+        if str(value).strip()
+    }
+    scopes = {
+        str(value).strip().casefold()
+        for value in (source_scopes or set())
+        if str(value).strip()
+    }
+    return arms == {"files"} and (not scopes or scopes == {"documents"})
+
+
 async def _rag_search(
     question: str,
     user_id: str | None,
@@ -2497,47 +3057,154 @@ async def _rag_search(
     query_context: dict[str, Any] | None = None,
     limit: int | None = None,
 ) -> tuple[dict[str, Any], list[SearchResult]]:
-    headers: dict[str, str] = {}
-    if user_id:
-        headers["X-RAG-User-ID"] = user_id
-    if user_groups:
-        headers["X-RAG-User-Groups"] = user_groups
-    if request_id:
-        headers["X-RAG-Request-ID"] = request_id
-
     _progress("retrieving", "Dokumente werden gesucht und Berechtigungen geprüft …")
-    async with _middleware_client(timeout=HTTP_TIMEOUT) as client:
-        response = await client.post(
-            f"{RAG_MIDDLEWARE_URL}/search",
-            json={
-                "query": question,
-                "model": _active_model_id(),
-                "limit": int(limit if limit is not None else SEARCH_LIMIT),
-                "entity_recall": bool(entity_recall),
-                "retrieval_arms": sorted(retrieval_arms) if retrieval_arms else None,
-                "source_scopes": sorted(source_scopes) if source_scopes else None,
-                "search_spec": search_spec,
-                "query_context": query_context,
-                "raw_results": bool(raw_results),
-                "force_unspecific": bool(force_unspecific),
-            },
-            headers=headers,
-        )
-        response.raise_for_status()
-        payload = response.json()
+    result_limit = int(limit if limit is not None else SEARCH_LIMIT)
+    identity = RetrievalIdentity(
+        user_id=user_id,
+        groups=tuple(
+            value
+            for value in (
+                part.strip() for part in str(user_groups or "").split(",")
+            )
+            if value
+        ),
+        request_id=request_id,
+    )
+    retrieval_client = MiddlewareRetrievalClient(
+        base_url=RAG_MIDDLEWARE_URL,
+        timeout=HTTP_TIMEOUT,
+        client_factory=_middleware_client,
+    )
 
-    parsed: list[SearchResult] = []
-    for i, item in enumerate(payload.get("results", []), start=1):
-        title = str(item.get("title") or item.get("document") or f"Dokument {i}")
-        text = str(
-            item.get("context_text")
-            or item.get("text")
-            or item.get("chunk")
-            or ""
-        ).strip()
-        if text or raw_results:
-            parsed.append(SearchResult(index=i, title=title, text=text, raw=item))
-    return payload, parsed
+    if _use_src_documents_retriever(retrieval_arms, source_scopes):
+        src_retriever = MiddlewareSrcRetriever(retrieval_client)
+        batch = await src_retriever.retrieve(
+            SrcRetrievalRequest(
+                query=question,
+                model_id=_active_model_id(),
+                identity=identity,
+                budget=RetrievalBudgetGrant(
+                    max_results=result_limit,
+                    max_rounds=1,
+                ),
+                entity_recall=entity_recall,
+                search_spec=search_spec,
+                query_context=query_context,
+                raw_results=raw_results,
+                force_unspecific=force_unspecific,
+            )
+        )
+        payload = dict(batch.diagnostics)
+        payload.setdefault("query", question)
+        payload.setdefault("model", _active_model_id())
+        payload.setdefault("retrieval_arms", ["files"])
+        payload.setdefault("source_scopes", ["documents"])
+        payload["results"] = [
+            dict(item.metadata)
+            for item in batch.document_evidence
+        ]
+        parsed = [
+            SearchResult(
+                index=item.index,
+                title=item.title,
+                text=item.text,
+                raw=dict(item.metadata),
+            )
+            for item in batch.document_evidence
+            if item.text or raw_results
+        ]
+        log.info(
+            "SRC Retriever: files/documents request results=%d acl_applied=%s",
+            len(parsed),
+            bool(payload.get("acl_applied")),
+        )
+        return payload, parsed
+
+    if _use_internal_erg_retriever(retrieval_arms, source_scopes):
+        capabilities = frozenset(
+            "vector" if arm == "vector" else "research-graph"
+            for arm in {
+                str(value).strip().casefold()
+                for value in (retrieval_arms or set())
+                if str(value).strip()
+            }
+        )
+        erg_retriever = MiddlewareErgRetriever(
+            retrieval_client,
+            model_id=_active_model_id(),
+        )
+        batch = await erg_retriever.retrieve(
+            ErgRetrievalRequest(
+                query=question,
+                identity=identity,
+                budget=RetrievalBudgetGrant(
+                    max_results=result_limit,
+                    max_rounds=1,
+                ),
+                grant=CapabilityGrant(capabilities),
+                search_spec=search_spec,
+                query_context=query_context,
+                entity_recall=entity_recall,
+                raw_results=raw_results,
+                force_unspecific=force_unspecific,
+            )
+        )
+        payload = dict(batch.diagnostics)
+        payload.setdefault("query", question)
+        payload.setdefault("model", _active_model_id())
+        payload.setdefault(
+            "retrieval_arms",
+            sorted(str(value) for value in (retrieval_arms or set())),
+        )
+        payload.setdefault("source_scopes", ["documents"])
+        payload["results"] = [dict(item.metadata) for item in batch.document_evidence]
+        parsed = [
+            SearchResult(
+                index=item.index,
+                title=item.title,
+                text=item.text,
+                raw=dict(item.metadata),
+            )
+            for item in batch.document_evidence
+            if item.text or raw_results
+        ]
+        log.info(
+            "ERG Internal Retriever: arms=%s results=%d acl_applied=%s",
+            sorted(str(value) for value in (retrieval_arms or set())),
+            len(parsed),
+            bool(payload.get("acl_applied")),
+        )
+        return payload, parsed
+
+    # ERG compatibility path. Mixed files/vector/graph requests and archive
+    # scopes still use the existing joint middleware endpoint so established
+    # fusion/reranking semantics remain unchanged. Pure internal ERG arms use
+    # MiddlewareErgRetriever above, including structured planner inputs.
+    response = await retrieval_client.search(
+        MiddlewareSearchRequest(
+            query=question,
+            model_id=_active_model_id(),
+            limit=result_limit,
+            identity=identity,
+            entity_recall=entity_recall,
+            retrieval_arms=(tuple(retrieval_arms) if retrieval_arms else None),
+            source_scopes=(tuple(source_scopes) if source_scopes else None),
+            search_spec=search_spec,
+            query_context=query_context,
+            raw_results=raw_results,
+            force_unspecific=force_unspecific,
+        )
+    )
+    parsed = [
+        SearchResult(
+            index=item.index,
+            title=item.title,
+            text=item.text,
+            raw=dict(item.metadata),
+        )
+        for item in response.evidence
+    ]
+    return dict(response.payload), parsed
 
 
 async def _rag_query_context(
@@ -2545,11 +3212,14 @@ async def _rag_query_context(
     *,
     request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Fetch compact Neo4j seed/alias context before query rewriting.
+    """Fetch compact local ERG seed/alias context before query rewriting.
 
-    Failure is intentionally fail-open: seeds improve rewriting, but a graph
-    outage must not disable ordinary Elasticsearch/Qdrant retrieval.
+    SRC is strictly Elasticsearch-only and never calls the graph/query-context
+    surface. In ERG tiers, failure is intentionally fail-open: local resolver
+    hints improve rewriting but must not disable ordinary retrieval.
     """
+    if is_src(PROVIDER_CONFIG):
+        return {}
     headers: dict[str, str] = {}
     if request_id:
         headers["X-RAG-Request-ID"] = request_id
@@ -2696,6 +3366,22 @@ def _guard_generated_numeric_month_must(elastic_query: str, *, original_query: s
     return re.sub(r"\s+", " ", " ".join(kept)).strip()
 
 
+def _execution_search_spec(
+    query: str,
+    *,
+    round_no: int,
+    search_spec: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return structured retrieval intent for deterministic backend compilation.
+
+    Query length no longer selects a separate execution path. The planner owns
+    semantic intent only; the middleware compiler owns Elasticsearch syntax for
+    every normal files query.
+    """
+    del query, round_no
+    return search_spec
+
+
 async def _rewrite_search_spec(
     *,
     question: str,
@@ -2704,12 +3390,12 @@ async def _rewrite_search_spec(
     previous_spec: dict[str, Any] | None,
     retrieval_arms: set[str],
     seed_context: dict[str, Any] | None = None,
+    require_entity_hints: bool = False,
 ) -> dict[str, Any]:
-    """Rewrite one user request into one small SearchSpec.
+    """Analyze one user request into backend-neutral structured retrieval intent.
 
-    The LLM writes the human-style Nextcloud full-text expression for files and
-    the natural semantic query for vectors.  Entity/concept/constraint fields
-    are analytical side-products used for verification and Graph-Lite.
+    The LLM describes entities, concept alternatives, constraints and the
+    semantic vector query. Backend query syntax is compiled deterministically.
     """
     files_requested = "files" in retrieval_arms
     vector_requested = "vector" in retrieval_arms
@@ -2724,7 +3410,7 @@ async def _rewrite_search_spec(
         f"VORHERIGER SEARCHSPEC:\n{previous_text}\n\n"
         f"BISHERIGES SICHTBARES TREFFERBILD:\n{prior}\n\n"
         "Erzeuge den SearchSpec für diese Runde. In Runde 1 ist stop=false. "
-        "Wenn files aktiv ist, muss elastic_query eine sinnvolle positive Volltextsuche enthalten. "
+        "Beschreibe für den Files-Arm nur strukturierte Suchintention; erzeuge keine Backend-Syntax. "
         "Explizite unterscheidende Namen/Kennungen nicht verlieren."
     )
     model = _retrieval_planner().model or ANSWER_MODEL
@@ -2745,36 +3431,59 @@ async def _rewrite_search_spec(
         if not raw:
             raise ValueError("Query rewriter returned empty content")
         value = _extract_json_object(raw)
+        raw_semantic_query = value.get("semantic_query")
+        if raw_semantic_query is not None and not isinstance(raw_semantic_query, str):
+            raise ValueError(
+                "Query rewriter semantic_query must be a string, got "
+                f"{type(raw_semantic_query).__name__}"
+            )
         spec = normalize_search_spec(value, original_query=question)
         if files_requested:
-            phrase_guarded_query = preserve_explicit_quoted_phrases(
-                question,
-                spec.get("elastic_query") or "",
-            )
-            if phrase_guarded_query != spec.get("elastic_query"):
-                log.info(
-                    "query rewrite guard: restored explicit quoted phrase syntax: before=%r after=%r",
-                    spec.get("elastic_query") or "",
-                    phrase_guarded_query,
+            safe_constraints = extract_safe_hard_constraints(question)
+            has_safe_literal = any(safe_constraints.get(kind) for kind in safe_constraints)
+            if not (
+                spec.get("entities")
+                or spec.get("concept_groups")
+                or has_safe_literal
+            ):
+                raise ValueError(
+                    "Query rewriter omitted structured files retrieval intent"
                 )
-                spec["elastic_query"] = phrase_guarded_query
-
-            guarded_elastic_query = _guard_generated_numeric_month_must(
-                spec.get("elastic_query") or "",
-                original_query=question,
-            )
-            if guarded_elastic_query != spec.get("elastic_query"):
-                log.info(
-                    "query rewrite guard: removed generated numeric month must: before=%r after=%r",
-                    spec.get("elastic_query") or "",
-                    guarded_elastic_query,
+            # A recognized concept without a lexical group loses semantic intent
+            # at the deterministic compiler boundary. Reject and retry instead
+            # of silently degrading to entity-only retrieval.
+            if spec.get("concepts") and not spec.get("concept_groups"):
+                raise ValueError(
+                    "Query rewriter emitted concepts without concept_groups"
                 )
-                spec["elastic_query"] = guarded_elastic_query
-            tokens = nextcloud_query_tokens(spec.get("elastic_query") or "")
-            if not tokens or not any(token.get("occur") in {"must", "should"} for token in tokens):
-                raise ValueError("Query rewriter omitted a positive elastic_query")
         if vector_requested and not str(spec.get("semantic_query") or "").strip():
             raise ValueError("Query rewriter omitted semantic_query")
+
+        if require_entity_hints:
+            entities = [
+                str(value or "").strip()
+                for value in (spec.get("entities") or [])
+                if str(value or "").strip()
+            ]
+            if not entities:
+                raise ValueError("Resolver research query rewriter omitted target entities")
+            hints = {
+                str(item.get("text") or "").strip().casefold(): str(
+                    item.get("kind") or ""
+                ).strip().casefold()
+                for item in (spec.get("entity_hints") or [])
+                if isinstance(item, dict)
+            }
+            missing = [
+                entity
+                for entity in entities
+                if hints.get(entity.casefold()) not in {"person", "organization"}
+            ]
+            if missing:
+                raise ValueError(
+                    "Resolver research query rewriter omitted person/organization entity_hints for: "
+                    + ", ".join(missing[:4])
+                )
 
         return {
             "valid": True,
@@ -2794,7 +3503,10 @@ async def _rewrite_search_spec(
         try:
             return await run_once(
                 "\n\nFEHLERHINWEIS: Die vorige Ausgabe war unbrauchbar. "
-                "Behalte alle expliziten Suchanker und liefere ausschließlich gültiges JSON."
+                "Behalte alle expliziten Suchanker und liefere ausschließlich gültiges JSON. "
+                "Beschreibe Entities und Concept-Gruppen strukturiert; erzeuge keine Elasticsearch- "
+                "oder Nextcloud-Abfragesyntax. Wenn concepts nicht leer ist, muss concept_groups "
+                "mindestens eine passende Gruppe enthalten. semantic_query muss ein JSON-String sein."
             )
         except Exception as second_exc:
             log.warning(
@@ -2896,6 +3608,49 @@ def _planner_executor_probe(
         "semantic_query": semantic_query,
         "retrieval_arms": sorted(probe_arms),
     }
+
+def _web_query_from_search_spec(
+    search_spec: dict[str, Any] | None,
+    fallback_query: str,
+) -> str:
+    """Compile a compact public-Web query from the structured retrieval plan.
+
+    UI source selection may request Documents+Web while the user phrase still
+    contains control wording such as "search internal documents and then the
+    web". Sending that full task sentence to a search engine degrades retrieval.
+    Prefer planner-extracted entities/concepts and only then the semantic query.
+    """
+    spec = dict(search_spec or {})
+    values: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not text:
+            return
+        folded = text.casefold()
+        if folded in seen:
+            return
+        seen.add(folded)
+        values.append(text)
+
+    for value in spec.get("entities") or []:
+        if isinstance(value, dict):
+            add(value.get("text") or value.get("value") or value.get("name"))
+        else:
+            add(value)
+    for value in spec.get("concepts") or []:
+        add(value)
+
+    if values:
+        return " ".join(values[:8])[:512].strip()
+
+    semantic = normalize_query_quotes(str(spec.get("semantic_query") or "")).strip()
+    if semantic:
+        return semantic[:512].strip()
+
+    return normalize_query_quotes(str(fallback_query or "")).strip()
+
 
 def _query_frame_file_anchors(
     question: str,
@@ -3494,10 +4249,10 @@ async def _verify_exhaustive_candidates(
         if compact:
             compact_instruction = (
                 "\n\nKOMPAKTER NORMALMODUS:\n"
-                "Gib pro Dokument nur index, status, relation_binding, relations, constraints "
-                "und mentioned_entities zurück. Kein reason-Feld, keine separaten entities- oder "
-                "concepts-Listen. relations enthält nur unmittelbar im Dokument belegte Beziehungen; "
-                "mentioned_entities nur bloße Erwähnungen/Referenzen."
+                "Gib pro Dokument nur index, status, reason, relation_binding, relations, constraints "
+                "und mentioned_entities zurück. reason ist eine kurze, konkrete Begründung der Einstufung; "
+                "keine separaten entities- oder concepts-Listen. relations enthält nur unmittelbar im "
+                "Dokument belegte Beziehungen; mentioned_entities nur bloße Erwähnungen/Referenzen."
             )
         prompt = (
             f"BENUTZERANFRAGE:\n{question}\n\n"
@@ -3511,7 +4266,7 @@ async def _verify_exhaustive_candidates(
             f"KANDIDATEN (bereits Live-ACL-geprueft):\n{context}"
         )
         messages = [
-            {"role": "system", "content": guarded_evidence_prompt(_prompt("verifier", CANDIDATE_VERIFIER_SYSTEM_PROMPT))},
+            {"role": "system", "content": guarded_evidence_prompt(_candidate_verifier_prompt())},
             {"role": "user", "content": prompt},
         ]
 
@@ -3628,7 +4383,8 @@ async def _verify_exhaustive_candidates(
         if reason:
             result.raw["verification_reason"] = reason
         decision_log.append((index, _source_filename(result), status))
-        if llm_status == "match" or status == "uncertain":
+        if status != "match" or llm_status != status:
+            frame = evidence_frames.get(index, _empty_evidence_frame())
             evidence_log.append({
                 "index": index,
                 "file": _source_filename(result),
@@ -3637,6 +4393,9 @@ async def _verify_exhaustive_candidates(
                 "binding": relation_binding,
                 "years": _observed_document_years(result),
                 "reason": reason[:220],
+                "relations": list(frame.get("relations") or [])[:4],
+                "mentioned_entities": list(frame.get("mentioned_entities") or [])[:6],
+                "constraints": list(frame.get("constraints") or [])[:4],
             })
         if status == "match":
             matches.append(result)
@@ -3679,6 +4438,23 @@ async def _verify_exhaustive_candidates(
     if batch_errors:
         meta["error"] = "; ".join(batch_errors)[:2000]
     return matches, uncertain, meta
+
+
+def _answer_candidates_from_verification(
+    matches: list[SearchResult],
+    uncertain: list[SearchResult],
+) -> tuple[list[SearchResult], bool]:
+    """Select answer candidates without upgrading verifier uncertainty.
+
+    Confirmed matches remain authoritative. Only when there are no matches do
+    uncertain candidates become answer context, and the caller must then use the
+    uncertainty-specific answer guard. Rejects never reach this helper.
+    """
+    if matches:
+        return list(matches), False
+    if uncertain:
+        return list(uncertain), True
+    return [], False
 
 
 async def _rag_multi_search(
@@ -3788,8 +4564,12 @@ async def _web_search(
     question: str,
     user_id: str | None,
     request_id: str | None = None,
+    research_run_path: str = "",
+    *,
+    research_goal: str = "",
+    queries: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Run the separate public-web arm in the middleware."""
+    """Run one logical public-Web research request in the middleware."""
     headers: dict[str, str] = {}
     if user_id:
         headers["X-RAG-User-ID"] = user_id
@@ -3799,23 +4579,57 @@ async def _web_search(
     async with _middleware_client(timeout=max(HTTP_TIMEOUT, 300.0)) as client:
         response = await client.post(
             f"{RAG_MIDDLEWARE_URL}/web/search",
-            json={"query": question},
+            json={
+                "query": question,
+                "queries": list(queries or []),
+                "research_goal": str(research_goal or question),
+                "research_run_path": str(research_run_path or ""),
+            },
             headers=headers,
         )
         response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        if research_run_path:
+            expected_layout = "chat_research_run_v1"
+            actual_layout = str(payload.get("archive_layout") or "").strip()
+            if actual_layout != expected_layout:
+                log.warning(
+                    "Request %s Web arm archive protocol mismatch: expected=%s got=%r; "
+                    "rag-api may be running stale code",
+                    request_id or "-", expected_layout, actual_layout,
+                )
+            expected_prefix = str(research_run_path or "").strip(" /") + "/web/"
+            returned_paths = [
+                str(path or "").strip(" /")
+                for path in (payload.get("archive_run_paths") or [])
+                if str(path or "").strip()
+            ]
+            single_path = str(payload.get("archive_run_path") or "").strip(" /")
+            if single_path:
+                returned_paths.append(single_path)
+            for archive_path in dict.fromkeys(returned_paths):
+                if not archive_path.startswith(expected_prefix):
+                    log.warning(
+                        "Request %s Web arm returned archive path outside Chat ResearchRun: "
+                        "research_run=%s archive_run=%s; rag-api/provider version skew suspected",
+                        request_id or "-", research_run_path, archive_path,
+                    )
+        return payload
+
 
 
 async def _web_search_many(
     queries: list[str],
     user_id: str | None,
     request_id: str | None = None,
+    research_run_path: str = "",
+    *,
+    research_goal: str = "",
 ) -> dict[str, Any]:
-    """Run a bounded set of web queries once and merge their evidence.
+    """Send multiple discovery probes as one logical Web research request.
 
-    Duplicate URLs are collapsed. A failed secondary query does not discard
-    evidence already obtained from other queries; if every query fails, the
-    first exception is re-raised so the caller keeps the existing error path.
+    Search/fetch/relevance aggregation belongs to the Web retriever. The
+    provider supplies only the stable research goal and bounded probe list.
     """
     cleaned: list[str] = []
     for item in queries:
@@ -3825,75 +4639,98 @@ async def _web_search_many(
         if len(cleaned) >= WEB_AFTER_MAX_QUERIES:
             break
     if not cleaned:
-        return {"enabled": True, "queries": [], "sources": [], "searched": 0, "fetched": 0}
-    if len(cleaned) == 1:
-        payload = await _web_search(cleaned[0], user_id, request_id)
-        payload = dict(payload)
-        payload["queries"] = cleaned
-        run_path = str(payload.get("archive_run_path") or "").strip()
-        payload["archive_run_paths"] = [run_path] if run_path else []
-        return payload
+        return {
+            "enabled": True,
+            "queries": [],
+            "sources": [],
+            "searched": 0,
+            "unique_hits": 0,
+            "fetched": 0,
+        }
 
-    merged_sources: list[dict[str, Any]] = []
-    seen_urls: set[str] = set()
-    archive_paths: list[str] = []
-    archive_errors: list[dict[str, Any]] = []
-    searched = 0
-    fetched = 0
-    enabled_seen = False
-    successful_calls = 0
-    first_exc: Exception | None = None
+    goal = str(research_goal or "").strip() or cleaned[0]
+    return await _web_search(
+        cleaned[0],
+        user_id,
+        request_id,
+        research_run_path,
+        research_goal=goal,
+        queries=cleaned,
+    )
 
-    for query in cleaned:
-        try:
-            payload = await _web_search(query, user_id, request_id)
-        except Exception as exc:
-            if first_exc is None:
-                first_exc = exc
-            archive_errors.append({"query": query, "error": f"{type(exc).__name__}: {exc}"})
-            log.warning("Web subquery failed query=%r: %s: %s", query, type(exc).__name__, exc)
-            continue
 
-        successful_calls += 1
-        enabled_seen = enabled_seen or bool(payload.get("enabled", True))
-        try:
-            searched += int(payload.get("searched") or 0)
-        except (TypeError, ValueError):
-            pass
-        try:
-            fetched += int(payload.get("fetched") or 0)
-        except (TypeError, ValueError):
-            pass
-        run_path = str(payload.get("archive_run_path") or "").strip()
-        if run_path and run_path not in archive_paths:
-            archive_paths.append(run_path)
-        archive_errors.extend(list(payload.get("archive_errors") or []))
+def _web_continuation_mode(
+    explicit_mixed_web: bool,
+    web_capability: bool,
+) -> tuple[bool, bool]:
+    """Return (continue_with_web, automatic_fallback_pending).
 
-        for source in list(payload.get("sources") or []):
-            item = dict(source)
-            url = str(item.get("final_url") or item.get("url") or "").strip()
-            key = url.casefold() if url else f"title:{str(item.get('title') or '').strip().casefold()}"
-            if key and key in seen_urls:
-                continue
-            if key:
-                seen_urls.add(key)
-            item.setdefault("search_query", query)
-            merged_sources.append(item)
+    Explicit /web is a user-selected arm and must survive any internal
+    unspecific/no-result/insufficient outcome even when planner-controlled
+    automatic Web fallback is disabled. Automatic fallback remains governed by
+    web_capability.
+    """
+    if explicit_mixed_web:
+        return True, False
+    if web_capability:
+        return True, True
+    return False, False
 
-    if successful_calls == 0 and first_exc is not None:
-        raise first_exc
 
-    return {
-        "enabled": enabled_seen,
-        "queries": cleaned,
-        "sources": merged_sources,
-        "searched": searched,
-        "fetched": fetched,
-        "archive_run_path": archive_paths[0] if len(archive_paths) == 1 else "",
-        "archive_run_paths": archive_paths,
-        "archive_errors": archive_errors,
-    }
+async def _run_post_response_task(
+    label: str,
+    func: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    started = time.perf_counter()
+    try:
+        await func(*args, **kwargs)
+        log.info(
+            "Post-response task %s finished elapsed_ms=%.1f",
+            label,
+            (time.perf_counter() - started) * 1000.0,
+        )
+    except Exception as exc:
+        log.warning(
+            "Post-response task %s failed after %.1fms: %s: %s",
+            label,
+            (time.perf_counter() - started) * 1000.0,
+            type(exc).__name__,
+            exc,
+        )
 
+def _add_post_response_barrier(
+    background_tasks: BackgroundTasks,
+    label: str,
+    func: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> None:
+    """Run Web archive finalization early in the post-response task list.
+
+    The Web arm may persist snapshots in the API process after /web/search has
+    returned. The finalizer therefore waits for the Web archive readiness
+    handshake before updating the archived recherche.md with the final answer.
+
+    ResearchRun metadata/provenance no longer depends on this task ordering: it
+    is committed to the durable dossier outbox and delivered independently by
+    the provider-side writer. Any overlap with API-side Web snapshot writes is
+    handled by the shared DAV retry policy rather than by this barrier.
+
+    Starlette executes BackgroundTasks in list order; inserting the finalizer at
+    the front keeps it ahead of any remaining post-response enrichment tasks.
+    """
+    background_tasks.tasks.insert(
+        0,
+        BackgroundTask(
+            _run_post_response_task,
+            label,
+            func,
+            *args,
+            **kwargs,
+        ),
+    )
 
 async def _web_finalize_archive(
     run_path: str,
@@ -3921,7 +4758,17 @@ async def _web_finalize_archive(
             },
             headers=headers,
         )
-        response.raise_for_status()
+        if response.is_error:
+            detail = ""
+            try:
+                payload = response.json()
+                detail = str(payload.get("detail") or "") if isinstance(payload, dict) else ""
+            except Exception:
+                detail = str(response.text or "").strip()
+            raise RuntimeError(
+                f"web archive finalize HTTP {response.status_code}"
+                + (f": {detail[:800]}" if detail else "")
+            )
         return response.json()
 
 
@@ -3960,12 +4807,149 @@ def _build_web_context(payload: dict[str, Any]) -> tuple[str, list[dict[str, Any
     )
     return rendered, candidates[:included_count]
 
-def _web_answer_messages(question: str, context: str) -> list[dict[str, str]]:
+def _web_answer_messages(
+    question: str,
+    context: str,
+    *,
+    source_scope_note: str = "",
+) -> list[dict[str, str]]:
+    scope = (
+        f"\n\nQUELLENUMFANG:\n{source_scope_note.strip()}"
+        if str(source_scope_note or "").strip()
+        else ""
+    )
     return [
         {"role": "system", "content": guarded_evidence_prompt(_prompt("web_answer", WEB_ANSWER_SYSTEM_PROMPT))},
         {
             "role": "user",
-            "content": f"FRAGE:\n{question}\n\nWEB-EVIDENCE:\n{context}",
+            "content": f"FRAGE:\n{question}\n\nWEB-EVIDENCE:\n{context}{scope}",
+        },
+    ]
+
+
+async def _download_external_artifact_payload(
+    payload: dict[str, Any],
+) -> tuple[bytes, str, str]:
+    """Download one adapter-issued remote artifact through the public-egress guard."""
+    url = str(payload.get("url") or "").strip()
+    expected_type = str(payload.get("content_type") or "").split(";", 1)[0].strip().casefold()
+    if expected_type not in {"application/pdf", "application/xml", "text/xml"}:
+        raise ValueError("unsupported remote artifact content type")
+    extension = ".pdf" if expected_type == "application/pdf" else ".xml"
+    fallback_name = "external-artifact" + extension
+    file_name = str(payload.get("file_name") or fallback_name).strip() or fallback_name
+
+    try:
+        targets = await asyncio.to_thread(
+            validated_public_connect_targets,
+            url,
+            allowed_ports={443},
+            allowed_schemes={"https"},
+        )
+        last_transport_error: Exception | None = None
+        data = b""
+        for pinned_url, host_header, sni_hostname in targets:
+            headers = {"Host": host_header}
+            try:
+                async with httpx.AsyncClient(
+                    timeout=30.0,
+                    follow_redirects=False,
+                    trust_env=False,
+                ) as client:
+                    async with client.stream(
+                        "GET",
+                        pinned_url,
+                        headers=headers,
+                        extensions={"sni_hostname": sni_hostname},
+                    ) as response:
+                        if response.status_code != 200:
+                            raise RuntimeError(
+                                f"external artifact HTTP {response.status_code}"
+                            )
+                        declared = response.headers.get("content-length")
+                        if (
+                            declared
+                            and declared.isdigit()
+                            and int(declared) > EXTERNAL_ARTIFACT_MAX_BYTES
+                        ):
+                            raise RuntimeError(
+                                "external artifact exceeds configured size limit"
+                            )
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in response.aiter_bytes():
+                            total += len(chunk)
+                            if total > EXTERNAL_ARTIFACT_MAX_BYTES:
+                                raise RuntimeError(
+                                    "external artifact exceeds configured size limit"
+                                )
+                            chunks.append(chunk)
+                        data = b"".join(chunks)
+                        break
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                last_transport_error = exc
+                continue
+        else:
+            if last_transport_error is not None:
+                raise last_transport_error
+            raise RuntimeError("external artifact has no validated connect target")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # Transport exception text may contain a short-lived bearer URL.
+        raise RuntimeError(
+            f"external artifact transport failed: {type(exc).__name__}"
+        ) from None
+
+    if expected_type == "application/pdf":
+        if not data.startswith(b"%PDF-"):
+            raise RuntimeError("external artifact payload is not a PDF")
+        return data, "application/pdf", file_name
+    if not data.lstrip().startswith(b"<"):
+        raise RuntimeError("external artifact payload is not XML")
+    return data, "application/xml", file_name
+
+
+def _resolver_answer_messages(
+    question: str,
+    evidence: dict[str, Any],
+) -> list[dict[str, str]]:
+    default_prompt = """
+Du beantwortest eine Personen- oder Firmenrecherche ausschließlich aus den
+bereitgestellten strukturierten Resolver-/Registerdaten.
+
+Regeln:
+- Resolverdaten sind externe Evidence, keine internen Nextcloud-Dokumente.
+- Erfinde keine Identität und verschmelze keine Kandidaten aufgrund bloßer
+  Namensähnlichkeit.
+- Bei status=candidates nenne die relevanten Kandidaten und die unterscheidenden
+  Merkmale. Bitte um zusätzlichen Kontext, wenn keine eindeutige Auswahl möglich ist.
+- Bei status=resolved darfst du die zugehörigen Enrichment-Daten verwenden.
+- Unterscheide aktuelle und historische Organstellungen anhand end_date.
+- Eine Organstellung ist keine Eigentümerstellung.
+- Nenne bei wesentlichen Aussagen die OpenRegister person/company id bzw.
+  Register-ID, wenn sie in der Evidence vorhanden ist.
+- Geburtsdaten sind Identitätsmerkmale; gib sie nur aus, wenn sie für die
+  gestellte Personenrecherche zur Unterscheidung oder Beantwortung relevant sind.
+""".strip()
+    payload = json.dumps(
+        evidence,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return [
+        {
+            "role": "system",
+            "content": guarded_evidence_prompt(
+                _prompt("resolver_answer", default_prompt)
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"FRAGE:\n{question}\n\nREGISTER-EVIDENCE (JSON):\n{payload}",
         },
     ]
 
@@ -3975,9 +4959,14 @@ def _hybrid_web_answer_messages(
     retrieval_query: str,
     internal_context: str,
     web_context: str,
+    *,
+    internal_uncertain_only: bool = False,
 ) -> list[dict[str, str]]:
+    system_prompt = _prompt("hybrid_web_answer", HYBRID_WEB_ANSWER_SYSTEM_PROMPT)
+    if internal_uncertain_only:
+        system_prompt += "\n\n" + UNCERTAIN_ANSWER_GUARD
     return [
-        {"role": "system", "content": guarded_evidence_prompt(_prompt("hybrid_web_answer", HYBRID_WEB_ANSWER_SYSTEM_PROMPT))},
+        {"role": "system", "content": guarded_evidence_prompt(system_prompt)},
         {
             "role": "user",
             "content": (
@@ -4186,6 +5175,11 @@ async def _graph_enqueue_evidence(
         # Immediate /use:Wn can fall back to a synthetic ID if Nextcloud did
         # not expose oc:fileid in PROPFIND.  Do not create a duplicate graph
         # document; the normal sync will enqueue the archived source later.
+        if raw.get("web_evidence_direct") and (
+            document_id.startswith("webarchive:")
+            or document_id.startswith("chatarchive:")
+        ):
+            continue
         if raw.get("webarchive_direct") and document_id.startswith("webarchive:"):
             continue
         seen.add(document_id)
@@ -4439,7 +5433,7 @@ async def _store_positive_research_findings(
             response.raise_for_status()
             data = response.json()
         log.info(
-            "AKI research findings persisted: docs=%d stored=%s skipped=%s frame=%s",
+            "SunaQ research findings persisted: docs=%d stored=%s skipped=%s frame=%s",
             len(documents),
             data.get("stored", 0),
             data.get("skipped", 0),
@@ -4449,7 +5443,7 @@ async def _store_positive_research_findings(
         # Re-use is an enrichment feature. Retrieval and the user answer must
         # remain available when Neo4j is disabled or temporarily unavailable.
         log.warning(
-            "AKI research finding persistence failed; answer continues unchanged: %s: %s",
+            "SunaQ research finding persistence failed; answer continues unchanged: %s: %s",
             type(exc).__name__,
             exc,
         )
@@ -4882,6 +5876,34 @@ ZUSÄTZLICHE EVIDENZREGELN (verbindlich):
 """.strip()
 
 
+UNCERTAIN_ANSWER_GUARD = """
+
+ZUSÄTZLICHE REGELN FÜR AUSSCHLIESSLICH UNSICHERE INTERNE TREFFER (verbindlich):
+- Der Candidate Verifier hat für keinen internen Dokumentkandidaten einen sicheren
+  Match bestätigt. Die bereitgestellten internen Dokumente haben lediglich einen
+  substanziellen, aber nicht hinreichend sicheren Bezug zur Nutzeranfrage.
+- Stelle zu Beginn klar, dass aus den internen Dokumenten kein eindeutiger bzw.
+  sicher bestätigter Treffer vorliegt. Bezeichne keines dieser Dokumente als das
+  gesuchte Dokument und behaupte die vom Nutzer vorausgesetzte Zuordnung nicht als
+  Tatsache.
+- Du darfst konkrete Tatsachen aus den internen Dokumenten als hilfreiche
+  Suchhinweise wiedergeben, sofern genau diese Tatsachen im Dokumenttext belegt
+  sind. Zitiere solche Angaben mit [n].
+- Trenne strikt zwischen sicher belegtem Dokumentinhalt und der unsicheren
+  Zuordnung zur Nutzeranfrage. Formulierungen wie "könnte entsprechen", "weist
+  einen Bezug auf" oder "die Unterlagen nennen ..." sind hierfür geeignet.
+- Eine Verifier-Einstufung oder -Begründung ist Klassifikationsmetadatum und kein
+  eigenständiger Tatsachenbeleg. Tatsachen müssen weiterhin aus dem gelieferten
+  Dokumenttext hervorgehen.
+- Wenn die unsicheren internen Treffer konkrete Identifikatoren oder Suchanker
+  liefern (z. B. Aktenzeichen, Blattnummer, Adresse, Vertragsnummer oder amtliche
+  Bezeichnung), nenne sie, soweit sie im Dokumenttext belegt sind. Sie können dem
+  Nutzer helfen, die nächste Suche präziser zu formulieren.
+- Öffentliche Web-Evidence bleibt in einer kombinierten Recherche eine getrennte
+  Evidenzklasse; diese Unsicherheitsregel stuft Web-Evidence weder auf noch ab.
+""".strip()
+
+
 DOCUMENT_ANALYSIS_GUARD = """
 
 ZUSÄTZLICHE REGELN FÜR EXPLIZIT AUSGEWÄHLTE DOKUMENTE (verbindlich):
@@ -4926,6 +5948,7 @@ def _render_rag_prompt(
     *,
     document_analysis: bool = False,
     selected_document_count: int | None = None,
+    uncertain_only: bool = False,
 ) -> str:
     base = (
         _prompt("answer", RAG_ANSWER_TEMPLATE)
@@ -4933,6 +5956,8 @@ def _render_rag_prompt(
         .replace("{{retrieval_query}}", retrieval_query)
     )
     guard = DOCUMENT_ANALYSIS_GUARD if document_analysis else ANSWER_GROUNDING_GUARD
+    if uncertain_only:
+        guard += "\n\n" + UNCERTAIN_ANSWER_GUARD
     if document_analysis and selected_document_count:
         guard += (
             "\n- Der bereitgestellte explizite Dokumentensatz enthält genau "
@@ -4951,6 +5976,7 @@ def _rag_answer_messages(
     *,
     document_analysis: bool = False,
     selected_document_count: int | None = None,
+    uncertain_only: bool = False,
 ) -> list[dict[str, str]]:
     # Critical design choice: NO raw prior chat history here.
     # The rewriter may resolve references, but the answerer sees only the current
@@ -4963,6 +5989,7 @@ def _rag_answer_messages(
                 retrieval_query,
                 document_analysis=document_analysis,
                 selected_document_count=selected_document_count,
+                uncertain_only=uncertain_only,
             ),
         },
         {"role": "user", "content": question},
@@ -5146,26 +6173,22 @@ def _source_directory(result: SearchResult) -> str:
 
 
 def _nextcloud_source_url(result: SearchResult) -> str:
-    """Build a deterministic Nextcloud Files URL from search metadata."""
+    """Build a deterministic, version-compatible Nextcloud Files URL."""
     raw = result.raw
 
-    # Allow the middleware to provide an already constructed URL in the future.
-    source_url = str(raw.get("source_url") or "").strip()
-    if source_url:
-        return source_url
+    # Rebuild Nextcloud file links from the canonical file id. This avoids
+    # preserving stale legacy URLs produced by an older API process/version.
+    openfile_id = str(raw.get("nextcloud_openfile_id") or "").strip()
+    if openfile_id.isdigit():
+        return build_nextcloud_source_url(
+            NEXTCLOUD_BASE_URL,
+            _source_directory(result),
+            openfile_id,
+            major_version=_nextcloud_major_version(),
+        )
 
-    if not NEXTCLOUD_BASE_URL:
-        return ""
-
-    openfile_id = raw.get("nextcloud_openfile_id")
-    if openfile_id in (None, ""):
-        return ""
-
-    params = urlencode({
-        "dir": _source_directory(result),
-        "openfile": str(openfile_id),
-    })
-    return f"{NEXTCLOUD_BASE_URL}/index.php/apps/files/?{params}"
+    # Non-file sources may intentionally carry an externally supplied URL.
+    return str(raw.get("source_url") or "").strip()
 
 
 def _display_date_value(value: str) -> str:
@@ -5223,16 +6246,7 @@ def _previous_assistant_text(messages: list[dict[str, Any]]) -> str:
 
 
 def _document_id_from_url(url: str) -> str | None:
-    try:
-        values = parse_qs(urlparse(str(url)).query).get("openfile") or []
-    except Exception:
-        return None
-    if not values:
-        return None
-    value = str(values[0]).strip()
-    if value.isdigit():
-        return f"files:{value}"
-    return None
+    return document_id_from_nextcloud_url(url)
 
 
 def _previous_source_map(messages: list[dict[str, Any]]) -> dict[int, str]:
@@ -5891,13 +6905,11 @@ Ein führendes / aktiviert immer ausschließlich den Directive-Modus; spätere K
 
 Quellenbereiche (untereinander kombinierbar):
 /documents
-  Normale Nextcloud-Dokumente, ohne Mail-, Web- und Chatarchiv.
+  Normale Nextcloud-Dokumente, ohne Mail- und Chatarchiv.
 /mailarchive
   Nur konfigurierte Mailarchive.
-/webarchive
-  Nur bereits archivierte Webquellen.
 /chatarchive
-  Nur gespeicherte SunaQ-Recherchen.
+  gespeicherte SunaQ-Recherchen einschließlich der zugehörigen Web-Evidence.
 /web
   Aktuelle öffentliche Web-Recherche. Allein = Web-only; zusammen mit internen Quellen = gemischte Recherche.
 
@@ -5935,9 +6947,9 @@ Retrieval-Technik (orthogonal zu den Quellenbereichen):
 Quellenbereiche und Retrieval-Technik können kombiniert werden, z. B.
 /documents /mailarchive /vector Rechnung 2025
 /documents /web Aktueller Stand des Vorgangs
-/webarchive /web Entwicklung seit der letzten Recherche
+/chatarchive /web Entwicklung seit der letzten Recherche
 
-Ohne Quellen-Directive werden nur normale Dokumente durchsucht; Mail-, Web- und Chatarchiv sind opt-in."""
+Ohne Quellen-Directive werden nur normale Dokumente durchsucht; Mail- und Chatarchive sind opt-in."""
 
 _HELP_ALIASES = {
     "help", "help me", "help please",
@@ -6077,11 +7089,21 @@ async def _probe_role_backend(role: str, timeout: float = 4.0) -> dict[str, Any]
                 response.raise_for_status()
                 data = response.json()
                 names = {
-                    str(item.get("name") or item.get("model") or "")
+                    str(item.get("name") or item.get("model") or "").strip()
                     for item in (data.get("models") or []) if isinstance(item, dict)
                 }
-                base = selected.model.split(":", 1)[0]
-                present = selected.model in names or any(name.split(":", 1)[0] == base for name in names if name)
+                configured_model = str(selected.model or "").strip()
+                configured_has_tag = ":" in configured_model
+                present = any(
+                    ollama_model_name_equal(configured_model, name)
+                    or (
+                        not configured_has_tag
+                        and name
+                        and name.split(":", 1)[0].strip().casefold()
+                        == configured_model.casefold()
+                    )
+                    for name in names
+                )
                 status = "ok" if present else "degraded"
                 result = {**info, "status": status, "model": selected.model, "model_present": bool(present)}
                 if not present:
@@ -6104,10 +7126,17 @@ async def _probe_role_backend(role: str, timeout: float = 4.0) -> dict[str, Any]
 
 
 async def _llm_health(timeout: float = 4.0) -> dict[str, Any]:
-    """Probe all configured role backends, deduplicating is unnecessary at this scale."""
-    roles = {}
-    for role in ("planner", "verifier", "evidence", "answer"):
-        roles[role] = await _probe_role_backend(role, timeout=timeout)
+    """Probe configured role backends concurrently.
+
+    Health diagnostics must not serialize four independent backend timeouts:
+    a healthy provider can otherwise take up to 4 * timeout to answer /health,
+    which makes operator UIs report a false provider outage.
+    """
+    role_names = ("planner", "verifier", "evidence", "answer")
+    results = await asyncio.gather(
+        *(_probe_role_backend(role, timeout=timeout) for role in role_names)
+    )
+    roles = dict(zip(role_names, results))
     statuses = {str(v.get("status")) for v in roles.values()}
     status = "down" if statuses == {"down"} else ("ok" if statuses == {"ok"} else "degraded")
     return {
@@ -6283,6 +7312,32 @@ async def live() -> dict[str, Any]:
 @app.get("/health")
 async def health() -> dict[str, Any]:
     llm_status = await _llm_health(timeout=min(float(HTTP_TIMEOUT), 4.0))
+    if CHAT_ARCHIVE_ENABLED:
+        try:
+            dossier_stats = _dossier_outbox().stats()
+            dossier_writer = {
+                "enabled": bool(_dossier_outbox().enabled),
+                "worker_running": bool(
+                    _DOSSIER_WRITER_TASK is not None
+                    and not _DOSSIER_WRITER_TASK.done()
+                ),
+                **dossier_stats,
+            }
+        except Exception as exc:
+            dossier_writer = {
+                "enabled": True,
+                "worker_running": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    else:
+        dossier_writer = {
+            "enabled": False,
+            "worker_running": False,
+            "pending": 0,
+            "running": 0,
+            "completed": 0,
+            "dead": 0,
+        }
     try:
         middleware = await _middleware_health()
     except Exception as exc:
@@ -6290,7 +7345,19 @@ async def health() -> dict[str, Any]:
     overall = "ok"
     if middleware.get("status") == "down":
         overall = "down"
-    elif middleware.get("status") != "ok" or llm_status.get("status") != "ok":
+    elif (
+        middleware.get("status") != "ok"
+        or llm_status.get("status") != "ok"
+        or dossier_writer.get("error")
+        or (
+            CHAT_ARCHIVE_ENABLED
+            and (
+                not dossier_writer.get("enabled")
+                or not dossier_writer.get("worker_running")
+                or int(dossier_writer.get("dead") or 0) > 0
+            )
+        )
+    ):
         overall = "degraded"
     return {
         "status": overall,
@@ -6299,6 +7366,7 @@ async def health() -> dict[str, Any]:
         "architecture_tier": architecture_tier(PROVIDER_CONFIG),
         "rag_middleware": RAG_MIDDLEWARE_URL,
         "middleware": middleware,
+        "dossier_writer": dossier_writer,
         "llm": llm_status,
         "models": {
             "default_auxiliary": LLM_MODEL,
@@ -6393,6 +7461,9 @@ async def list_models(
             continue
         item = model.public_info()
         item["default"] = model.model_id == default_id
+        item["source_capabilities"] = _source_capabilities_for_identity(
+            user_id, model=model,
+        )
         data.append(item)
     capabilities = _source_capabilities_for_identity(user_id)
     return {
@@ -6496,6 +7567,7 @@ async def register_chat_archive(
 async def chat_completions(
     body: ChatCompletionRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
 ) -> Any:
     client_id = _check_auth(authorization)
@@ -6505,6 +7577,8 @@ async def chat_completions(
         raise HTTPException(status_code=400, detail="No user message found")
 
     completion_id = "chatcmpl-" + uuid.uuid4().hex
+    conversation_id = _conversation_id(request, body)
+    research_run: ResearchRun | None = None
     # Prefer the explicit RAG headers, but accept common OpenWebUI identity
     # headers and the OpenAI-compatible ``user`` request field as fallbacks.
     # The middleware never trusts these values for authorization by itself;
@@ -6572,10 +7646,21 @@ async def chat_completions(
     # Policy controls automatic public-web fallback. Explicit /web remains a
     # user action unless web is administratively disabled.
     web_capability = client_web_capability and RETRIEVAL_POLICY.web == "planner"
+    # Implicit web fallback always uses native Web Evidence. A delegated
+    # model binding does not silently authorize another backend when the user
+    # did not explicitly request Web.
+    if web_capability:
+        try:
+            selected_for_auto = _research_backend_for_model(runtime_model.model)
+        except ValueError:
+            selected_for_auto = None
+        if selected_for_auto is None or selected_for_auto.delegated:
+            web_capability = False
 
     natural_workflow: NaturalInstructionWorkflow | None = None
     direct_kind: str | None = None
     retrieval_limit_notice = ""
+    uncertain_only_answer = False
     planner_exhaustive = False
 
     if auxiliary:
@@ -6717,16 +7802,28 @@ async def chat_completions(
         # Multi-user just-in-time binding.  Auxiliary OpenWebUI helper requests
         # deliberately bypass RAG/ACL, but every normal task is checked before
         # retrieval so an unbound identity does not consume ES/reranker work.
+        auth_preflight_started = time.perf_counter()
         try:
             auth_state = await _ensure_nextcloud_binding(user_id)
         except Exception as exc:
-            log.warning("Request %s auth preflight failed: %s: %s", completion_id, type(exc).__name__, exc)
+            log.warning(
+                "Request %s auth preflight failed after %.1fms: %s: %s",
+                completion_id,
+                (time.perf_counter() - auth_preflight_started) * 1000.0,
+                type(exc).__name__,
+                exc,
+            )
             return _static_response(
                 "Die Benutzerautorisierung ist derzeit nicht erreichbar. "
                 "Bitte versuchen Sie es erneut oder wenden Sie sich an den Administrator.",
                 completion_id,
                 body.stream,
             )
+        log.info(
+            "Request %s timing: auth_preflight_ms=%.1f",
+            completion_id,
+            (time.perf_counter() - auth_preflight_started) * 1000.0,
+        )
 
         auth_status = str(auth_state.get("status") or "").strip().lower()
         if auth_status == "identity_missing":
@@ -6799,6 +7896,74 @@ async def chat_completions(
                     + ", ".join(labels) + ".",
                     completion_id,
                     body.stream,
+                )
+
+        # A Web-only model may forbid ordinary private-document retrieval.
+        # The implicit default documents scope must not bypass that model gate.
+        if direct_kind is None and runtime_model.model.section("capabilities").get("documents") is False:
+            implicit_documents = (
+                not web_only
+                and retrieval_arms is None
+                and not source_scopes_explicit
+                and not use_references
+            )
+            explicit_documents = bool(
+                (source_scopes and "documents" in source_scopes)
+                or (retrieval_arms and set(retrieval_arms) & {"files", "vector", "graph"})
+                or use_references or elastic_mode
+            )
+            if implicit_documents or explicit_documents:
+                return _static_response(
+                    "Interne Dokumentenrecherche ist für dieses SunaQ-Modell nicht freigeschaltet.",
+                    completion_id, body.stream,
+                )
+
+        # Only retrieval/research turns get a run directory. Trivial direct
+        # replies remain in chat.md but do not create empty provenance runs.
+        if (
+            direct_kind is None
+            and conversation_id
+            and user_id
+            and CHAT_ARCHIVE_ENABLED
+        ):
+            research_run_reserved_at = time.perf_counter()
+            try:
+                archive = _research_archive()
+                research_run = archive.reserve_run(
+                    scoped_user_id=user_id,
+                    conversation_id=conversation_id,
+                    request_id=completion_id,
+                )
+                if research_run is not None:
+                    # Commit provenance intent durably before the answer returns.
+                    # The provider-side dossier writer drains the outbox later and
+                    # preserves per-conversation ordering across DAV locks/restarts.
+                    _enqueue_dossier_write(
+                        "persist_run_start",
+                        research_run,
+                        label="research_run_start",
+                        request_id=completion_id,
+                        question=question,
+                        model_id=runtime_model.model.model_id,
+                    )
+                    log.info(
+                        "Research dossier run reserved: conversation=%s run=%s",
+                        conversation_id,
+                        research_run.run_path,
+                    )
+            except Exception as exc:
+                # Provenance reservation is fail-open. It must never make normal
+                # retrieval unavailable.
+                log.warning(
+                    "Research dossier run reservation failed; request continues: %s: %s",
+                    type(exc).__name__,
+                    exc,
+                )
+            finally:
+                log.info(
+                    "Request %s timing: research_run_reserve_ms=%.1f",
+                    completion_id,
+                    (time.perf_counter() - research_run_reserved_at) * 1000.0,
                 )
 
     options, think, logged_parameters = _generation_parameters(body)
@@ -6950,6 +8115,33 @@ async def chat_completions(
             body.stream,
         )
 
+    web_backend: WebBackend | None = None
+    if (not auxiliary) and (web_only or explicit_mixed_web):
+        try:
+            web_backend = _research_backend_for_model(runtime_model.model)
+        except ValueError as exc:
+            return _static_response(
+                "Der Research-Backend dieses Modells ist nicht verfügbar: " + str(exc),
+                completion_id, body.stream,
+            )
+        if web_backend is None:
+            return _static_response(
+                "Web-Recherche ist für dieses SunaQ-Modell nicht freigeschaltet.",
+                completion_id, body.stream,
+            )
+        log.info(
+            "Request %s Web backend=%s kind=%s adapter=%s",
+            completion_id, web_backend.backend_id, web_backend.kind, web_backend.adapter,
+        )
+        if explicit_mixed_web and web_backend.delegated:
+            return _static_response(
+                "Dieses Modell verwendet einen delegierten Research-Provider. "
+                "Die kombinierte Dokumente+Web-Anfrage erfordert eine separate "
+                "Hybrid-Egress-Freigabe, die noch nicht implementiert ist. "
+                "Bitte Dokumente und Web in getrennten Schritten abfragen.",
+                completion_id, body.stream,
+            )
+
     _research_call(
         "start_query",
         query_id=completion_id,
@@ -6963,9 +8155,181 @@ async def chat_completions(
         auxiliary=auxiliary,
     )
 
-    if (not auxiliary) and web_only:
+    if (
+        (not auxiliary)
+        and web_only
+        and web_backend is not None
+        and web_backend.delegated
+    ):
+        _progress(
+            "web",
+            f"Externe Web-Recherche ({web_backend.adapter}) wird ausgeführt …",
+        )
         try:
-            web_payload = await _web_search(web_search_query, user_id, completion_id)
+            delegated_provider = _delegated_research_provider(web_backend)
+            if delegated_provider is None:
+                raise RuntimeError("delegated research provider is not available")
+            delegated_result = await delegated_provider.research(
+                DelegatedResearchRequest(
+                    query=web_search_query,
+                    request_id=completion_id,
+                )
+            )
+        except httpx.HTTPStatusError as exc:
+            detail = ""
+            try:
+                payload = exc.response.json()
+                detail = str(
+                    payload.get("error", {}).get("message")
+                    if isinstance(payload.get("error"), dict)
+                    else payload.get("detail") or ""
+                )
+            except Exception:
+                detail = exc.response.text[:500]
+            content = (
+                f"Externe Web-Recherche über {web_backend.adapter} "
+                f"fehlgeschlagen (HTTP {exc.response.status_code})."
+            )
+            if detail:
+                content += " " + detail
+            _research_call(
+                "finish_query",
+                query_id=completion_id,
+                status="delegated_web_error",
+                final_retrieval_query=retrieval_query,
+                answer_text=content,
+            )
+            return _static_response(content, completion_id, body.stream)
+        except Exception as exc:
+            content = (
+                f"Externe Web-Recherche über {web_backend.adapter} "
+                f"fehlgeschlagen: {type(exc).__name__}: {exc}"
+            )
+            _research_call(
+                "finish_query",
+                query_id=completion_id,
+                status="delegated_web_error",
+                final_retrieval_query=retrieval_query,
+                answer_text=content,
+            )
+            return _static_response(content, completion_id, body.stream)
+
+        display_sources = [
+            {
+                "index": citation.index,
+                "title": citation.title or citation.url,
+                "url": citation.url,
+                "final_url": citation.url,
+            }
+            for citation in delegated_result.citations
+        ]
+        content = delegated_result.answer_markdown + _web_source_suffix(display_sources)
+
+        if research_run is not None:
+            _enqueue_dossier_write(
+                "write_delegated_research",
+                research_run,
+                label="delegated_research_provenance",
+                backend_id=web_backend.backend_id,
+                provider=delegated_result.provider,
+                model=delegated_result.model,
+                response_id=delegated_result.response_id,
+                search_queries=list(delegated_result.search_queries),
+                citations=[
+                    {
+                        "index": citation.index,
+                        "url": citation.url,
+                        "title": citation.title,
+                        "start_index": citation.start_index,
+                        "end_index": citation.end_index,
+                    }
+                    for citation in delegated_result.citations
+                ],
+                sources=[
+                    {
+                        "url": source.url,
+                        "title": source.title,
+                        "cited": source.cited,
+                    }
+                    for source in delegated_result.sources
+                ],
+                usage=dict(delegated_result.usage),
+            )
+
+        _research_call(
+            "finish_query",
+            query_id=completion_id,
+            status="delegated_web_answered",
+            final_retrieval_query=retrieval_query,
+            answer_text=content,
+        )
+        log.info(
+            "Request %s finished: delegated_web_answered provider=%s model=%s "
+            "queries=%d citations=%d sources=%d",
+            completion_id,
+            delegated_result.provider,
+            delegated_result.model,
+            len(delegated_result.search_queries),
+            len(delegated_result.citations),
+            len(delegated_result.sources),
+        )
+        return _static_response(content, completion_id, body.stream)
+
+    if (not auxiliary) and web_only:
+        web_query_started = time.perf_counter()
+        native_web_queries = await _derive_web_queries(
+            question=question,
+            fallback_query=web_search_query,
+        )
+        log.info(
+            "Request %s timing: web_query_derivation_ms=%.1f queries=%d",
+            completion_id,
+            (time.perf_counter() - web_query_started) * 1000.0,
+            len(native_web_queries),
+        )
+        if native_web_queries:
+            web_search_query = native_web_queries[0]
+            web_search_queries = list(native_web_queries)
+        try:
+            web_research_started = time.perf_counter()
+            initial_queries = list(web_search_queries or [web_search_query])
+            web_payload = await _web_search_many(
+                initial_queries,
+                user_id,
+                completion_id,
+                research_run.run_path if research_run is not None else "",
+                research_goal=question,
+            )
+
+            fetch_failures = list(web_payload.get("fetch_errors") or [])
+            if fetch_failures:
+                log.warning(
+                    "Request %s Web fetch failures=%d sample=%s",
+                    completion_id,
+                    len(fetch_failures),
+                    [
+                        {
+                            "url": str(item.get("url") or "")[:240],
+                            "error": str(item.get("error") or "")[:300],
+                            "queries": [
+                                str(value)[:180]
+                                for value in (item.get("queries") or [])
+                            ][:3],
+                        }
+                        for item in fetch_failures[:5]
+                    ],
+                )
+            log.info(
+                "Request %s timing: web_research_ms=%.1f searched=%s unique_hits=%s fetched=%s selected=%s archive_mode=%s queries=%d",
+                completion_id,
+                (time.perf_counter() - web_research_started) * 1000.0,
+                web_payload.get("searched"),
+                web_payload.get("unique_hits"),
+                web_payload.get("fetched"),
+                len(web_payload.get("sources") or []),
+                web_payload.get("archive_mode") or "-",
+                len(web_payload.get("queries") or []),
+            )
         except httpx.HTTPStatusError as exc:
             detail = ""
             try:
@@ -7000,62 +8364,202 @@ async def chat_completions(
             return _static_response(content, completion_id, body.stream)
 
         web_context, web_sources = _build_web_context(web_payload)
+        if research_run is not None and web_sources:
+            _enqueue_dossier_write(
+                "write_web_evidence",
+                research_run,
+                label="web_evidence_dossier",
+                queries=list(web_payload.get("queries") or [web_search_query]),
+                sources=web_sources,
+                searched=int(web_payload.get("searched") or 0),
+                fetched=int(web_payload.get("fetched") or 0),
+                archive_run_paths=[
+                    str(path).strip()
+                    for path in (
+                        web_payload.get("archive_run_paths")
+                        or ([web_payload.get("archive_run_path")] if web_payload.get("archive_run_path") else [])
+                    )
+                    if str(path or "").strip()
+                ],
+            )
         if not web_sources:
-            details = []
-            if web_payload.get("searched") is not None:
-                details.append(f"gesucht: {web_payload.get('searched')}")
-            if web_payload.get("fetched") is not None:
-                details.append(f"geladen: {web_payload.get('fetched')}")
-            content = "Es wurde keine hinreichend relevante, tatsächlich abrufbare Webquelle gefunden."
-            if details:
-                content += " (" + ", ".join(details) + ")"
+            searched = int(web_payload.get("searched") or 0)
+            fetched = int(web_payload.get("fetched") or 0)
+            content = (
+                "Die Web-Recherche wurde ausgeführt, aber nach Abruf und "
+                "Relevanzprüfung blieb keine hinreichende Web-Evidence übrig "
+                f"(Suchtreffer: {searched}, Seiten geladen: {fetched}, "
+                "als Evidence akzeptiert: 0)."
+            )
+            content += (
+                "\n\n*Quellenumfang: Für diesen Turn war ausschließlich Web "
+                "ausgewählt; interne Dokumente wurden nicht durchsucht.*"
+            )
             _research_call(
                 "finish_query", query_id=completion_id, status="web_insufficient",
                 final_retrieval_query=retrieval_query, answer_text=content,
             )
             return _static_response(content, completion_id, body.stream)
 
-        messages = _web_answer_messages(question, web_context)
+        messages = _web_answer_messages(
+            question,
+            web_context,
+            source_scope_note=(
+                "Für diesen Turn war ausschließlich Web ausgewählt. "
+                "Interne Dokumente wurden nicht durchsucht. Beantworte den "
+                "öffentlich recherchierbaren Teil des Auftrags anhand der "
+                "Web-Evidence und stelle nicht dar, dass interne Recherche "
+                "technisch unmöglich sei."
+            ),
+        )
+        archive_errors = list(web_payload.get("archive_errors") or [])
+        archive_run_paths = [
+            str(path).strip()
+            for path in (web_payload.get("archive_run_paths") or [])
+            if str(path or "").strip()
+        ]
+        if not archive_run_paths:
+            archive_run_path = str(web_payload.get("archive_run_path") or "").strip()
+            if archive_run_path:
+                archive_run_paths = [archive_run_path]
+
+        web_suffix = (
+            _web_source_suffix(web_sources)
+            + "\n\n*Quellenumfang: ausschließlich Web; interne Dokumente "
+              "wurden in diesem Turn nicht durchsucht.*"
+        )
+        if archive_errors:
+            web_suffix += (
+                f"\n\n*Archivierung: {len(archive_errors)} Web-Evidence-Schritt(e) "
+                "konnten bereits vor der Antwort nicht vorbereitet werden; "
+                "die Web-Evidence selbst wurde trotzdem ausgewertet.*"
+            )
+
+        if body.stream:
+            async def web_answer_stream() -> AsyncIterator[str]:
+                initial = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": _active_model_id(),
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(initial, ensure_ascii=False)}\n\n"
+
+                chunks: list[str] = []
+                stream_status = "web_answered"
+                web_answer_started = time.perf_counter()
+                try:
+                    async for event in _ollama_stream(
+                        messages,
+                        options=options,
+                        think=False,
+                        model=ANSWER_MODEL,
+                        role="answer",
+                    ):
+                        token = str(event.get("content") or "")
+                        if not token:
+                            continue
+                        chunks.append(token)
+                        yield _sse_chunk(completion_id, token)
+                except Exception as exc:
+                    stream_status = "stream_error"
+                    log.warning("Request %s web answer stream failed: %s", completion_id, exc)
+                    if not chunks:
+                        fallback = _llm_unavailable_text(exc, found=len(web_sources))
+                    else:
+                        fallback = f"\n\n[LLM-Ausgabe unterbrochen: {exc}]"
+                    chunks.append(fallback)
+                    yield _sse_chunk(completion_id, fallback)
+
+                answer = "".join(chunks)
+                if not answer:
+                    answer = "Die Webquellen wurden ausgewählt, aber das Antwortmodell hat keinen Text geliefert."
+                    chunks.append(answer)
+                    yield _sse_chunk(completion_id, answer)
+
+                log.info(
+                    "Request %s timing: web_answer_model_ms=%.1f stream=true",
+                    completion_id,
+                    (time.perf_counter() - web_answer_started) * 1000.0,
+                )
+
+                if web_suffix:
+                    yield _sse_chunk(completion_id, web_suffix)
+                content = answer + web_suffix
+
+                for archive_run_path in archive_run_paths:
+                    _add_post_response_barrier(
+                        background_tasks,
+                        "web_archive_finalize",
+                        _web_finalize_archive,
+                        archive_run_path,
+                        answer,
+                        user_id,
+                        answer_model=ANSWER_MODEL,
+                        answer_parameters=dict(options or {}),
+                        request_id=completion_id,
+                    )
+
+                _research_call(
+                    "finish_query",
+                    query_id=completion_id,
+                    status=stream_status,
+                    final_retrieval_query=retrieval_query,
+                    answer_text=content,
+                )
+                _progress("complete", "Fertig.")
+                log.info(
+                    "Request %s finished: %s searched=%s fetched=%s selected=%s stream=true",
+                    completion_id,
+                    stream_status,
+                    web_payload.get("searched"),
+                    web_payload.get("fetched"),
+                    len(web_sources),
+                )
+                yield _sse_chunk(completion_id, finish_reason="stop")
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(web_answer_stream(), media_type="text/event-stream")
+
         try:
+            web_answer_started = time.perf_counter()
             answer = await _ollama_complete(
                 messages, options=options, think=False, model=ANSWER_MODEL, role="answer"
+            )
+            log.info(
+                "Request %s timing: web_answer_model_ms=%.1f stream=false",
+                completion_id,
+                (time.perf_counter() - web_answer_started) * 1000.0,
             )
         except httpx.HTTPError as exc:
             content = _llm_unavailable_text(exc, found=len(web_sources)) + _web_source_suffix(web_sources)
             log.warning("Request %s web answer LLM unavailable: %s", completion_id, exc)
-            return _static_response(content, completion_id, body.stream)
+            return _static_response(content, completion_id, False)
         if not answer:
             answer = "Die Webquellen wurden ausgewählt, aber das Antwortmodell hat keinen Text geliefert."
-        content = answer + _web_source_suffix(web_sources)
-        archive_errors = list(web_payload.get("archive_errors") or [])
-        archive_run_path = str(web_payload.get("archive_run_path") or "").strip()
-        if archive_run_path:
-            try:
-                await _web_finalize_archive(
-                    archive_run_path,
-                    answer,
-                    user_id,
-                    answer_model=ANSWER_MODEL,
-                    answer_parameters=dict(options or {}),
-                    request_id=completion_id,
-                )
-            except Exception as exc:
-                archive_errors.append({
-                    "url": "recherche.md",
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-                log.warning("Request %s web archive finalization failed: %s", completion_id, exc)
-        if archive_errors:
-            content += f"\n\n*Archivierung: {len(archive_errors)} Webarchiv-Schritt(e) konnten nicht vollständig abgeschlossen werden; die Web-Evidence selbst wurde trotzdem ausgewertet.*"
+        content = answer + web_suffix
+        for archive_run_path in archive_run_paths:
+            _add_post_response_barrier(
+                background_tasks,
+                "web_archive_finalize",
+                _web_finalize_archive,
+                archive_run_path,
+                answer,
+                user_id,
+                answer_model=ANSWER_MODEL,
+                answer_parameters=dict(options or {}),
+                request_id=completion_id,
+            )
         _research_call(
             "finish_query", query_id=completion_id, status="web_answered",
             final_retrieval_query=retrieval_query, answer_text=content,
         )
         log.info(
-            "Request %s finished: web_answered searched=%s fetched=%s selected=%s",
+            "Request %s finished: web_answered searched=%s fetched=%s selected=%s stream=false",
             completion_id, web_payload.get("searched"), web_payload.get("fetched"), len(web_sources),
         )
-        return _static_response(content, completion_id, body.stream)
+        return _static_response(content, completion_id, False)
 
     auto_web_payload: dict[str, Any] | None = None
     auto_web_sources: list[dict[str, Any]] = []
@@ -7368,10 +8872,12 @@ async def chat_completions(
         # ------------------------------------------------------------
         # Simple retrieval contract
         #
-        # One structured SearchSpec drives every normal retrieval round.
-        # Neo4j remains available inside the API for entity/alias expansion,
-        # but it is not an automatic document-retrieval arm.  Qdrant receives
-        # only semantic_query; Elasticsearch receives only the lexical fields.
+        # The LLM SearchSpec carries analysis/refinement metadata, but a proven
+        # deterministic first-round planner remains authoritative for short
+        # literal queries (1..3 words). Longer/complex queries and later recall
+        # rounds execute the structured SearchSpec. Neo4j remains available
+        # inside the API for entity/alias expansion but is not an automatic
+        # document-retrieval arm.
         # ------------------------------------------------------------
         explicit_arm_selection = retrieval_arms is not None
         if retrieval_arms is None:
@@ -7385,21 +8891,129 @@ async def chat_completions(
                 sorted(retrieval_arms),
             )
 
+        resolver_research_cfg = _profile_section("resolver_research")
+        resolver_research_enabled = _config_truthy(
+            resolver_research_cfg.get("enabled"), False
+        )
+        resolver_direct_answer = (
+            resolver_research_enabled
+            and _config_truthy(resolver_research_cfg.get("direct_answer"), False)
+        )
+        resolver_sources = [
+            str(value or "").strip().casefold()
+            for value in (resolver_research_cfg.get("sources") or [])
+            if str(value or "").strip()
+        ]
+        effective_resolver_sources = list(
+            allowed_resolver_sources(PROVIDER_CONFIG, resolver_sources)
+        )
+        resolver_enrich_resolved = _config_truthy(
+            resolver_research_cfg.get("enrich_resolved"), True
+        )
+        resolver_include_holdings = _config_truthy(
+            resolver_research_cfg.get("include_holdings"), False
+        )
+        resolver_archive_supplied_documents = _config_truthy(
+            resolver_research_cfg.get("archive_supplied_documents"), True
+        )
+        resolver_persist_external_graph = _config_truthy(
+            resolver_research_cfg.get("persist_external_graph"), True
+        )
+        resolver_settings = load_resolver_settings(runtime_model.model.config)
+        planner_settings = _retrieval_planner()
+        planner_exhaustive = detect_exhaustive_intent(retrieval_query)
+        planner_bounded_document_set = (
+            detect_bounded_document_set(retrieval_query) and not planner_exhaustive
+        )
+
+        # A direct-answer resolver profile cannot run when its administrator-owned
+        # gateway capability is disabled. Resolve this deterministic policy deny
+        # before spending an LLM call on query rewriting, and publish the deny as
+        # an inspectable strategy record.
+        if resolver_direct_answer and not resolver_settings.enabled:
+            verification_limit = (
+                planner_settings.exhaustive_verification_candidate_limit
+                if planner_exhaustive
+                else (
+                    planner_settings.bounded_verification_candidate_limit
+                    if planner_bounded_document_set
+                    else planner_settings.verification_candidate_limit
+                )
+            )
+            retrieval_decision = build_retrieval_decision_record(
+                query_id=completion_id,
+                original_query=question,
+                normalized_query=retrieval_query,
+                search_spec={},
+                architecture_tier=architecture_tier(PROVIDER_CONFIG),
+                model_id=runtime_model.model.model_id,
+                retrieval_arms=set(retrieval_arms or set()),
+                source_scopes=(
+                    set(source_scopes)
+                    if source_scopes is not None
+                    else None
+                ),
+                explicit_arm_selection=explicit_arm_selection,
+                web_requested=web_requested,
+                resolver_research_requested=resolver_research_enabled,
+                resolver_gateway_enabled=False,
+                resolver_sources=resolver_sources,
+                exhaustive=planner_exhaustive,
+                bounded_document_set=planner_bounded_document_set,
+                max_rounds=planner_settings.max_retrieval_rounds,
+                max_queries_per_round=planner_settings.max_queries_per_round,
+                verification_candidate_limit=verification_limit,
+                max_complete_documents=planner_settings.max_complete_documents,
+                planner_status="not_run",
+                block_retrieval=True,
+            )
+            retrieval_decision_payload = retrieval_decision.to_dict()
+            _set_progress_retrieval_decision(
+                progress_id,
+                _ACTIVE_PROGRESS_OWNER.get(),
+                retrieval_decision_payload,
+            )
+            _write_retrieval_record(
+                retrieval_decision_payload,
+                kind="decision",
+            )
+            if research_run is not None:
+                # Provenance-only: the durable outbox preserves ordering after
+                # the previously queued persist_run_start operation.
+                _enqueue_dossier_write(
+                    "write_retrieval_decision",
+                    research_run,
+                    label="retrieval_decision_dossier",
+                    decision=dict(retrieval_decision_payload),
+                )
+            _progress(
+                "strategy_ready",
+                "Suchstrategie: Registerresolver administrativ gesperrt.",
+            )
+            content = "Die Resolver-Recherche ist administrativ nicht freigeschaltet."
+            _research_call(
+                "finish_query",
+                query_id=completion_id,
+                status="resolver_not_available",
+                final_retrieval_query=retrieval_query,
+                answer_text=content,
+            )
+            return _static_response(content, completion_id, body.stream)
+
         rewrite_enabled_task = bool(
             not use_references
             and not implicit_filename_use
             and not elastic_mode
-            and bool(set(retrieval_arms or set()) & {"files", "vector"})
+            and (
+                resolver_research_enabled
+                or bool(set(retrieval_arms or set()) & {"files", "vector"})
+            )
         )
         # Keep the historic variable name below so verifier/evidence code stays
         # small; it now means "structured rewrite path", not RC8 multi-probe.
         planner_enabled_task = rewrite_enabled_task
         planner_probes: list[dict[str, Any]] = []  # legacy retrieval-record field
         planner_query_frame: dict[str, Any] = normalize_query_frame({})
-        planner_exhaustive = detect_exhaustive_intent(retrieval_query)
-        planner_bounded_document_set = (
-            detect_bounded_document_set(retrieval_query) and not planner_exhaustive
-        )
         planner_previous_doc_ids: set[str] = set()
         active_search_spec: dict[str, Any] | None = None
         rewrite_model = _retrieval_planner().model or ANSWER_MODEL
@@ -7408,10 +9022,17 @@ async def chat_completions(
 
         query_seed_context: dict[str, Any] = {}
         if rewrite_enabled_task:
+            query_context_started = time.perf_counter()
             query_seed_context = await _rag_query_context(
                 retrieval_query,
                 request_id=completion_id,
             )
+            log.info(
+                "Request %s timing: query_context_ms=%.1f",
+                completion_id,
+                (time.perf_counter() - query_context_started) * 1000.0,
+            )
+            query_rewrite_started = time.perf_counter()
             initial_rewrite = await _rewrite_search_spec(
                 question=retrieval_query,
                 round_no=1,
@@ -7419,12 +9040,85 @@ async def chat_completions(
                 previous_spec=None,
                 retrieval_arms=set(retrieval_arms or set()) & {"files", "vector"},
                 seed_context=query_seed_context,
+                require_entity_hints=resolver_research_enabled,
+            )
+            log.info(
+                "Request %s timing: query_rewrite_ms=%.1f",
+                completion_id,
+                (time.perf_counter() - query_rewrite_started) * 1000.0,
             )
             if not bool(initial_rewrite.get("valid")):
+                verification_limit = (
+                    planner_settings.exhaustive_verification_candidate_limit
+                    if planner_exhaustive
+                    else (
+                        planner_settings.bounded_verification_candidate_limit
+                        if planner_bounded_document_set
+                        else planner_settings.verification_candidate_limit
+                    )
+                )
+                retrieval_decision = build_retrieval_decision_record(
+                    query_id=completion_id,
+                    original_query=question,
+                    normalized_query=retrieval_query,
+                    search_spec=dict(initial_rewrite.get("spec") or {}),
+                    architecture_tier=architecture_tier(PROVIDER_CONFIG),
+                    model_id=runtime_model.model.model_id,
+                    retrieval_arms=set(retrieval_arms or set()),
+                    source_scopes=(
+                        set(source_scopes)
+                        if source_scopes is not None
+                        else None
+                    ),
+                    explicit_arm_selection=explicit_arm_selection,
+                    web_requested=web_requested,
+                    resolver_research_requested=resolver_research_enabled,
+                    resolver_gateway_enabled=resolver_settings.enabled,
+                    resolver_sources=resolver_sources,
+                    exhaustive=planner_exhaustive,
+                    bounded_document_set=planner_bounded_document_set,
+                    max_rounds=planner_settings.max_retrieval_rounds,
+                    max_queries_per_round=planner_settings.max_queries_per_round,
+                    verification_candidate_limit=verification_limit,
+                    max_complete_documents=planner_settings.max_complete_documents,
+                    planner_status="failed",
+                    block_retrieval=True,
+                )
+                retrieval_decision_payload = retrieval_decision.to_dict()
+                _set_progress_retrieval_decision(
+                    progress_id,
+                    _ACTIVE_PROGRESS_OWNER.get(),
+                    retrieval_decision_payload,
+                )
+                _write_retrieval_record(
+                    retrieval_decision_payload,
+                    kind="decision",
+                )
+                if research_run is not None:
+                    # Provenance-only: queued after persist_run_start in the
+                # per-conversation durable outbox.
+                    _enqueue_dossier_write(
+                        "write_retrieval_decision",
+                        research_run,
+                        label="retrieval_decision_dossier",
+                        decision=dict(retrieval_decision_payload),
+                    )
+                _progress(
+                    "strategy_failed",
+                    "Suchstrategie konnte nicht zuverlässig erstellt werden.",
+                )
                 content = (
-                    "Die Suchanfrage konnte nicht zuverlässig in eine interne "
-                    "Dokumentensuche übersetzt werden. Bitte formulieren Sie die "
-                    "Anfrage etwas konkreter."
+                    (
+                        "Die Registeranfrage konnte nicht zuverlässig in eine "
+                        "Personen-/Firmensuche übersetzt werden. Bitte nennen Sie "
+                        "die gesuchte Person oder Organisation etwas konkreter."
+                    )
+                    if resolver_research_enabled
+                    else (
+                        "Die Suchanfrage konnte nicht zuverlässig in eine interne "
+                        "Dokumentensuche übersetzt werden. Bitte formulieren Sie die "
+                        "Anfrage etwas konkreter."
+                    )
                 )
                 _research_call(
                     "finish_query", query_id=completion_id, status="query_rewrite_failed",
@@ -7437,14 +9131,528 @@ async def chat_completions(
                 query_frame_from_search_spec(active_search_spec, intent=retrieval_query)
             )
             log.info(
-                "query rewrite round 1: elastic_present=%s semantic_present=%s entities=%d concepts=%d constraints=%d verification_requirements=%d seed_keys=%d",
-                bool(str(active_search_spec.get("elastic_query") or "").strip()),
+                "query intent round 1: semantic_present=%s entities=%d concepts=%d concept_groups=%d constraints=%d verification_requirements=%d seed_keys=%d",
                 bool(str(active_search_spec.get("semantic_query") or "").strip()),
                 len(active_search_spec.get("entities") or []),
                 len(active_search_spec.get("concepts") or []),
+                len(active_search_spec.get("concept_groups") or []),
                 len(active_search_spec.get("constraints") or []),
                 len(active_search_spec.get("verification_requirements") or []),
                 len(query_seed_context),
+            )
+
+            verification_limit = (
+                planner_settings.exhaustive_verification_candidate_limit
+                if planner_exhaustive
+                else (
+                    planner_settings.bounded_verification_candidate_limit
+                    if planner_bounded_document_set
+                    else planner_settings.verification_candidate_limit
+                )
+            )
+            retrieval_decision = build_retrieval_decision_record(
+                query_id=completion_id,
+                original_query=question,
+                normalized_query=retrieval_query,
+                search_spec=active_search_spec,
+                architecture_tier=architecture_tier(PROVIDER_CONFIG),
+                model_id=runtime_model.model.model_id,
+                retrieval_arms=set(retrieval_arms or set()),
+                source_scopes=(
+                    set(source_scopes)
+                    if source_scopes is not None
+                    else None
+                ),
+                explicit_arm_selection=explicit_arm_selection,
+                web_requested=web_requested,
+                resolver_research_requested=resolver_research_enabled,
+                resolver_gateway_enabled=resolver_settings.enabled,
+                resolver_sources=resolver_sources,
+                exhaustive=planner_exhaustive,
+                bounded_document_set=planner_bounded_document_set,
+                max_rounds=planner_settings.max_retrieval_rounds,
+                max_queries_per_round=planner_settings.max_queries_per_round,
+                verification_candidate_limit=verification_limit,
+                max_complete_documents=planner_settings.max_complete_documents,
+            )
+            retrieval_decision_payload = retrieval_decision.to_dict()
+            _set_progress_retrieval_decision(
+                progress_id,
+                _ACTIVE_PROGRESS_OWNER.get(),
+                retrieval_decision_payload,
+            )
+            _write_retrieval_record(
+                retrieval_decision_payload,
+                kind="decision",
+            )
+            if research_run is not None:
+                # Provenance-only: the durable outbox preserves ordering after
+                # the previously queued persist_run_start operation.
+                _enqueue_dossier_write(
+                    "write_retrieval_decision",
+                    research_run,
+                    label="retrieval_decision_dossier",
+                    decision=dict(retrieval_decision_payload),
+                )
+            _progress(
+                "strategy_ready",
+                "Suchstrategie festgelegt; Recherche läuft …",
+            )
+
+            # Optional ERG resolver boundary. The Query Rewriter still decides
+            # which references/entities exist; the resolver only enriches those
+            # references and never receives raw document evidence.
+            if (
+                resolver_research_enabled
+                and resolver_settings.enabled
+                and effective_resolver_sources
+                and active_search_spec.get("entities")
+            ):
+                resolver_started = time.perf_counter()
+                resolver_outcome = await resolve_search_spec(
+                    resolver_settings,
+                    active_search_spec,
+                    sources=effective_resolver_sources,
+                )
+                log.info(
+                    "Request %s timing: resolver_ms=%.1f sources=%s references=%d",
+                    completion_id,
+                    (time.perf_counter() - resolver_started) * 1000.0,
+                    ",".join(effective_resolver_sources),
+                    len(resolver_outcome.request.get("references") or []),
+                )
+
+                enrichment_records: list[dict[str, Any]] = []
+                automatic_document_records: list[dict[str, Any]] = []
+                automatic_artifact_records: list[dict[str, Any]] = []
+                artifact_summary_sections: list[str] = []
+                artifact_source_labels: set[str] = set()
+                if (
+                    not resolver_outcome.error
+                    and resolver_outcome.response is not None
+                    and resolver_research_enabled
+                    and resolver_enrich_resolved
+                ):
+                    for result in resolver_outcome.response.get("results") or []:
+                        if not isinstance(result, dict):
+                            continue
+                        if str(result.get("status") or "").strip().casefold() != "resolved":
+                            continue
+                        candidates = [
+                            item for item in (result.get("candidates") or [])
+                            if isinstance(item, dict)
+                        ]
+                        if not candidates:
+                            continue
+                        candidate = candidates[0]
+                        enrichment = await enrich_candidate(
+                            resolver_settings,
+                            source=str(candidate.get("source") or ""),
+                            candidate_id=str(candidate.get("candidate_id") or ""),
+                            kind=str(candidate.get("kind") or ""),
+                            include_holdings=(
+                                resolver_include_holdings
+                                and str(candidate.get("kind") or "").strip().casefold()
+                                == "person"
+                            ),
+                        )
+                        enrichment_response = (
+                            dict(enrichment.response)
+                            if isinstance(enrichment.response, dict)
+                            else enrichment.response
+                        )
+                        research_artifacts: list[dict[str, Any]] = []
+                        if isinstance(enrichment_response, dict):
+                            raw_artifacts = enrichment_response.pop("artifacts", [])
+                            research_artifacts = [
+                                item for item in raw_artifacts
+                                if isinstance(item, dict)
+                            ]
+
+                        source_key = str(candidate.get("source") or "resolver").strip().casefold()
+                        seen_remote_urls: set[str] = set()
+                        for artifact in research_artifacts:
+                            mode = str(artifact.get("mode") or "").strip().casefold()
+                            file_name = str(artifact.get("file_name") or "").strip()
+                            content_type = str(artifact.get("content_type") or "").strip()
+                            title = str(artifact.get("title") or file_name).strip()
+                            metadata = (
+                                dict(artifact.get("metadata") or {})
+                                if isinstance(artifact.get("metadata"), dict)
+                                else {}
+                            )
+                            display_source = str(
+                                metadata.get("source") or candidate.get("source") or ""
+                            ).strip()
+                            if display_source:
+                                artifact_source_labels.add(display_source)
+                            category = str(
+                                metadata.get("artifact_role")
+                                or "research_artifact"
+                            ).strip()
+                            artifact_record: dict[str, Any] = {
+                                "entity": str(candidate.get("canonical") or result.get("reference") or ""),
+                                "candidate_id": str(candidate.get("candidate_id") or ""),
+                                "source": source_key,
+                                "title": title,
+                                "category": category,
+                                "status": "unavailable",
+                                "response": None,
+                                "error": "",
+                            }
+                            try:
+                                if mode == "inline_text":
+                                    data = str(artifact.get("content") or "").encode("utf-8")
+                                    if not data or not file_name or not content_type:
+                                        raise ValueError("invalid inline research artifact")
+                                elif mode == "remote":
+                                    if not resolver_archive_supplied_documents:
+                                        continue
+                                    remote_url = str(artifact.get("url") or "").strip()
+                                    if not remote_url or remote_url in seen_remote_urls:
+                                        continue
+                                    seen_remote_urls.add(remote_url)
+                                    data, content_type, file_name = await _download_external_artifact_payload(
+                                        artifact
+                                    )
+                                else:
+                                    continue
+
+                                if research_run is None:
+                                    artifact_record["status"] = "available_unarchived"
+                                    artifact_record["response"] = {
+                                        "file_name": file_name,
+                                        "content_type": content_type,
+                                        "size_bytes": len(data),
+                                    }
+                                else:
+                                    archived = await _research_archive().write_external_source(
+                                        research_run,
+                                        source=source_key or "resolver",
+                                        external_id=str(candidate.get("candidate_id") or ""),
+                                        file_name=file_name,
+                                        content=data,
+                                        content_type=content_type,
+                                        metadata={
+                                            **metadata,
+                                            "adapter_source": source_key,
+                                        },
+                                    )
+                                    file_id = str(archived.get("file_id") or "")
+                                    if file_id.isdigit():
+                                        archived["source_url"] = build_nextcloud_source_url(
+                                            NEXTCLOUD_BASE_URL,
+                                            "/" + "/".join(
+                                                str(archived.get("path") or "").split("/")[:-1]
+                                            ),
+                                            file_id,
+                                            major_version=_nextcloud_major_version(),
+                                        )
+                                    artifact_record["status"] = "archived"
+                                    artifact_record["response"] = archived
+                                    if (
+                                        bool(artifact.get("include_in_summary"))
+                                        and str(artifact.get("summary_markdown") or "").strip()
+                                    ):
+                                        artifact_summary_sections.append(
+                                            str(artifact.get("summary_markdown") or "").strip()
+                                        )
+                            except Exception as exc:
+                                artifact_record["error"] = type(exc).__name__
+                                log.warning(
+                                    "Resolver research artifact archival failed for %s/%s: %s",
+                                    source_key,
+                                    str(candidate.get("candidate_id") or ""),
+                                    type(exc).__name__,
+                                )
+
+                            automatic_artifact_records.append(artifact_record)
+                            if category == "primary_source":
+                                automatic_document_records.append(artifact_record)
+
+                        enrichment_records.append({
+                            "reference": result.get("reference"),
+                            "candidate": {
+                                "source": candidate.get("source"),
+                                "candidate_id": candidate.get("candidate_id"),
+                                "canonical": candidate.get("canonical"),
+                                "kind": candidate.get("kind"),
+                            },
+                            "response": enrichment_response,
+                            "error": enrichment.error,
+                        })
+
+                document_records: list[dict[str, Any]] = list(automatic_document_records)
+
+                archive_response = (
+                    dict(resolver_outcome.response)
+                    if isinstance(resolver_outcome.response, dict)
+                    else resolver_outcome.response
+                )
+                if isinstance(archive_response, dict) and enrichment_records:
+                    archive_response["enrichments"] = enrichment_records
+                if isinstance(archive_response, dict) and document_records:
+                    archive_response["documents"] = [
+                        {
+                            "entity": item.get("entity"),
+                            "candidate_id": item.get("candidate_id"),
+                            "category": item.get("category"),
+                            "status": item.get("status"),
+                            "file_date": (
+                                (item.get("response") or {}).get("file_date")
+                                if isinstance(item.get("response"), dict)
+                                else None
+                            ),
+                            "file_name": (
+                                (item.get("response") or {}).get("file_name")
+                                if isinstance(item.get("response"), dict)
+                                else None
+                            ),
+                            "path": (
+                                (item.get("response") or {}).get("path")
+                                if isinstance(item.get("response"), dict)
+                                else None
+                            ),
+                            "file_id": (
+                                (item.get("response") or {}).get("file_id")
+                                if isinstance(item.get("response"), dict)
+                                else None
+                            ),
+                            "sha256": (
+                                (item.get("response") or {}).get("sha256")
+                                if isinstance(item.get("response"), dict)
+                                else None
+                            ),
+                            "error": item.get("error") or "",
+                        }
+                        for item in document_records
+                    ]
+                if isinstance(archive_response, dict) and automatic_artifact_records:
+                    archive_response["artifacts"] = [
+                        {
+                            "entity": item.get("entity"),
+                            "candidate_id": item.get("candidate_id"),
+                            "source": item.get("source"),
+                            "title": item.get("title"),
+                            "category": item.get("category"),
+                            "status": item.get("status"),
+                            "file_name": (
+                                (item.get("response") or {}).get("file_name")
+                                if isinstance(item.get("response"), dict)
+                                else None
+                            ),
+                            "content_type": (
+                                (item.get("response") or {}).get("content_type")
+                                if isinstance(item.get("response"), dict)
+                                else None
+                            ),
+                            "path": (
+                                (item.get("response") or {}).get("path")
+                                if isinstance(item.get("response"), dict)
+                                else None
+                            ),
+                            "file_id": (
+                                (item.get("response") or {}).get("file_id")
+                                if isinstance(item.get("response"), dict)
+                                else None
+                            ),
+                            "sha256": (
+                                (item.get("response") or {}).get("sha256")
+                                if isinstance(item.get("response"), dict)
+                                else None
+                            ),
+                            "error": item.get("error") or "",
+                        }
+                        for item in automatic_artifact_records
+                    ]
+
+                if research_run is not None and resolver_outcome.request.get("references"):
+                    _enqueue_dossier_write(
+                        "write_resolver",
+                        research_run,
+                        label="resolver_research_dossier",
+                        request_payload=resolver_outcome.request,
+                        response_payload=archive_response,
+                        error=resolver_outcome.error,
+                    )
+
+                has_openregister_candidates = bool(
+                    resolver_outcome.response is not None
+                    and any(
+                        str(candidate.get("source") or "").strip().casefold() == "openregister"
+                        for result in (resolver_outcome.response.get("results") or [])
+                        if isinstance(result, dict)
+                        for candidate in (result.get("candidates") or [])
+                        if isinstance(candidate, dict)
+                    )
+                )
+                if (
+                    resolver_research_enabled
+                    and resolver_persist_external_graph
+                    and has_openregister_candidates
+                    and _config_truthy(
+                        (PROVIDER_CONFIG.get("neo4j") or {}).get("enabled"),
+                        False,
+                    )
+                ):
+                    try:
+                        graph_counts = await asyncio.to_thread(
+                            persist_openregister_research,
+                            PROVIDER_CONFIG,
+                            run_id=(
+                                research_run.run_id
+                                if research_run is not None
+                                else completion_id
+                            ),
+                            resolver_response=resolver_outcome.response,
+                            enrichments=enrichment_records,
+                            documents=document_records,
+                        )
+                        log.info(
+                            "OpenRegister graph persisted: entities=%d findings=%d facts=%d documents=%d",
+                            int(graph_counts.get("entities") or 0),
+                            int(graph_counts.get("findings") or 0),
+                            int(graph_counts.get("facts") or 0),
+                            int(graph_counts.get("documents") or 0),
+                        )
+                    except Exception as exc:
+                        # External graph learning is enrichment only and must
+                        # never block the register answer.
+                        log.warning(
+                            "OpenRegister graph persistence failed; answer continues: %s: %s",
+                            type(exc).__name__,
+                            exc,
+                        )
+
+                if resolver_outcome.error:
+                    log.warning(
+                        "ERG resolver unavailable; continuing with current query context: %s",
+                        resolver_outcome.error,
+                    )
+                    if resolver_direct_answer:
+                        content = (
+                            "Die Resolver-Recherche ist derzeit nicht erreichbar. "
+                            "Es wurde nicht auf interne Dokumente ausgewichen."
+                        )
+                        _research_call(
+                            "finish_query",
+                            query_id=completion_id,
+                            status="resolver_unavailable",
+                            final_retrieval_query=retrieval_query,
+                            answer_text=content,
+                        )
+                        return _static_response(content, completion_id, body.stream)
+                elif resolver_outcome.response is not None:
+                    if resolver_direct_answer:
+                        resolver_evidence = {
+                            "resolver": resolver_outcome.response,
+                            "enrichments": enrichment_records,
+                            "documents": document_records,
+                        }
+                        try:
+                            answer = await _ollama_complete(
+                                _resolver_answer_messages(question, resolver_evidence),
+                                options=options,
+                                think=False,
+                                model=generation_model,
+                                role="answer",
+                            )
+                        except Exception as exc:
+                            log.warning(
+                                "Request %s register answer LLM unavailable: %s",
+                                completion_id,
+                                exc,
+                            )
+                            answer = ""
+                        content = answer or (
+                            "Die Registerdaten wurden abgerufen, aber das Antwortmodell "
+                            "hat keinen Antworttext geliefert."
+                        )
+                        if research_run is not None:
+                            _enqueue_dossier_write(
+                                "write_research_markdown",
+                                research_run,
+                                label="register_research_markdown",
+                                question=question,
+                                answer=content,
+                                source_records=list(automatic_artifact_records),
+                                heading="Registerrecherche",
+                                source_label=", ".join(sorted(artifact_source_labels)),
+                                summary_sections=list(artifact_summary_sections),
+                            )
+                        _research_call(
+                            "finish_query",
+                            query_id=completion_id,
+                            status="resolver_answered",
+                            final_retrieval_query=retrieval_query,
+                            answer_text=content,
+                        )
+                        log.info(
+                            "Request %s finished: resolver_answered references=%d enrichments=%d documents=%d",
+                            completion_id,
+                            len(resolver_outcome.request.get("references") or []),
+                            len(enrichment_records),
+                            len(document_records),
+                        )
+                        return _static_response(content, completion_id, body.stream)
+
+                    resolved_context = entity_context_from_resolver(
+                        resolver_outcome.response
+                    )
+                    query_seed_context = merge_entity_context(
+                        query_seed_context,
+                        resolved_context,
+                    )
+                    log.info(
+                        "ERG resolver: references=%d resolved_entities=%d expansions=%d",
+                        len(resolver_outcome.request.get("references") or []),
+                        sum(
+                            1
+                            for item in (resolved_context.get("entities") or [])
+                            if str(item.get("status") or "") == "resolved"
+                        ),
+                        len(resolved_context.get("elastic_phrase_expansion") or []),
+                    )
+            elif resolver_direct_answer:
+                if not resolver_settings.enabled:
+                    content = "Die Resolver-Recherche ist administrativ nicht freigeschaltet."
+                elif resolver_sources and not effective_resolver_sources:
+                    content = (
+                        "Die für dieses Modell konfigurierte Resolver-Quelle ist "
+                        f"im Architektur-Tier {architecture_tier(PROVIDER_CONFIG)!r} "
+                        "nicht freigegeben."
+                    )
+                elif not resolver_sources:
+                    content = "Für die Resolver-Recherche ist keine Resolver-Quelle konfiguriert."
+                else:
+                    content = "Die Anfrage enthält keine eindeutig erkennbare Person oder Organisation für die Resolver-Recherche."
+                _research_call(
+                    "finish_query",
+                    query_id=completion_id,
+                    status="resolver_not_available",
+                    final_retrieval_query=retrieval_query,
+                    answer_text=content,
+                )
+                return _static_response(content, completion_id, body.stream)
+
+        retrieval_execution_rounds: list[dict[str, Any]] = []
+        retrieval_execution_verifier: list[dict[str, Any]] = []
+
+        def queue_retrieval_execution(
+            selected_results: list[SearchResult] | None = None,
+        ) -> None:
+            if research_run is None or not retrieval_execution_rounds:
+                return
+            _enqueue_dossier_write(
+                "write_retrieval_execution",
+                research_run,
+                label="retrieval_execution_dossier",
+                execution=_retrieval_execution_payload(
+                    query_id=completion_id,
+                    rounds=retrieval_execution_rounds,
+                    verifier_decisions=retrieval_execution_verifier,
+                    selected_results=list(selected_results or []),
+                ),
             )
 
         retrieval_rounds = (
@@ -7464,6 +9672,18 @@ async def chat_completions(
                         retrieval_candidate_limit = max(
                             SEARCH_LIMIT, _retrieval_planner().verification_candidate_limit
                         )
+                    execution_search_spec = _execution_search_spec(
+                        retrieval_query,
+                        round_no=round_no,
+                        search_spec=active_search_spec,
+                    )
+                    if execution_search_spec is None and active_search_spec is not None:
+                        log.info(
+                            "retrieval round %d: deterministic short-query executor query=%r; "
+                            "LLM SearchSpec retained for analysis/refinement",
+                            round_no,
+                            retrieval_query,
+                        )
                     payload, ranked_results = await _rag_search(
                         retrieval_query,
                         user_id,
@@ -7474,10 +9694,25 @@ async def chat_completions(
                         source_scopes=source_scopes,
                         raw_results=(list_mode == "raw"),
                         force_unspecific=(force_unspecific or list_mode == "ranked"),
-                        search_spec=active_search_spec,
+                        search_spec=execution_search_spec,
                         query_context=query_seed_context,
                         limit=retrieval_candidate_limit,
                     )
+                    if execution_search_spec is None and active_search_spec is not None:
+                        log.info(
+                            "retrieval round %d short-query candidates: %s",
+                            round_no,
+                            [
+                                {
+                                    "rank": result.index,
+                                    "title": str(result.title or "")[:140],
+                                    "es_rank": (result.raw or {}).get("es_rank"),
+                                    "vector_rank": (result.raw or {}).get("vector_rank"),
+                                    "rrf_rank": (result.raw or {}).get("rrf_rank"),
+                                }
+                                for result in ranked_results[:10]
+                            ],
+                        )
                 else:
                     payload, ranked_results = await _rag_search(
                         retrieval_query,
@@ -7512,6 +9747,19 @@ async def chat_completions(
                     final_retrieval_query=retrieval_query,
                 )
                 raise HTTPException(status_code=502, detail=f"RAG middleware error: {exc}") from exc
+
+            # The middleware response has already crossed live ACL. Re-rank
+            # the visible candidates from 1..n and persist no backend rank/score
+            # that could reveal filtered candidates.
+            retrieval_execution_rounds.append({
+                "round": int(round_no),
+                "queries": dict(payload.get("execution_queries") or {}),
+                "authorized_candidates": _authorized_document_records(ranked_results),
+            })
+            # Queue a minimal record immediately so early-return paths still leave
+            # auditable query/candidate provenance. Later writes overwrite it with
+            # verifier/selection details in the same ordered dossier outbox.
+            queue_retrieval_execution()
 
             if followup_uses_history and not followup_evidence_loaded:
                 followup_evidence_results = await _resolve_followup_evidence(
@@ -7595,12 +9843,12 @@ async def chat_completions(
                         )
                         planner_previous_doc_ids = current_doc_ids
                         log.info(
-                            "retrieval round %d rewrite: elastic_present=%s semantic_present=%s entities=%d concepts=%d constraints=%d",
+                            "retrieval round %d intent: semantic_present=%s entities=%d concepts=%d concept_groups=%d constraints=%d",
                             round_no + 1,
-                            bool(str(active_search_spec.get("elastic_query") or "").strip()),
                             bool(str(active_search_spec.get("semantic_query") or "").strip()),
                             len(active_search_spec.get("entities") or []),
                             len(active_search_spec.get("concepts") or []),
+                            len(active_search_spec.get("concept_groups") or []),
                             len(active_search_spec.get("constraints") or []),
                         )
                         continue
@@ -7642,6 +9890,11 @@ async def chat_completions(
                     compact=True,
                     exhaustive=planner_exhaustive,
                 )
+                retrieval_execution_verifier[:] = _authorized_verifier_records(
+                    verification,
+                    ranked_results,
+                )
+                queue_retrieval_execution()
                 verified_count = int(verification.get("checked") or 0)
                 # ``ranked_results`` is bounded by the request limit.  For an
                 # exhaustive files request Elasticsearch may know that more
@@ -7739,19 +9992,16 @@ async def chat_completions(
                         final_retrieval_query=retrieval_query, answer_text=content,
                     )
                     return _static_response(content, completion_id, body.stream)
-                if planner_exhaustive and not verified_results and uncertain_results:
-                    content = (
-                        "Die Suche hat mögliche Kandidaten gefunden, aber keinen davon anhand des "
-                        "Dokumentinhalts hinreichend sicher als passenden Treffer verifizieren können. "
-                        "Bitte präzisieren Sie die Anfrage leicht; ich verwende keine lediglich ähnlich "
-                        "erscheinenden Dokumente als Ersatztreffer."
+                ranked_results, uncertain_only_answer = _answer_candidates_from_verification(
+                    verified_results,
+                    uncertain_results,
+                )
+                if uncertain_only_answer:
+                    log.info(
+                        "Request %s continuing with uncertain-only answer context: candidates=%d",
+                        completion_id,
+                        len(ranked_results),
                     )
-                    _research_call(
-                        "finish_query", query_id=completion_id, status="exhaustive_verification_uncertain",
-                        final_retrieval_query=retrieval_query, answer_text=content,
-                    )
-                    return _static_response(content, completion_id, body.stream)
-                ranked_results = verified_results
 
             if list_mode is not None:
                 content = _format_retrieval_list(
@@ -7776,6 +10026,7 @@ async def chat_completions(
                     sorted(retrieval_arms) if retrieval_arms else ["files", "vector", "graph"],
                     len(ranked_results),
                 )
+                queue_retrieval_execution(ranked_results)
                 return _static_response(content, completion_id, body.stream)
 
             if retrieval_mode in {"filename_exact", "filename_not_found"}:
@@ -7806,12 +10057,16 @@ async def chat_completions(
                 # A guard in one explicitly requested arm must not cancel another
                 # requested capability. Preserve the internal warning and continue
                 # with the web arm when web was explicitly/implicitly allowed.
-                if explicit_mixed_web or web_capability:
+                continue_web, fallback_pending = _web_continuation_mode(
+                    explicit_mixed_web,
+                    web_capability,
+                )
+                if continue_web:
                     results = []
                     context = ""
                     messages = []
                     internal_fallback_message = content
-                    web_fallback_pending = not explicit_mixed_web
+                    web_fallback_pending = fallback_pending
                     log.info("Request %s internal retrieval too_unspecific; continuing with web=%s", completion_id, True)
                     break
                 _set_suggestions(_refinement_suggestions(
@@ -7837,13 +10092,22 @@ async def chat_completions(
                         " Zu der erkannten Entität liegen Informationen im für Sie zugänglichen "
                         "Datenbestand vor."
                     )
-                if web_capability:
+                continue_web, fallback_pending = _web_continuation_mode(
+                    explicit_mixed_web,
+                    web_capability,
+                )
+                if continue_web:
                     results = []
                     context = ""
                     messages = []
                     internal_fallback_message = content
-                    web_fallback_pending = True
-                    log.info("Request %s internal retrieval unspecific; web fallback may be evaluated", completion_id)
+                    web_fallback_pending = fallback_pending
+                    log.info(
+                        "Request %s internal retrieval unspecific; continuing with explicit_web=%s fallback_web=%s",
+                        completion_id,
+                        explicit_mixed_web,
+                        web_fallback_pending,
+                    )
                     break
                 _set_suggestions(_refinement_suggestions(
                     question,
@@ -7868,12 +10132,16 @@ async def chat_completions(
 
             if retrieval_mode == "degraded_no_results":
                 content = str(payload.get("retrieval_message") or "Ein interner Suchdienst ist derzeit nicht verfügbar.").strip()
-                if explicit_mixed_web or web_capability:
+                continue_web, fallback_pending = _web_continuation_mode(
+                    explicit_mixed_web,
+                    web_capability,
+                )
+                if continue_web:
                     results = []
                     context = ""
                     messages = []
                     internal_fallback_message = content
-                    web_fallback_pending = not explicit_mixed_web
+                    web_fallback_pending = fallback_pending
                     break
                 _research_call(
                     "finish_query", query_id=completion_id, status="degraded_no_results",
@@ -7885,12 +10153,16 @@ async def chat_completions(
                 no_results_text = "Ich habe in den internen Unterlagen keine passenden Dokumenttreffer gefunden."
                 if retrieval_limit_notice:
                     no_results_text += "\n\n" + retrieval_limit_notice
-                if web_capability:
+                continue_web, fallback_pending = _web_continuation_mode(
+                    explicit_mixed_web,
+                    web_capability,
+                )
+                if continue_web:
                     results = []
                     context = ""
                     messages = []
                     internal_fallback_message = no_results_text
-                    web_fallback_pending = True
+                    web_fallback_pending = fallback_pending
                     break
                 if not ALLOW_GENERAL_KNOWLEDGE:
                     content = no_results_text
@@ -7914,7 +10186,7 @@ async def chat_completions(
             )
             review_context, review_results = _build_review_context(ranked_results)
 
-            if _evidence_decision_mode() == "review":
+            if _evidence_decision_mode() == "review" and not uncertain_only_answer:
                 _research_call(
                     "log_documents",
                     round_id=round_id,
@@ -7966,13 +10238,21 @@ async def chat_completions(
                     )
                     if reason:
                         content += " " + reason
-                    if web_capability:
+                    continue_web, fallback_pending = _web_continuation_mode(
+                        explicit_mixed_web,
+                        web_capability,
+                    )
+                    if continue_web:
                         results = []
                         context = ""
                         messages = []
                         internal_fallback_message = content
-                        web_fallback_pending = True
-                        log.info("Evidence requested retry; no internal pass left, web fallback may be evaluated")
+                        web_fallback_pending = fallback_pending
+                        log.info(
+                            "Evidence requested retry; no internal pass left, continuing with explicit_web=%s fallback_web=%s",
+                            explicit_mixed_web,
+                            web_fallback_pending,
+                        )
                         break
                     _set_suggestions(_refinement_suggestions(
                         question,
@@ -8064,13 +10344,22 @@ async def chat_completions(
                         continue
 
                     content = _format_insufficient(decision)
-                    if web_capability:
+                    continue_web, fallback_pending = _web_continuation_mode(
+                        explicit_mixed_web,
+                        web_capability,
+                    )
+                    if continue_web:
                         results = []
                         context = ""
                         messages = []
                         internal_fallback_message = content
-                        web_fallback_pending = True
-                        log.info("Request %s internal evidence insufficient; web fallback may be evaluated", completion_id)
+                        web_fallback_pending = fallback_pending
+                        log.info(
+                            "Request %s internal evidence insufficient; continuing with explicit_web=%s fallback_web=%s",
+                            completion_id,
+                            explicit_mixed_web,
+                            web_fallback_pending,
+                        )
                         break
                     _research_call(
                         "finish_query",
@@ -8128,6 +10417,14 @@ async def chat_completions(
                 stage="answer_context",
                 documents=_raw_documents(results),
             )
+            if research_run is not None:
+                _enqueue_dossier_write(
+                    "write_documents",
+                    research_run,
+                    label="research_documents_manifest",
+                    documents=_authorized_document_records(results),
+                )
+                queue_retrieval_execution(results)
             # A ResearchRun should describe evidence that actually reached the
             # answer model, not the wider verifier candidate pool. This keeps
             # curation aligned with the user-visible research and avoids
@@ -8143,7 +10440,12 @@ async def chat_completions(
                 retrieval_query=retrieval_query,
                 source_scopes=source_scopes,
             )
-            messages = _rag_answer_messages(question, retrieval_query, context)
+            messages = _rag_answer_messages(
+                question,
+                retrieval_query,
+                context,
+                uncertain_only=uncertain_only_answer,
+            )
             break
 
     if (not auxiliary) and explicit_mixed_web:
@@ -8160,16 +10462,37 @@ async def chat_completions(
             )
             if web_search_queries:
                 web_search_query = web_search_queries[0]
+        elif natural_workflow is None:
+            # UI-selected Documents+Web is an explicit mixed task too. Do not
+            # send the whole user work instruction to Brave/SearX; compile the
+            # public query from the structured planner output we already have.
+            compiled_web_query = _web_query_from_search_spec(
+                active_search_spec,
+                web_search_query,
+            )
+            if compiled_web_query:
+                web_search_query = compiled_web_query
+                web_search_queries = [compiled_web_query]
+                log.info(
+                    "Request %s mixed Web query compiled from SearchSpec: %r",
+                    completion_id,
+                    compiled_web_query,
+                )
 
         auto_web = True
         auto_web_decision = {
             "use_web": True,
-            "reason": f"explicit_natural_instruction:{natural_workflow.web_timing if natural_workflow else 'parallel'}",
+            "reason": (
+                f"explicit_natural_instruction:{natural_workflow.web_timing}"
+                if natural_workflow is not None
+                else "explicit_web_directive:parallel"
+            ),
         }
         web_fallback_pending = False
         log.info(
-            "Request %s explicit natural web workflow: timing=%s queries=%r internal_results=%d",
+            "Request %s explicit mixed Web workflow: source=%s timing=%s queries=%r internal_results=%d",
             completion_id,
+            "natural_instruction" if natural_workflow is not None else "directive",
             natural_workflow.web_timing if natural_workflow else "parallel",
             web_search_queries,
             len(results),
@@ -8201,9 +10524,17 @@ async def chat_completions(
     if (not auxiliary) and auto_web:
         try:
             if explicit_natural_web:
-                auto_web_payload = await _web_search_many(web_search_queries, user_id, completion_id)
+                auto_web_payload = await _web_search_many(
+                    web_search_queries, user_id, completion_id,
+                    research_run.run_path if research_run is not None else "",
+                    research_goal=question,
+                )
             else:
-                auto_web_payload = await _web_search(web_search_query, user_id, completion_id)
+                auto_web_payload = await _web_search(
+                    web_search_query, user_id, completion_id,
+                    research_run.run_path if research_run is not None else "",
+                    research_goal=question,
+                )
             auto_web_context, auto_web_sources = _build_web_context(auto_web_payload)
             auto_web_archive_run_paths = [
                 str(path).strip()
@@ -8215,6 +10546,17 @@ async def chat_completions(
                 if single_path:
                     auto_web_archive_run_paths = [single_path]
             auto_web_archive_errors = list(auto_web_payload.get("archive_errors") or [])
+            if research_run is not None and auto_web_sources:
+                _enqueue_dossier_write(
+                    "write_web_evidence",
+                    research_run,
+                    label="automatic_web_evidence_dossier",
+                    queries=list(auto_web_payload.get("queries") or web_search_queries),
+                    sources=auto_web_sources,
+                    searched=int(auto_web_payload.get("searched") or 0),
+                    fetched=int(auto_web_payload.get("fetched") or 0),
+                    archive_run_paths=auto_web_archive_run_paths,
+                )
         except Exception as exc:
             log.warning("Request %s automatic web arm failed; internal answer continues: %s", completion_id, exc)
             auto_web_payload = None
@@ -8224,10 +10566,26 @@ async def chat_completions(
         if auto_web_sources:
             if results:
                 messages = _hybrid_web_answer_messages(
-                    question, retrieval_query, context, auto_web_context
+                    question,
+                    retrieval_query,
+                    context,
+                    auto_web_context,
+                    internal_uncertain_only=uncertain_only_answer,
                 )
             else:
                 messages = _web_answer_messages(question, auto_web_context)
+        elif results and explicit_mixed_web:
+            # The Web arm was executed but produced no answer-grade evidence.
+            # Tell the answerer that explicitly so it does not misdescribe the
+            # situation as "Web research is unavailable in this environment".
+            messages = _hybrid_web_answer_messages(
+                question,
+                retrieval_query,
+                context,
+                "(Web-Recherche ausgeführt; keine hinreichend relevante, "
+                "tatsächlich abrufbare Web-Evidence gefunden.)",
+                internal_uncertain_only=uncertain_only_answer,
+            )
         elif not results and internal_fallback_message:
             content = (
                 internal_fallback_message
@@ -8330,24 +10688,19 @@ async def chat_completions(
                 content += "\n\n" + retrieval_limit_notice
             if auto_web_sources:
                 for auto_web_archive_run_path in auto_web_archive_run_paths:
-                    try:
-                        await _web_finalize_archive(
-                            auto_web_archive_run_path,
-                            answer,
-                            user_id,
-                            answer_model=ANSWER_MODEL,
-                            answer_parameters=dict(options or {}),
-                            request_id=completion_id,
-                        )
-                    except Exception as exc:
-                        auto_web_archive_errors.append({
-                            "url": "recherche.md",
-                            "run_path": auto_web_archive_run_path,
-                            "error": f"{type(exc).__name__}: {exc}",
-                        })
-                        log.warning("Request %s automatic web archive finalization failed for %s: %s", completion_id, auto_web_archive_run_path, exc)
+                    _add_post_response_barrier(
+                        background_tasks,
+                        "automatic_web_archive_finalize",
+                        _web_finalize_archive,
+                        auto_web_archive_run_path,
+                        answer,
+                        user_id,
+                        answer_model=ANSWER_MODEL,
+                        answer_parameters=dict(options or {}),
+                        request_id=completion_id,
+                    )
                 if auto_web_archive_errors:
-                    content += f"\n\n*Webarchiv: {len(auto_web_archive_errors)} Archivierungsschritt(e) konnten nicht vollständig abgeschlossen werden.*"
+                    content += f"\n\n*Chatarchiv: {len(auto_web_archive_errors)} Web-Evidence-Schritt(e) konnten bereits vor der Antwort nicht vorbereitet werden.*"
         else:
             content = answer
 
@@ -8527,20 +10880,17 @@ async def chat_completions(
 
             if auto_web_sources:
                 for auto_web_archive_run_path in auto_web_archive_run_paths:
-                    try:
-                        await _web_finalize_archive(
-                            auto_web_archive_run_path,
-                            "".join(accumulated),
-                            user_id,
-                            answer_model=ANSWER_MODEL,
-                            answer_parameters=dict(options or {}),
-                            request_id=completion_id,
-                        )
-                    except Exception as exc:
-                        log.warning(
-                            "Request %s automatic web archive finalization failed for %s: %s",
-                            completion_id, auto_web_archive_run_path, exc,
-                        )
+                    _add_post_response_barrier(
+                        background_tasks,
+                        "automatic_web_archive_finalize_stream",
+                        _web_finalize_archive,
+                        auto_web_archive_run_path,
+                        "".join(accumulated),
+                        user_id,
+                        answer_model=ANSWER_MODEL,
+                        answer_parameters=dict(options or {}),
+                        request_id=completion_id,
+                    )
 
         _research_call(
             "finish_query",
@@ -8557,4 +10907,3 @@ async def chat_completions(
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
-

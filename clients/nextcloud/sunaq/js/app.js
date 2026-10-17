@@ -9,10 +9,14 @@
     var sendButton;
     var cancelEditButton;
     var status;
+    var retrievalStrategy;
+    var retrievalStrategyContent;
     var messageList;
     var retryButton;
     var chatList;
     var modelSelect;
+    var modelSourceCapabilities = {};
+    var fallbackSourceCapabilities = {};
     var sidebar;
     var sidebarToggle;
     var activeRequestId = '';
@@ -21,7 +25,6 @@
     var sourceScopeLabels = {
         documents: 'Dokumente',
         mailarchive: 'Mailarchiv',
-        webarchive: 'Webarchiv',
         chatarchive: 'Chatarchiv',
         web: 'Web'
     };
@@ -437,6 +440,7 @@
         }
 
         messageList.appendChild(wrapper);
+        return wrapper;
     }
 
     function renderConversation() {
@@ -500,6 +504,11 @@
         });
     }
 
+    function refreshSelectedModelCapabilities() {
+        var selected = modelSelect ? String(modelSelect.value || '') : '';
+        applySourceCapabilities(modelSourceCapabilities[selected] || fallbackSourceCapabilities);
+    }
+
     function loadModels() {
         if (!modelSelect) {
             return Promise.resolve();
@@ -511,7 +520,8 @@
             var userSettings = data.user_settings && typeof data.user_settings === 'object'
                 ? data.user_settings
                 : {};
-            applySourceCapabilities(userSettings.source_capabilities || {});
+            fallbackSourceCapabilities = userSettings.source_capabilities || {};
+            modelSourceCapabilities = {};
             modelSelect.innerHTML = '';
             models.forEach(function (model) {
                 if (!model || !model.id) {
@@ -519,6 +529,9 @@
                 }
                 var option = document.createElement('option');
                 option.value = String(model.id);
+                if (model.source_capabilities && typeof model.source_capabilities === 'object') {
+                    modelSourceCapabilities[String(model.id)] = model.source_capabilities;
+                }
                 option.textContent = String(model.name || model.id);
                 if (model.description) {
                     option.title = String(model.description);
@@ -539,6 +552,7 @@
             if (!modelSelect.value && models[0] && models[0].id) {
                 modelSelect.value = String(models[0].id);
             }
+            refreshSelectedModelCapabilities();
         }).catch(function (error) {
             status.textContent = 'Modellliste nicht verfügbar: ' + error.message;
         });
@@ -583,6 +597,153 @@
         });
     }
 
+
+    function streamFallbackError(message) {
+        var error = new Error(message || 'Streaming nicht verfügbar.');
+        error.sunaqStreamFallback = true;
+        return error;
+    }
+
+    function cleanStreamContent(value) {
+        var text = String(value || '');
+        text = text.replace(/<!--rag-source:\d+:[^>]+-->/g, '');
+        text = text.replace(/<!--rag-source:[\s\S]*$/, '');
+        return text.replace(/[ \t]+\n/g, '\n');
+    }
+
+    function parseSseBlock(block) {
+        var eventName = 'message';
+        var data = [];
+        String(block || '').split('\n').forEach(function (line) {
+            if (line.indexOf('event:') === 0) {
+                eventName = line.slice(6).trim() || 'message';
+            } else if (line.indexOf('data:') === 0) {
+                data.push(line.slice(5).replace(/^\s/, ''));
+            }
+        });
+        return {event: eventName, data: data.join('\n')};
+    }
+
+    function streamChatRequest(payload, onContent) {
+        var options = {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                'requesttoken': OC.requestToken,
+                'Content-Type': 'application/json',
+                'Accept': 'text/event-stream'
+            },
+            body: JSON.stringify(payload)
+        };
+
+        return fetch(OC.generateUrl('/apps/sunaq/chat/stream'), options).then(function (response) {
+            if (!response.ok) {
+                if (response.status === 404 || response.status === 405) {
+                    throw streamFallbackError('Streaming-Endpunkt ist nicht verfügbar.');
+                }
+                return response.json().catch(function () { return {}; }).then(function (data) {
+                    throw new Error(data.error || ('HTTP ' + response.status));
+                });
+            }
+            if (
+                !response.body
+                || typeof response.body.getReader !== 'function'
+                || typeof window.TextDecoder !== 'function'
+            ) {
+                throw streamFallbackError('Dieser Browser unterstützt Streaming nicht.');
+            }
+
+            var reader = response.body.getReader();
+            var decoder = new window.TextDecoder('utf-8');
+            var buffer = '';
+            var rawContent = '';
+            var meta = {};
+            var streamError = null;
+
+            function handleBlock(block) {
+                var frame = parseSseBlock(block);
+                if (!frame.data && frame.event === 'message') {
+                    return;
+                }
+                if (frame.event === 'sunaq_meta') {
+                    try {
+                        meta = JSON.parse(frame.data || '{}') || {};
+                    } catch (e) {
+                        meta = {};
+                    }
+                    return;
+                }
+                if (frame.event === 'sunaq_error') {
+                    try {
+                        var errorData = JSON.parse(frame.data || '{}') || {};
+                        streamError = new Error(errorData.error || 'Streaming fehlgeschlagen.');
+                    } catch (e) {
+                        streamError = new Error('Streaming fehlgeschlagen.');
+                    }
+                    return;
+                }
+                if (frame.event === 'sunaq_done' || frame.data === '[DONE]') {
+                    return;
+                }
+
+                try {
+                    var payloadChunk = JSON.parse(frame.data || '{}');
+                    var choice = payloadChunk.choices && payloadChunk.choices[0];
+                    var delta = choice && choice.delta ? choice.delta : {};
+                    if (typeof delta.content === 'string' && delta.content) {
+                        rawContent += delta.content;
+                        onContent(cleanStreamContent(rawContent));
+                    }
+                } catch (e) {
+                    // Ignore malformed/non-OpenAI SSE frames. The server-side
+                    // metadata event still determines the final saved message.
+                }
+            }
+
+            function consumeBuffer(finalPass) {
+                buffer = buffer.replace(/\r\n/g, '\n');
+                var marker;
+                while ((marker = buffer.indexOf('\n\n')) !== -1) {
+                    var block = buffer.slice(0, marker);
+                    buffer = buffer.slice(marker + 2);
+                    if (block.trim()) {
+                        handleBlock(block);
+                    }
+                }
+                if (finalPass && buffer.trim()) {
+                    handleBlock(buffer);
+                    buffer = '';
+                }
+            }
+
+            function pump() {
+                return reader.read().then(function (part) {
+                    if (part.done) {
+                        buffer += decoder.decode();
+                        consumeBuffer(true);
+                        if (streamError) {
+                            throw streamError;
+                        }
+                        if (!meta.content) {
+                            meta.content = cleanStreamContent(rawContent).trim();
+                        }
+                        return meta;
+                    }
+                    buffer += decoder.decode(part.value, {stream: true});
+                    consumeBuffer(false);
+                    if (streamError) {
+                        return reader.cancel().then(function () {
+                            throw streamError;
+                        });
+                    }
+                    return pump();
+                });
+            }
+
+            return pump();
+        });
+    }
+
     function newRequestId() {
         if (window.crypto && typeof window.crypto.randomUUID === 'function') {
             return window.crypto.randomUUID();
@@ -596,6 +757,110 @@
             randomPart = Math.random().toString(36).slice(2);
         }
         return 'req-' + Date.now().toString(36) + '-' + randomPart;
+    }
+
+    function newConversationId() {
+        if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+            return window.crypto.randomUUID();
+        }
+        var randomPart = '';
+        if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+            var values = new Uint32Array(2);
+            window.crypto.getRandomValues(values);
+            randomPart = values[0].toString(16) + values[1].toString(16);
+        } else {
+            randomPart = Math.random().toString(36).slice(2);
+        }
+        return 'chat-' + Date.now().toString(36) + '-' + randomPart;
+    }
+
+    function clearRetrievalDecision() {
+        if (retrievalStrategyContent) {
+            retrievalStrategyContent.textContent = '';
+        }
+        if (retrievalStrategy) {
+            retrievalStrategy.hidden = true;
+            retrievalStrategy.open = false;
+        }
+    }
+
+    function renderRetrievalDecision(record) {
+        if (!retrievalStrategy || !retrievalStrategyContent || !record || typeof record !== 'object') {
+            return;
+        }
+        var planner = record.planner || {};
+        var policy = record.policy || {};
+        var plan = record.effective_plan || {};
+        var lines = [];
+
+        function add(label, value) {
+            if (Array.isArray(value)) {
+                value = value.join(', ');
+            }
+            value = String(value || '').trim();
+            if (value) {
+                lines.push(label + ': ' + value);
+            }
+        }
+
+        lines.push('Analyse');
+        add('Anfrage', record.normalized_query || record.original_query);
+        add('Entitäten', planner.entities);
+        add('Konzepte', planner.concepts);
+        if (Array.isArray(planner.concept_groups) && planner.concept_groups.length) {
+            add('Konzeptgruppen', planner.concept_groups.map(function (item) {
+                if (!Array.isArray(item) || item.length < 2) {
+                    return String(item);
+                }
+                var required = item[0] ? 'MUSS' : 'OPTIONAL';
+                var terms = Array.isArray(item[1]) ? item[1].join(' | ') : String(item[1] || '');
+                return required + ': ' + terms;
+            }));
+        }
+        if (Array.isArray(planner.constraints) && planner.constraints.length) {
+            add('Constraints', planner.constraints.map(function (item) {
+                return Array.isArray(item) ? item.join(' = ') : String(item);
+            }));
+        }
+
+        lines.push('');
+        lines.push('Planner');
+        add('Status', planner.status);
+        add('Semantic', planner.semantic_query);
+        add('Verifikation', planner.verification_requirements);
+
+        lines.push('');
+        lines.push('Policy');
+        add('Architektur', policy.architecture_tier);
+        add('Profil', policy.model_id);
+        add('Retriever', policy.retrieval_arms);
+        add('Quellen', policy.source_scopes);
+        if (policy.web_requested) {
+            lines.push('Web angefordert: ja');
+            lines.push('Web freigegeben: ' + (policy.web_enabled ? 'ja' : 'nein'));
+        }
+        add('Resolver angefordert', policy.requested_resolver_sources);
+        if (policy.resolver_research_requested) {
+            lines.push(
+                'Resolver freigegeben: ' +
+                (policy.resolver_research_enabled ? 'ja' : 'nein')
+            );
+        }
+        add('Resolver effektiv', policy.resolver_sources);
+        add('Entscheidungsgründe', policy.reason_codes);
+
+        lines.push('');
+        lines.push('Effektiver Plan');
+        add('Retriever', plan.retrieval_arms);
+        add('Quellen', plan.source_scopes);
+        add('Resolver', plan.resolver_sources);
+        add('Runden', plan.max_rounds);
+        add('Queries pro Runde', plan.max_queries_per_round);
+        add('Verifier-Fenster', plan.verification_candidate_limit);
+        add('Max. vollständige Dokumente', plan.max_complete_documents);
+
+        retrievalStrategyContent.textContent = lines.join('\n');
+        retrievalStrategy.hidden = false;
     }
 
     function stopProgress(requestId) {
@@ -627,6 +892,9 @@
                 if (label) {
                     status.textContent = label;
                 }
+                if (data.retrieval_decision) {
+                    renderRetrievalDecision(data.retrieval_decision);
+                }
                 if (String(data.stage || '') === 'complete') {
                     stopProgress(requestId);
                     return;
@@ -644,6 +912,7 @@
 
     function startProgress(requestId) {
         stopProgress();
+        clearRetrievalDecision();
         activeRequestId = requestId;
         status.textContent = 'Anfrage wird vorbereitet …';
         scheduleProgressPoll(requestId);
@@ -717,7 +986,7 @@
             sendButton.setAttribute('aria-label', 'Senden');
             cancelEditButton.hidden = true;
             renderConversation();
-            setBusy(false, '');
+            setBusy(false, data.archive_warning || '');
             loadChatList();
             input.focus();
         }).catch(function (error) {
@@ -726,18 +995,35 @@
     }
 
     function runQueryRequest() {
+        if (!conversationId) {
+            conversationId = newConversationId();
+        }
         var requestId = newRequestId();
-        setRetryVisible(false);
-        setBusy(true, 'Anfrage wird vorbereitet …');
-        startProgress(requestId);
-
-        return apiRequest('/chat', 'POST', {
+        var requestPayload = {
             messages: messages,
             sourceScopes: selectedScopes(),
             conversationId: conversationId,
             model: modelSelect ? modelSelect.value : '',
             requestId: requestId
-        }).then(function (data) {
+        };
+
+        setRetryVisible(false);
+        setBusy(true, 'Anfrage wird vorbereitet …');
+        startProgress(requestId);
+
+        var streamWrapper = addMessage('assistant', '');
+        var streamContentNode = streamWrapper.querySelector('.sunaq-content');
+
+        function renderStreamedContent(content) {
+            if (!streamContentNode) {
+                return;
+            }
+            streamContentNode.innerHTML = '';
+            appendMarkdown(streamContentNode, content);
+            messageList.scrollTop = messageList.scrollHeight;
+        }
+
+        function finish(data) {
             stopProgress(requestId);
             var answer = data.content || 'Keine Antwort erhalten.';
             var assistant = {
@@ -757,15 +1043,29 @@
                 conversationId = data.conversation.id;
             }
             renderConversation();
-            setBusy(false, '');
+            setBusy(false, data.archive_warning || '');
             loadChatList();
-        }).catch(function (error) {
+            return data;
+        }
+
+        function legacyFallback() {
+            if (streamWrapper && streamWrapper.parentNode) {
+                streamWrapper.parentNode.removeChild(streamWrapper);
+            }
+            return apiRequest('/chat', 'POST', requestPayload).then(finish);
+        }
+
+        return streamChatRequest(requestPayload, renderStreamedContent).then(finish).catch(function (error) {
+            if (error && error.sunaqStreamFallback) {
+                return legacyFallback();
+            }
             stopProgress(requestId);
             renderConversation();
             addMessage('assistant', 'Fehler: ' + error.message);
             messageList.scrollTop = messageList.scrollHeight;
             setBusy(false, '');
             setRetryVisible(true);
+            return null;
         });
     }
 
@@ -832,6 +1132,7 @@
         setRetryVisible(false);
         renderConversation();
         status.textContent = '';
+        clearRetrievalDecision();
         loadChatList();
         input.focus();
     }
@@ -845,10 +1146,15 @@
         sendButton = document.getElementById('sunaq-send');
         cancelEditButton = document.getElementById('sunaq-cancel-edit');
         status = document.getElementById('sunaq-status');
+        retrievalStrategy = document.getElementById('sunaq-retrieval-strategy');
+        retrievalStrategyContent = document.getElementById('sunaq-retrieval-strategy-content');
         messageList = document.getElementById('sunaq-messages');
         retryButton = document.getElementById('sunaq-retry');
         chatList = document.getElementById('sunaq-chat-list');
         modelSelect = document.getElementById('sunaq-model');
+        if (modelSelect) {
+            modelSelect.addEventListener('change', refreshSelectedModelCapabilities);
+        }
         sidebar = document.getElementById('sunaq-sidebar');
         sidebarToggle = document.getElementById('sunaq-sidebar-toggle');
         scopeInputs = Array.prototype.slice.call(document.querySelectorAll('input[name="sunaq-scope"]'));

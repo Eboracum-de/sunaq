@@ -23,6 +23,13 @@ import httpx
 from rag.policy_hooks import PRE_MODEL_EGRESS, apply_policy_hook
 
 
+def ollama_model_name_equal(configured: str, installed: str) -> bool:
+    """Compare Ollama model tags case-insensitively without changing the tag."""
+    configured_name = str(configured or "").strip().casefold()
+    installed_name = str(installed or "").strip().casefold()
+    return bool(configured_name and installed_name and configured_name == installed_name)
+
+
 class EmbeddingContextLengthError(RuntimeError):
     """Embedding backend rejected an input because it exceeds model context."""
 
@@ -99,6 +106,7 @@ class EmbeddingBackend:
                 "backend": self.kind,
                 "base_url": self.base_url,
                 "model": self.model,
+                "egress_class": "embedding",
             },
         )
         if not isinstance(checked, list) or any(
@@ -146,6 +154,23 @@ class EmbeddingBackend:
 class OllamaEmbeddings(EmbeddingBackend):
     kind = "ollama"
 
+    def _casefold_installed_model(self, client: httpx.Client) -> str | None:
+        """Return an installed Ollama tag matching the configured name by case only."""
+        try:
+            response = client.get(f"{self.base_url}/api/tags")
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            return None
+        matches: list[str] = []
+        for item in payload.get("models") or [] if isinstance(payload, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("model") or "").strip()
+            if ollama_model_name_equal(self.model, name):
+                matches.append(name)
+        return matches[0] if len(matches) == 1 else None
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
@@ -163,6 +188,25 @@ class OllamaEmbeddings(EmbeddingBackend):
                 json=payload,
             )
             if response.status_code == 404:
+                installed_name = self._casefold_installed_model(client)
+                if installed_name and installed_name != self.model:
+                    self.model = installed_name
+                    payload["model"] = installed_name
+                    response = client.post(
+                        f"{self.base_url}/api/embed",
+                        json=payload,
+                    )
+
+            if response.status_code == 404:
+                response_text = str(response.text or "").casefold()
+                if "model" in response_text and (
+                    "not found" in response_text
+                    or "not installed" in response_text
+                    or "pull" in response_text
+                ):
+                    raise RuntimeError(
+                        f"Ollama embedding model {self.model!r} is not installed"
+                    )
                 if self.dimensions is not None:
                     raise RuntimeError(
                         "Configured embedding.dimensions requires Ollama /api/embed; "

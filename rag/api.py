@@ -9,6 +9,7 @@ import httpx
 import requests
 
 from fastapi import (
+    BackgroundTasks,
     Depends,
     FastAPI,
     HTTPException,
@@ -43,6 +44,7 @@ from rag.api_security import (
     ApiSecurity,
 )
 from rag.elasticsearch_client import requests_options as elastic_requests_options
+from rag.embeddings import ollama_model_name_equal
 from rag.planner import create_plan
 from rag.graph_indexer import GraphEvidenceIndexer
 from rag.graph_queue import GraphQueue
@@ -487,7 +489,7 @@ class ElasticSearchRequest(BaseModel):
 
     source_scopes: list[str] | None = Field(
         default=None,
-        description="Optionale Quellenbereiche: documents, mailarchive, webarchive, chatarchive.",
+        description="Optionale Quellenbereiche: documents, mailarchive, chatarchive.",
     )
 
     include_content: bool = Field(
@@ -503,7 +505,9 @@ class SearchSpecRequest(BaseModel):
     elastic_query: str = Field(default="", max_length=1200)
     semantic_query: str = Field(default="", max_length=1200)
     entities: list[str] = Field(default_factory=list, max_length=16)
+    entity_hints: list[dict[str, str]] = Field(default_factory=list, max_length=16)
     concepts: list[str] = Field(default_factory=list, max_length=16)
+    concept_groups: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
     constraints: list[dict[str, str]] = Field(default_factory=list, max_length=12)
     verification_requirements: list[str] = Field(default_factory=list, max_length=16)
     # Legacy rc2 fields remain accepted for compatibility with stored records
@@ -572,8 +576,8 @@ class SearchRequest(BaseModel):
     search_spec: SearchSpecRequest | None = Field(
         default=None,
         description=(
-            "Optionaler Query-Rewrite mit Nextcloud-kompatibler elastic_query, "
-            "semantic_query und Analysemetadaten."
+            "Optionaler backend-neutraler SearchSpec. Planner-Semantik wird "
+            "strukturiert übertragen; Backend-Syntax bleibt Compiler-Verantwortung."
         ),
     )
 
@@ -641,7 +645,7 @@ class DocumentResolveRequest(BaseModel):
         max_length=60,
         description=(
             "Explizite Dokumentreferenzen: files:<id>, vollständiger Nextcloud-Pfad, "
-            "exakter Dateiname oder interner webarchive:<Pfad>-Verweis."
+            "exakter Dateiname oder archivierter Evidence-Pfad aus einem Chat-ResearchRun."
         ),
     )
 
@@ -665,7 +669,26 @@ class PlanRequest(BaseModel):
 
 
 class WebSearchRequest(BaseModel):
-    query: str = Field(..., min_length=1, description="Öffentliche Web-Recherche. Suchsnippets werden nie als Evidence verwendet.")
+    query: str = Field(
+        ...,
+        min_length=1,
+        description="Kompatibilitäts-/Fallback-Query für öffentliche Web-Recherche.",
+    )
+    queries: list[str] = Field(
+        default_factory=list,
+        max_length=8,
+        description="Optionale Discovery-Probes für eine gemeinsame Web-Recherche.",
+    )
+    research_goal: str = Field(
+        default="",
+        max_length=4000,
+        description="Stabiler Rechercheauftrag für Relevance und Passage-Auswahl.",
+    )
+    research_run_path: str = Field(
+        default="",
+        max_length=1024,
+        description="Optionaler provider-eigener Chat-ResearchRun für persistierte Web-Evidence.",
+    )
 
 
 class WebArchiveFinalizeRequest(BaseModel):
@@ -905,6 +928,7 @@ def result_to_dict(
         "source_date_confidence": item.get("source_date_confidence"),
         "source_date_basis": item.get("source_date_basis"),
         "source_origin": item.get("source_origin"),
+        "web_evidence_direct": bool(item.get("web_evidence_direct", False)),
         "webarchive_direct": bool(item.get("webarchive_direct", False)),
         "acl_verified_by": item.get("acl_verified_by"),
 
@@ -1047,13 +1071,14 @@ def _health_embedding(timeout: float) -> dict[str, Any]:
             try:
                 payload = response.json()
                 names = {
-                    str(item.get("name") or item.get("model") or "")
+                    str(item.get("name") or item.get("model") or "").strip()
                     for item in (payload.get("models") or [])
                     if isinstance(item, dict)
                 }
-                base = EMBEDDING_MODEL.split(":", 1)[0]
-                present = EMBEDDING_MODEL in names or any(
-                    name.split(":", 1)[0] == base for name in names if name
+                present = any(
+                    ollama_model_name_equal(EMBEDDING_MODEL, name)
+                    for name in names
+                    if name
                 )
                 result["model_present"] = bool(present)
                 if not present:
@@ -1383,14 +1408,27 @@ def health():
     ),
     **ZONE_USER
 )
-async def web_search(request: WebSearchRequest, http_request: Request):
+async def web_search(
+    request: WebSearchRequest,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
+):
     try:
         user_id = (
             http_request.headers.get("x-rag-user-id")
             or http_request.headers.get("x-openwebui-user-id")
             or http_request.headers.get("x-open-webui-user-id")
         )
-        return await _get_web_arm().research(request.query, rag_user_id=user_id)
+        probes = [str(value).strip() for value in request.queries if str(value).strip()]
+        if not probes:
+            probes = [request.query]
+        return await _get_web_arm().research_many(
+            probes,
+            research_goal=request.research_goal or request.query,
+            rag_user_id=user_id,
+            research_run_path=request.research_run_path,
+            background_add_task=background_tasks.add_task,
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=502,
@@ -1400,7 +1438,7 @@ async def web_search(request: WebSearchRequest, http_request: Request):
 
 @app.post(
     "/web/archive/finalize",
-    summary="Web-Rechercheakte mit LLM-Ausgabe abschließen",
+    summary="Web-Evidence im Chat-ResearchRun mit LLM-Ausgabe abschließen",
     **ZONE_USER
 )
 async def web_archive_finalize(request: WebArchiveFinalizeRequest, http_request: Request):
@@ -1420,7 +1458,7 @@ async def web_archive_finalize(request: WebArchiveFinalizeRequest, http_request:
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Webarchiv-Finalisierung fehlgeschlagen: {type(exc).__name__}: {exc}",
+            detail=f"Finalisierung der Web-Evidence im Chat fehlgeschlagen: {type(exc).__name__}: {exc}",
         ) from exc
 
 
@@ -1800,7 +1838,7 @@ async def documents_resolve(body: DocumentResolveRequest, http_request: Request)
         ):
             raise HTTPException(
                 status_code=403,
-                detail="Web archive references are not available in Secure RAG Core (SRC)",
+                detail="Archived Web Evidence is not available in Secure RAG Core (SRC)",
             )
         for reference in body.references:
             value = str(reference or "").strip()
@@ -2463,6 +2501,12 @@ def search(
 
             "raw_results":
                 bool(search_result.get("raw_results", body.raw_results)),
+
+            # Query provenance is safe to expose after the ACL boundary because
+            # it contains no candidate identities/counts. Result provenance below
+            # remains restricted to ACL-authorized documents.
+            "execution_queries":
+                search_result.get("execution_queries", {}),
 
             # Report the caller's explicit control flag, not the internal
             # ACL-safety override used to defer broad-field feedback.

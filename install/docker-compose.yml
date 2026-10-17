@@ -33,7 +33,26 @@ services:
     volumes:
       - neo4j_data:/data
       - neo4j_logs:/logs
-      - ../runtime/service-secrets/neo4j_auth:/run/secrets/neo4j_auth:ro
+      - ../runtime/service-secrets/neo4j_auth:/run/secrets/neo4j_auth:ro,z
+
+  erg-resolver:
+    profiles: ["resolver"]
+    build:
+      context: ..
+      dockerfile: install/components/erg-resolver/Dockerfile
+    image: sunaq-erg-resolver:0.8.7-rc1
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      RESOLVER_NEO4J_ENABLED: "${RESOLVER_NEO4J_ENABLED:-false}"
+      RESOLVER_NEO4J_URI: "bolt://127.0.0.1:${NEO4J_BOLT_PORT:-7687}"
+      RESOLVER_NEO4J_USERNAME: "${NEO4J_USERNAME:-neo4j}"
+      RESOLVER_NEO4J_PASSWORD_FILE: "/run/sunaq-secrets/neo4j_auth"
+      RESOLVER_OPENREGISTER_ENABLED: "${RESOLVER_OPENREGISTER_ENABLED:-false}"
+      RESOLVER_OPENREGISTER_API_KEY_FILE: "/run/sunaq-secrets/OPENREGISTER_API_KEY"
+      RESOLVER_OPENPLZ_ENABLED: "${RESOLVER_OPENPLZ_ENABLED:-false}"
+    volumes:
+      - ../runtime/service-secrets:/run/sunaq-secrets:ro,z
 
   playwright-renderer:
     profiles: ["renderer"]

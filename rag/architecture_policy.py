@@ -1,11 +1,13 @@
 """SunaQ architecture-tier policy.
 
-SRC (Secure RAG Core) is a deliberately narrow retrieval/persistence boundary:
-Nextcloud/Elasticsearch documents, mandatory live Nextcloud ACL, at most one
-retrieval round, and no archive/web/vector/document-graph side channels. LLM roles may be
-local or remote according to administrator policy; remote evidence remains
-subject to the provider's hard egress caps. ERG is the broader Research Gate
-envelope.
+SRC (Secure RAG Core) is the deliberately narrow Nextcloud/Elasticsearch
+boundary: mandatory live Nextcloud ACL, one retrieval round, no SunaQ-owned
+persistent derived knowledge state and no external information acquisition.
+ERG Internal adds SunaQ-owned persistent derived state generated exclusively
+from the authoritative internal Nextcloud information space. ERG Full
+additionally permits external information acquisition and research egress.
+Model, reranker and embedding processing locality remains an orthogonal
+administrator decision.
 
 The architecture tier is independent from deployment packaging. Packaging may
 select defaults, but runtime validation and request gates enforce the boundary.
@@ -13,17 +15,28 @@ select defaults, but runtime validation and request gates enforce the boundary.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-import ipaddress
-import socket
 from typing import Any
-from urllib.parse import urlparse
 
 from rag.retrieval_planner import load_retrieval_planner_settings
 
 
 SRC = "src"
-ERG = "erg"
-VALID_TIERS = frozenset({SRC, ERG})
+ERG_INTERNAL = "erg_internal"
+ERG_FULL = "erg_full"
+
+# Backwards-compatible symbol: historical "ERG" meant the full ERG envelope.
+ERG = ERG_FULL
+
+_TIER_ALIASES = {
+    "erg": ERG_FULL,
+    "erg-internal": ERG_INTERNAL,
+    "erg-full": ERG_FULL,
+}
+VALID_TIERS = frozenset({SRC, ERG_INTERNAL, ERG_FULL})
+
+LOCAL_RESOLVER_ADAPTERS = frozenset({"neo4j"})
+EXTERNAL_RESOLVER_ADAPTERS = frozenset({"openplz", "openregister"})
+
 
 SRC_ALLOWED_SOURCE_SCOPES = frozenset({"documents"})
 SRC_ALLOWED_RETRIEVAL_ARMS = frozenset({"files"})
@@ -31,11 +44,8 @@ SRC_ALLOWED_RETRIEVAL_ARMS = frozenset({"files"})
 SRC_BLOCKED_API_PREFIXES = (
     "/web/",
     "/source-origin/register-chat",
-    "/graph/document",
-    "/graph/enqueue-evidence",
-    "/graph/research-findings",
-    "/graph/queue/",
-    "/graph/index-evidence",
+    "/graph/",
+    "/query-context",
 )
 
 
@@ -56,26 +66,86 @@ def _truthy(value: Any, default: bool = False) -> bool:
     return str(value).strip().casefold() in {"1", "true", "yes", "on"}
 
 
+def normalize_architecture_tier(value: Any) -> str:
+    """Return the canonical architecture tier, preserving unknown values."""
+    raw = str(value or ERG_FULL).strip().casefold()
+    return _TIER_ALIASES.get(raw, raw)
+
+
 def architecture_tier(cfg: Mapping[str, Any]) -> str:
-    # Existing installations predate this field and are ERG-capable, so ERG is
-    # the compatibility default. Fresh core presets set SRC explicitly.
-    return str(_get(cfg, "architecture.tier", ERG) or ERG).strip().casefold()
+    # Existing installations used "erg"; normalize that legacy value to the
+    # new ERG Full envelope rather than silently reducing capabilities.
+    return normalize_architecture_tier(_get(cfg, "architecture.tier", ERG_FULL))
 
 
 def is_src(cfg: Mapping[str, Any]) -> bool:
     return architecture_tier(cfg) == SRC
 
 
+def is_erg_internal(cfg: Mapping[str, Any]) -> bool:
+    return architecture_tier(cfg) == ERG_INTERNAL
+
+
+def is_erg_full(cfg: Mapping[str, Any]) -> bool:
+    return architecture_tier(cfg) == ERG_FULL
+
+
+def allows_external_research(cfg: Mapping[str, Any]) -> bool:
+    """Whether public/external retrieval and resolver adapters are permitted."""
+    return is_erg_full(cfg)
+
+
+def allowed_resolver_sources(
+    cfg: Mapping[str, Any],
+    sources: Iterable[str] | None,
+) -> tuple[str, ...]:
+    requested = tuple(
+        sorted(
+            {
+                str(value).strip().casefold()
+                for value in (sources or ())
+                if str(value).strip()
+            }
+        )
+    )
+    tier = architecture_tier(cfg)
+    if tier == SRC:
+        return ()
+    if tier == ERG_INTERNAL:
+        return tuple(
+            value for value in requested if value in LOCAL_RESOLVER_ADAPTERS
+        )
+    return requested
+
+
 def validate_architecture_config(cfg: Mapping[str, Any]) -> list[str]:
     tier = architecture_tier(cfg)
     if tier not in VALID_TIERS:
         return [
-            f"architecture.tier must be one of {sorted(VALID_TIERS)!r}, got {tier!r}"
+            "architecture.tier must be one of "
+            f"{sorted(VALID_TIERS)!r} (legacy alias 'erg' is accepted), got {tier!r}"
         ]
-    if tier != SRC:
-        return []
 
     errors: list[str] = []
+    if tier == ERG_FULL:
+        return errors
+
+    policy_web = str(
+        _get(cfg, "retrieval_policy.web", "disabled") or ""
+    ).strip().casefold()
+    if tier == ERG_INTERNAL:
+        if policy_web != "disabled":
+            errors.append("ERG Internal requires retrieval_policy.web=disabled")
+        if _truthy(_get(cfg, "mail.enabled", False), False):
+            errors.append("ERG Internal requires mail.enabled=false")
+        if _truthy(_get(cfg, "mail.worker.enabled", False), False):
+            errors.append("ERG Internal requires mail.worker.enabled=false")
+        if _truthy(_get(cfg, "delegated_research.enabled", False), False):
+            errors.append("ERG Internal requires delegated_research.enabled=false")
+        return errors
+
+    # SRC: Elasticsearch/Nextcloud only; no SunaQ-owned secondary retrieval or
+    # resolution state.
     if not _truthy(_get(cfg, "acl.enabled", False), False):
         errors.append("SRC requires acl.enabled=true")
 
@@ -88,10 +158,6 @@ def validate_architecture_config(cfg: Mapping[str, Any]) -> list[str]:
     policy_graph = str(
         _get(cfg, "retrieval_policy.internal.graph", "disabled") or ""
     ).strip().casefold()
-    policy_web = str(
-        _get(cfg, "retrieval_policy.web", "disabled") or ""
-    ).strip().casefold()
-
     if policy_files == "disabled":
         errors.append("SRC requires retrieval_policy.internal.files to remain enabled")
     if policy_vector != "disabled":
@@ -103,6 +169,8 @@ def validate_architecture_config(cfg: Mapping[str, Any]) -> list[str]:
 
     disabled_flags = (
         ("qdrant.enabled", True),
+        ("neo4j.enabled", False),
+        ("resolver.enabled", False),
         ("sync_worker.enabled", True),
         ("sync.graph_queue.enabled", False),
         ("graph_queue.enabled", True),
@@ -131,7 +199,15 @@ def request_capability_error(
     source_scopes: Iterable[str] | None = None,
     web_requested: bool = False,
 ) -> str | None:
-    if not is_src(cfg):
+    tier = architecture_tier(cfg)
+    if tier == ERG_FULL:
+        return None
+    if tier == ERG_INTERNAL and web_requested:
+        return (
+            "Diese SunaQ-Installation läuft als ERG Internal; öffentliche "
+            "Web-Recherche und andere externe Research-Arme erfordern ERG Full."
+        )
+    if tier == ERG_INTERNAL:
         return None
 
     requested_sources = {
@@ -183,41 +259,15 @@ def effective_retrieval_arms(
 
 
 def api_path_blocked(cfg: Mapping[str, Any], path: str) -> bool:
-    if not is_src(cfg):
-        return False
     normalized = "/" + str(path or "").lstrip("/")
+    tier = architecture_tier(cfg)
+    if tier == ERG_FULL:
+        return False
+    if tier == ERG_INTERNAL:
+        return normalized == "/web" or normalized.startswith("/web/")
     return any(
         normalized == prefix.rstrip("/") or normalized.startswith(prefix)
         for prefix in SRC_BLOCKED_API_PREFIXES
-    )
-
-
-def _remote_endpoint(url: str) -> bool:
-    """Return True unless the endpoint resolves exclusively inside local/private space."""
-    host = (urlparse(str(url or "")).hostname or "").strip().casefold()
-    if not host:
-        return True
-    if host in {"localhost", "localhost.localdomain"}:
-        return False
-    try:
-        addresses = [ipaddress.ip_address(host)]
-    except ValueError:
-        try:
-            infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-        except socket.gaierror:
-            return True
-        addresses = []
-        for item in infos:
-            try:
-                addresses.append(ipaddress.ip_address(item[4][0]))
-            except (ValueError, IndexError):
-                return True
-        if not addresses:
-            return True
-
-    return any(
-        not (address.is_loopback or address.is_private or address.is_link_local)
-        for address in addresses
     )
 
 
@@ -227,10 +277,10 @@ def validate_role_backends(
 ) -> list[str]:
     """Validate role routing against architecture-tier invariants.
 
-    SRC constrains retrieval sources, derived state and retrieval complexity, but
-    it does not require zero model egress. Administrators may deliberately route
-    planner/verifier/evidence/answer roles to remote providers; the provider's
-    remote evidence caps remain the data-minimization boundary for those calls.
+    Architecture tiers constrain information sources, SunaQ-owned derived state
+    and retrieval complexity. Processing locality is orthogonal: administrators
+    may deliberately route planner/verifier/evidence/answer, reranker or
+    embedding work to remote providers without changing the tier.
     """
 
     del cfg, backends
@@ -238,9 +288,50 @@ def validate_role_backends(
 
 
 def validate_runtime_model(cfg: Mapping[str, Any], model: Any) -> list[str]:
-    if not is_src(cfg):
+    tier = architecture_tier(cfg)
+    if tier == ERG_FULL:
         return []
+
     errors: list[str] = []
+    if tier == ERG_INTERNAL:
+        try:
+            capabilities = dict(model.section("capabilities") or {})
+        except Exception:
+            capabilities = {}
+        if capabilities.get("web") is True:
+            errors.append(
+                f"ERG Internal does not permit Web capability; model "
+                f"{getattr(model, 'model_id', '<unknown>')!r} enables web"
+            )
+        try:
+            research = dict(model.section("research") or {})
+        except Exception:
+            research = {}
+        web_backend = str(research.get("web_backend") or "").strip().casefold()
+        if web_backend and web_backend != "none":
+            errors.append(
+                f"ERG Internal does not permit external Web backends; model "
+                f"{getattr(model, 'model_id', '<unknown>')!r} selects {web_backend!r}"
+            )
+        try:
+            resolver_research = dict(model.section("resolver_research") or {})
+        except Exception:
+            resolver_research = {}
+        resolver_sources = {
+            str(value).strip().casefold()
+            for value in (resolver_research.get("sources") or ())
+            if str(value).strip()
+        }
+        external_sources = sorted(resolver_sources - LOCAL_RESOLVER_ADAPTERS)
+        if external_sources:
+            errors.append(
+                f"ERG Internal permits only local resolver adapters; model "
+                f"{getattr(model, 'model_id', '<unknown>')!r} requests "
+                + ", ".join(external_sources)
+            )
+        return errors
+
+    # SRC model constraints.
     try:
         model_config = getattr(model, "config", None)
         if isinstance(model_config, Mapping):
@@ -260,17 +351,4 @@ def validate_runtime_model(cfg: Mapping[str, Any], model: Any) -> list[str]:
             f"{getattr(model, 'model_id', '<unknown>')!r} requests {rounds}"
         )
 
-    try:
-        reranker = dict(model.section("reranker") or {})
-    except Exception:
-        reranker = {}
-    backend = str(reranker.get("backend") or "none").strip().casefold()
-    if backend == "tei":
-        tei_url = str(reranker.get("tei_url") or "").strip()
-        if not tei_url or _remote_endpoint(tei_url):
-            errors.append(
-                f"SRC requires a local reranker; model "
-                f"{getattr(model, 'model_id', '<unknown>')!r} uses TEI endpoint "
-                f"{tei_url or '<unset>'!r}"
-            )
     return errors

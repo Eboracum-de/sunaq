@@ -13,8 +13,10 @@ from typing import Any
 
 from rag.retrieval_planner import normalize_query_frame
 
+# Keep the legacy provenance code stable because it participates in
+# deterministic Finding IDs and therefore identifies existing graph data.
 PROVENANCE_CODE = "aki_research"
-PROVENANCE_LABEL = "AKI Recherche"
+PROVENANCE_LABEL = "SunaQ Recherche"
 
 
 def _clean(value: Any, limit: int = 500) -> str:

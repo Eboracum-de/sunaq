@@ -61,3 +61,79 @@ def test_exhaustive_verifier_fails_closed_to_uncertain(monkeypatch):
     assert len(uncertain) == 1
     assert meta["uncertain"] == 1
     assert "error" in meta
+
+
+def test_answer_candidates_use_uncertain_only_when_no_match():
+    match = provider.SearchResult(index=1, title="match.pdf", text="confirmed", raw={})
+    uncertain = provider.SearchResult(
+        index=2,
+        title="hint.pdf",
+        text="Grundbuch von Friedrichstadt Blatt 3216",
+        raw={"verification_status": "uncertain"},
+    )
+
+    selected, uncertain_only = provider._answer_candidates_from_verification(
+        [match], [uncertain]
+    )
+    assert selected == [match]
+    assert uncertain_only is False
+
+    selected, uncertain_only = provider._answer_candidates_from_verification(
+        [], [uncertain]
+    )
+    assert selected == [uncertain]
+    assert uncertain_only is True
+
+    selected, uncertain_only = provider._answer_candidates_from_verification([], [])
+    assert selected == []
+    assert uncertain_only is False
+
+
+def test_uncertain_only_answer_prompt_preserves_groundbook_clues_without_upgrading_match():
+    result = provider.SearchResult(
+        index=1,
+        title="Blatt-3216.pdf",
+        text=(
+            "Amtsgericht Tempelhof-Kreuzberg. Grundbuch von Friedrichstadt. "
+            "Blatt 3216. Musterstraße 44, 10969 Berlin."
+        ),
+        raw={"document_id": "files:3216", "verification_status": "uncertain"},
+    )
+    context, included = provider._build_context([result])
+    messages = provider._rag_answer_messages(
+        "Grundbuchauszug Musterstraße 44 in Berlin",
+        "Grundbuchauszug Musterstraße 44 in Berlin",
+        context,
+        uncertain_only=True,
+    )
+
+    assert included == [result]
+    system = messages[0]["content"]
+    assert "AUSSCHLIESSLICH UNSICHERE INTERNE TREFFER" in system
+    assert "kein eindeutiger bzw." in system
+    assert "könnte entsprechen" in system
+    assert "Blatt 3216" in system
+    assert "Musterstraße 44" in system
+
+
+def test_uncertain_only_answer_guard_not_added_for_confirmed_matches():
+    messages = provider._rag_answer_messages(
+        "Grundbuchblatt 3216 Kreuzberg",
+        "Grundbuchblatt 3216 Kreuzberg",
+        "[]",
+    )
+    assert "AUSSCHLIESSLICH UNSICHERE INTERNE TREFFER" not in messages[0]["content"]
+
+
+def test_hybrid_answer_keeps_internal_uncertainty_separate_from_web_evidence():
+    messages = provider._hybrid_web_answer_messages(
+        "Grundbuchauszug Musterstraße 44",
+        "Grundbuchauszug Musterstraße 44",
+        '[{"citation":"[1]","text":"Grundbuch von Friedrichstadt Blatt 3216"}]',
+        '[{"citation":"[W1]","text":"öffentliche Quelle"}]',
+        internal_uncertain_only=True,
+    )
+    system = messages[0]["content"]
+    assert "AUSSCHLIESSLICH UNSICHERE INTERNE TREFFER" in system
+    assert "Öffentliche Web-Evidence" in system
+    assert "Blatt 3216" in messages[1]["content"]

@@ -18,16 +18,16 @@ Three shipped profiles are exposed through the authenticated OpenAI-compatible
 
 | Display name | Model ID | Verification window | Answer context |
 | --- | --- | ---: | ---: |
-| Schnell | `sunaq-standard` | 10 | 10 documents / 25k chars |
-| Gründlich | `sunaq-thorough` | 30 | 30 documents / 100k chars |
-| Tief | `sunaq-deep` | 50 | 50 documents / 200k chars |
+| Standard (Schnell) | `sunaq-standard` | 10 | 10 documents / 25k chars |
+| Thorough (Gründlich) | `sunaq-thorough` | 30 | 30 documents / 100k chars |
+| Deep (Tief) | `sunaq-deep` | 50 | 50 documents / 200k chars |
 
 The current rc1 experiment deliberately changes **budget only**. All three
 profiles use one retrieval round, Evidence Review is off and planner thinking is
 off. Additional retrieval rounds and model reasoning are separate future
 experiments.
 
-Schnell is the default entitlement. Gründlich and Tief are enabled per user in
+Standard (Schnell) is the default entitlement. Thorough (Gründlich) and Deep (Tief) are enabled per user in
 SunaQ Admin. The provider exposes only models currently allowed for the
 authenticated user.
 
@@ -60,7 +60,7 @@ Nextcloud client renders them as compact action buttons.
 
 Examples:
 
-- `Mit Tief erneut suchen` only when a strictly stronger profile is currently
+- `Retry with Deep` (`Mit Tief erneut suchen`) only when a strictly stronger profile is currently
   allowed for the user;
 - `Anfrage präzisieren` for broad/unspecific or capacity-limited searches;
 - evidence-control clarification options where that mode is used.
@@ -139,7 +139,7 @@ Existing `provider.env` files are also preserved. If an upgraded 0.8.5
 installation explicitly contains legacy `REMOTE_*` data-exposure caps, 0.8.6
 continues to enforce them as tighter limits for packaged SunaQ profiles. Fresh
 0.8.6 templates instead expose `SUNAQ_REMOTE_HARD_*` ceilings and leave the
-legacy variables unset. Administrators who want Gründlich/Tief to use their
+legacy variables unset. Administrators who want Thorough (Gründlich) / Deep (Tief) to use their
 larger remote budgets after an upgrade must review and deliberately remove or
 raise the preserved legacy caps.
 
@@ -160,7 +160,7 @@ The rc1 release candidate has completed the planned pre-public validation:
 - GitHub CI is green on the release-freeze branch;
 - a fresh Super-Light installation was exercised against a real Nextcloud /
   Elasticsearch estate;
-- Schnell, Gründlich and Tief were exercised with real data, including the
+- Standard (Schnell), Thorough (Gründlich) and Deep (Tief) were exercised with real data, including the
   bundled SunaQ Recherche client;
 - the final CodeRabbit review findings were verified against current code and
   all review threads are resolved;

@@ -195,7 +195,7 @@ def _fake_unspecific_search_result():
         "results": [
             {
                 "document_id": "files:100",
-                "title": "Vogelsang 280",
+                "title": "Musterweg 280",
                 "context_text": "Treffer",
             }
         ],
@@ -220,7 +220,7 @@ def test_unspecific_feedback_is_hidden_when_acl_authorizes_zero_candidates(monke
     )
 
     payload = api.search(
-        api.SearchRequest(query="Suche Informationen über die Vogelsang 280"),
+        api.SearchRequest(query="Suche Informationen über die Musterweg 280"),
         _request({"X-RAG-User-ID": "user-2"}),
     )
     assert payload["results"] == []
@@ -243,7 +243,7 @@ def test_unspecific_feedback_survives_only_with_acl_visible_candidate(monkeypatc
     )
 
     payload = api.search(
-        api.SearchRequest(query="Suche Informationen über die Vogelsang 280"),
+        api.SearchRequest(query="Suche Informationen über die Musterweg 280"),
         _request({"X-RAG-User-ID": "user-1"}),
     )
     assert payload["results"] == []

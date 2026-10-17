@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.8.7-rc1 – 2026-10-17
+- Finalize the first public 0.8.7 release-candidate runtime identifier as `0.8.7-rc1` across Admin, API and Provider surfaces; internal development branch numbering is not exposed as the release version.
+- Release the bundled Nextcloud app as 0.3.16 with **Dateinamen mit SunaQ vorschlagen** in Files: keep the NC23-25 legacy action path, add compatibility adapters for the NC26-32 and NC33+ Files action generations, keep file IDs string-safe, require explicit user confirmation, and execute the rename through Nextcloud's Node API.
+- Dot-prefixed Nextcloud files are treated as machine metadata and excluded from normal RAG evidence, Qdrant sync and GraphQueue processing; this prevents hidden chat/research sidecars from re-entering the semantic corpus.
+- Installer reruns now apply a centralized, non-destructive config upgrade pass for required operational defaults (including persistent sync state/status paths and `sync_worker.pause_check_documents: 25`). Explicit administrator values and optional capability/policy choices are preserved; manual deployments receive `config_check` warnings when they still rely on implicit sync defaults.
+
+- Refine the architecture into three enforced information/data envelopes: SRC has no SunaQ-owned persistent derived knowledge store or external information acquisition; ERG Internal adds SunaQ-owned derived state from the authoritative internal Nextcloud information space; ERG Full additionally permits external information ingress and research egress. Add explicit `--architecture-tier src|erg-internal|erg-full`; keep `core|workgroup|full` as recommended capability presets and `standard|dockerized` as an independent deployment axis. LLM/reranker/embedding processing locality remains orthogonal.
+- Align the ERG Internal `workgroup` preset with that boundary by disabling Mail import/worker there; Mail, public Web, Delegated Research and external resolver capability belong to ERG Full. Document a future central Derived Reconciler as target architecture only; 0.8.7 keeps the existing component-specific Qdrant/CardDAV/Graph/Findings lifecycle mechanisms.
+- Simplify installer composition: tier-only fresh installs are bare, named presets are atomic shortcuts, positive `--with-*` switches build custom combinations, and negative component switches are reserved for rerun/removal operations.
+- Add deployment-neutral runtime gates for Sync and Mail workers. Fresh installs seed both paused; the Admin UI can release/pause them without rewriting `config.yaml` or requiring Docker/systemd privileges.
+- Add protected Admin `System` diagnostics and a read-only, document-centric `Vektor`/Qdrant overview. Running vector syncs now honor runtime pause cooperatively at configurable document-batch boundaries (default 25), without treating the interrupted traversal as a complete stale-cleanup pass. The Vector page shows raw Elasticsearch document count, vectorized document count, Qdrant chunks and last-sync exclusions/deferred work without querying Nextcloud; HNSW indexing remains a technical detail. Maintenance switching and cross-deployment service log control remain host-operator functions in this RC to avoid granting the Admin container host-service privileges.
+- Make the operational entrypoints explicitly deployment-independent: Dockerized now installs the same top-level `start-all.sh`, `stop-all.sh` and `status.sh` as Standard; the legacy Dockerized status helper forwards to common status, and operator-facing output uses `standard|dockerized` while retaining internal `native` compatibility.
+- Change Sync/Mail runtime gates to fail closed: missing runtime control means paused, and installer runs seed absent control state with both workers paused. Leaving maintenance may start the worker process/container, but it performs no work until explicitly released.
+- Make Admin System diagnostics use Provider `/live` for liveness and keep the more expensive `/health` as detail diagnostics; LLM role health probes now run concurrently to avoid false timeouts.
+- Make SearchSpec/query-rewriter prompts model-owned alongside planner/verifier/evidence/answer prompts, and add ERG Internal/Full parity coverage for ordinary internal document research.
+- Make `workgroup` and `full` atomic ERG bundles include local Qdrant/vector capability; the sync worker is configured but remains runtime-paused until explicitly released.
+- Separate capability policy from infrastructure availability. ERG Internal/Full permit vector retrieval as optional without forcing `qdrant.enabled`; baseline document-graph retrieval remains separately disabled even where Neo4j is available for resolver/Findings functions.
+- Introduce explicit Provider/Orchestrator, Resolver, SRC Retriever and ERG Retriever boundaries and continue the modular-first extraction from the historical provider/middleware monolith.
+- Make normal query planning backend-neutral. SearchSpec now carries entities, entity hints, concepts, required/optional concept groups, constraints, semantic query and verification requirements; the planner no longer owns Elasticsearch syntax.
+- Add deterministic lexical compilation for structured intent. Required concept alternatives compile to MUST(OR(...)) groups, explicit entities become required lexical groups and safe literal constraints such as years/identifiers/filenames are added deterministically where applicable.
+- Remove the normal short-query Fast Path from SearchSpec execution and add regression coverage for first-round structured intent, including the case where an entity plus a required document/concept criterion must survive through to Elasticsearch.
+- Fix the Provider → API SearchSpec transport so `concept_groups` and `entity_hints` are preserved instead of being silently dropped by the API request model.
+- Tighten planner validation so recognized concepts cannot silently degrade into entity-only Files retrieval when their concept groups are omitted.
+- Repair ResearchRun reservation/persistence lifecycle. Run-root writers can materialize a locally reserved run, and provenance-only writes are queued after run-start persistence rather than racing it.
+- Replace `retrieval-decision.v1.json` with lean `retrieval-decision.v2.json`, removing legacy/redundant planner/effective-plan backend-syntax fields.
+- Add `retrieval-execution.v1.json` for actual query/execution provenance with an explicit post-live-ACL private-document boundary. Executed queries may be retained, while portable records exclude raw hit counts, denied candidate identities, pre-ACL ES/RRF/vector ranks and backend scores.
+- Harden ResearchRun `documents.json` to the same authorized-rank projection; verifier decisions are persisted only for ACL-authorized document IDs.
+- Add an architecture whitepaper and refresh SRC/ERG, architecture, retrieval, technical-reference, privacy, threat-model, lifecycle, administration, installation and known-limitations documentation around the current 0.8.7-rc1 design.
+- Fix Standard/native Qdrant smoke diagnostics to use the deployment-neutral installation-relative `config.yaml` path instead of Docker-only `/app/config.yaml`; preserve executable mode for operator entrypoints and explicitly install `smoke-test.sh` / `maintenance-mode.sh` as executable.
+- Harden backup/restore for the 0.8.7 state model: include administrator-owned `models/`, current Dockerized installer state, worker control, proxy internal-auth state and configured non-rebuildable SQLite state; retain bundled Neo4j snapshots, keep Qdrant derived data outside the recovery set, and exclude/reset the associated vector sync state so disaster recovery cannot falsely treat an absent Qdrant collection as synchronized.
+- Restore the durable ResearchRun dossier outbox and shared Nextcloud DAV writer from the validated rc1 development line: provenance writes are committed to `runtime/dossier_queue.sqlite`, delivered in per-conversation order, recovered across provider restarts and retried with bounded backoff on transient WebDAV `423 Locked` responses. Web snapshot and dossier writers share the same DAV lock-handling transport.
+
+
 ## 0.8.6-rc1.2 – 2026-09-26
 
 - Replace delimiter-based retrieved-document context with server-generated JSON evidence records for answer, Candidate Verifier, Evidence Controller and Web relevance/answer paths. Add an immutable Python-side untrusted-evidence guard so profile/prompt overrides cannot remove the rule that retrieved content is data rather than instruction.
@@ -36,9 +69,9 @@
 
 ## 0.8.6-rc1 – 2026-09-24
 
-- Introduce SunaQ user-facing research profiles `Schnell`, `Gründlich` and `Tief` with stable ordering and per-user model entitlements exposed through authenticated `/v1/models`.
+- Introduce SunaQ user-facing research profiles `Standard (Schnell)`, `Thorough (Gründlich)` and `Deep (Tief)` with stable ordering and per-user model entitlements exposed through authenticated `/v1/models`.
 - Move request-local search/planner/evidence/retrieval-signal/entity-resolution/graph/reranker/context/answer-context settings into startup-loaded `models/<profile>/profile.yaml` packages with model-specific prompt packs and request-local LLM-role routing.
-- Keep the initial rc1 profile experiment budget-only: one retrieval round for all shipped profiles, Evidence Review off and planner thinking off; candidate/answer windows are 10/30/50 documents for Schnell/Gründlich/Tief.
+- Keep the initial rc1 profile experiment budget-only: one retrieval round for all shipped profiles, Evidence Review off and planner thinking off; candidate/answer windows are 10/30/50 documents for Standard/Thorough/Deep (Schnell/Gründlich/Tief).
 - Separate legacy remote safety caps from packaged SunaQ profile budgets and add administrator hard ceilings so stronger profiles are not silently flattened back to the legacy 10-candidate/8-document path.
 - Add near-capacity retrieval warnings distinct from hard known-overflow warnings; add verifier batch progress such as `Prüfe Dokumente 11–15 von 48 …`.
 - Add deterministic provider follow-up actions and render them in SunaQ Recherche; stronger-model reruns are offered only when a strictly stronger profile is currently allowed for the authenticated user, while broad/unspecific retrieval can offer `Anfrage präzisieren`.
@@ -50,7 +83,7 @@
 - Make Super-Light smoke diagnostics maintenance-aware: Neo4j and Playwright are reported as intentionally deferred until maintenance mode is disabled instead of producing a false post-install failure/warning.
 - Align Qdrant source-origin filtering with Elasticsearch semantics for explicit document/archive scopes while retaining path-based fallback for legacy untagged chunks.
 - Refresh 0.8.6 architecture/install/client/profile/release documentation and retain the live-Nextcloud-ACL security invariant.
-- Final rc1 hardening fixes request-local Graph/Entity/Reranker profile application, preserves explicit legacy remote-data caps on upgrades, prevents cross-owner progress-ID replacement, keeps explicit preserved result sets intact, aligns the Gründlich rerank window to 30, excludes `.sunaq.json` sidecars before Elasticsearch candidate limiting, and fixes retained legacy install/chat-archive paths.
+- Final rc1 hardening fixes request-local Graph/Entity/Reranker profile application, preserves explicit legacy remote-data caps on upgrades, prevents cross-owner progress-ID replacement, keeps explicit preserved result sets intact, aligns the Thorough (Gründlich) rerank window to 30, excludes `.sunaq.json` sidecars before Elasticsearch candidate limiting, and fixes retained legacy install/chat-archive paths.
 
 ## 0.8.5-rc5.1 – 2026-09-22
 
@@ -174,7 +207,7 @@ Planned follow-up work is tracked in `docs/ROADMAP.md`.
 - Make the smoke test deployment-profile aware: dockerized Super-Light no longer fails for a missing host Python venv, configured-off Qdrant is reported as disabled, and Playwright renderer degradation is reported separately.
 - Keep the optional Playwright renderer service alive when Chromium itself fails to launch, exposing the launch error through its live endpoint instead of entering a restart loop; Web search and non-rendered archive output remain available.
 - Expose an explicit diagnostic reason when per-user Web archiving is disabled or has no target path.
-- Allow a deliberately narrow web-only follow-up rewrite for short acronyms when the immediately preceding user query used the exact acronym inside a longer entity name (for example, FLG after FLG Automation), without enabling general chat-topic carry-over.
+- Allow a deliberately narrow web-only follow-up rewrite for short acronyms when the immediately preceding user query used the exact acronym inside a longer entity name (for example, ACME after ACME Automation), without enabling general chat-topic carry-over.
 
 - Replace the corpus-wide Findings inbox with user-scoped ResearchRun curation: `CanonicalUser -> ResearchRun -> ResearchFinding -> Document`. ResearchRuns retain original query provenance while equivalent Findings remain globally deduplicated and reuse one shared curation decision.
 - Apply current-user Nextcloud live ACL before Admin or end-user Finding evidence is listed or opened; unauthorized Findings are omitted from counts and legacy global no-entity suppression is no longer a user-context bypass.

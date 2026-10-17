@@ -35,7 +35,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-chmod 700 "$new_secret_dir"
+# The runtime root remains private (0700), but helper containers bind-mount this
+# subdirectory directly and run under fixed, non-host UIDs.  Allow traversal of
+# known secret paths without allowing directory listing; individual file modes
+# remain the read-authorization boundary inside those containers.
+chmod 700 "$PREFIX/runtime"
+chmod 0711 "$new_secret_dir"
 chown "$owner" "$new_secret_dir"
 
 is_secret_key() {
@@ -188,6 +193,14 @@ for key in "${!secret_names[@]}"; do
   printf '%s_FILE=/run/sunaq-secrets/%s\n' "$key" "$key" >> "$container_tmp"
   printf '%s_FILE=%q\n' "$key" "$SECRET_DIR/$key" >> "$service_tmp"
 done
+
+# The resolver image runs as uid/gid 10002. Keep its OpenRegister key
+# host-owner controlled while granting only that container group read access.
+if [[ -n "${secret_names[OPENREGISTER_API_KEY]+x}" ]]; then
+  openregister_secret="$new_secret_dir/OPENREGISTER_API_KEY"
+  chmod 0440 "$openregister_secret"
+  chown "${owner%%:*}:10002" "$openregister_secret"
+fi
 
 # Neo4j supports NEO4J_AUTH_FILE, whose file contains user/password together.
 if [[ -n "${secret_names[NEO4J_PASSWORD]+x}" ]]; then

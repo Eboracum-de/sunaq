@@ -1,6 +1,6 @@
 # Privacy architecture and trust boundary
 
-**Reference:** `0.8.6-rc1.1`
+**Reference:** `0.8.7-rc1` release candidate
 
 The middleware deliberately separates access to the complete private corpus from
 processing of already selected evidence. Privacy is therefore not defined as
@@ -24,6 +24,8 @@ authorization pipeline is eligible for transmission to a remote verifier/answer
 role. Query-rewrite roles may also receive the user query and bounded shared
 identity/alias context according to configuration; that context is retrieval
 knowledge, not document evidence.
+
+The same boundary applies to portable retrieval provenance. Backend queries may be recorded, but ResearchRun candidate/verifier provenance for private documents starts after live ACL. Raw pre-ACL hit counts, denied candidate identities, backend ranks and scores remain operator diagnostics rather than user-visible ResearchRun metadata.
 
 ```text
 Nextcloud / Elasticsearch
@@ -58,18 +60,20 @@ The current reference can route four LLM roles independently:
 Unset role settings inherit the canonical `LLM_*` backend for compatibility. Each role can override backend, URL, model, API key, TLS verification
 and trust scope through `<ROLE>_LLM_*` variables.
 
-The `evidence` role remains available even though the **Evidence Control** stage is disabled by default. For packaged SunaQ models, opt in per selected model with `models/<profile>/profile.yaml: evidence_control.mode: review`; the evidence model then runs only after live ACL and Candidate Verification. The Candidate Verifier is a separate stage and is unaffected by this switch. The shipped Schnell profile may additionally consume a preserved legacy `config.yaml: evidence_control` value through its explicit `legacy_config_overlay` upgrade bridge. `EVIDENCE_DECISION_MODE` is only the legacy/default fallback when no effective packaged-profile value is present.
+The `evidence` role remains available even though the **Evidence Control** stage is disabled by default. For packaged SunaQ models, opt in per selected model with `models/<profile>/profile.yaml: evidence_control.mode: review`; the evidence model then runs only after live ACL and Candidate Verification. The Candidate Verifier is a separate stage and is unaffected by this switch. The shipped Standard (Schnell) profile may additionally consume a preserved legacy `config.yaml: evidence_control` value through its explicit `legacy_config_overlay` upgrade bridge. `EVIDENCE_DECISION_MODE` is only the legacy/default fallback when no effective packaged-profile value is present.
 
 A practical `private-retrieval` deployment keeps embedding, Qdrant, reranking
 and ACL local while using a capable remote model for verifier/evidence/answer.
 A `strict-local` deployment points all roles at a local provider instead.
 
-Within the SRC/ERG architecture concept, **SRC prefers local model processing but
-does not require zero egress**. Remote model roles can remain compatible with SRC
-when the administrator deliberately accepts the disclosure and the configured
-remote evidence caps bound what is transmitted. ERG is distinguished primarily
-by opt-in sources, derived state and more complex retrieval/graph capabilities,
-not merely by the existence of a remote LLM endpoint.
+Within the three-tier architecture, **SRC does not require zero model egress**.
+Remote model roles can remain compatible with SRC when the administrator
+deliberately accepts the disclosure and configured evidence caps bound what is
+transmitted. The retrieval/data-plane distinction is instead: SRC has no
+SunaQ-owned secondary retrieval state; ERG Internal adds local derived
+retrieval/resolution state; ERG Full additionally permits external
+research/resolution boundaries. Model-processing and embedding egress remain
+orthogonal policy decisions.
 
 ## Remote evidence budgets
 
@@ -114,18 +118,62 @@ extractor. Administrators may still enqueue/process graph jobs deliberately.
 
 ## Public Web Research
 
-Public Web Research is separate from the private corpus. Search results are
-fetched first; only actually fetched content can become evidence. Selected
-sources can be archived to the current user's Nextcloud via WebDAV. Archive TLS
-verification has its own `web.yaml: archive.verify_tls` setting because the
-archive write is a separate HTTP client path.
+Public Web Research is separate from the private corpus. The native SunaQ Web
+path searches and fetches sources itself; only actually fetched content can
+become evidence. Selected sources can be archived to the current user's
+Nextcloud via WebDAV. Archive TLS verification has its own
+`web.yaml: archive.verify_tls` setting because the archive write is a separate
+HTTP client path.
+
+ERG may alternatively delegate a **Web-only** request to a configured hosted
+Research Provider such as OpenAI. In this mode the external provider owns Web
+search and answer synthesis. The first delegated-research contract has no field
+for Nextcloud document evidence, retrieved document text or raw chat history.
+Only the effective public-Web query is transmitted; for a contextual follow-up
+that query may be the standalone query produced by SunaQ's normal follow-up
+rewrite. Both `outbound_query` and `pre_model_egress` policy hooks run before
+the request leaves SunaQ.
+
+**Important current limitation (October 2026):** The standalone-query rewrite
+may consume prior *assistant messages*, including earlier answers grounded in
+private Nextcloud documents. The delegated research adapter does not receive
+the raw chat history, but the rewritten query may nevertheless incorporate
+private details from those answers. Moreover, if the configured follow-up
+rewrite LLM is remote, that rewrite step itself can transmit the bounded chat
+history to an external LLM independently of the research adapter.
+
+0.8.7-rc1 has a deterministic, class-aware outbound egress policy. Public research
+queries use the `research_query` class and default to `guard`: known credential
+formats and administrator-configured identifier regexes are redacted before the
+query leaves SunaQ. This applies to Brave/SearX-style Web search, delegated
+research queries and external resolver references. Resolver-local ranking
+context remains local and is not redacted merely because the selected adapter is
+external.
+
+Remote planner/verifier/evidence/answer/follow-up calls use the separate
+`model_processing` class and default to `audit`, while external embeddings use
+`embedding` and default to `allow`. Administrators may change either class to
+`guard` or `block`, but SunaQ does not destructively redact those payloads by
+default because doing so can change verification, answer or vector semantics.
+This policy reduces accidental disclosure risk; it does **not** claim to detect
+all sensitive business facts or provide a complete DLP guarantee.
+
+A delegated Web-only request must not be confused with a future delegated hybrid
+mode. Sending internal Nextcloud evidence to a hosted Research Provider would
+cross an additional trust boundary and therefore requires an explicit
+data-egress grant and contract rather than reusing the public-only adapter.
+
+The normalized delegated provenance (provider/model, provider search queries,
+citations, consulted URLs and bounded usage metadata) may be stored in the
+current Nextcloud ResearchRun. Raw provider responses are not persisted by this
+path.
 
 ## Privacy/policy inspection hooks
 
-rc1.1 implements the generic hook points, but not concrete inspection adapters.
-The hooks sit at the privacy and trust boundaries where data leaves the
-controlled retrieval plane, untrusted content enters it, or SunaQ persists
-imported/generated content:
+The generic hook points remain the stable privacy/trust-boundary interface. 0.8.7-rc1
+runs the built-in egress policy through the outbound/model hook stages before
+any optional site-specific evaluator. The same hooks still cover untrusted
+content entering SunaQ and persistence boundaries:
 
 - `outbound_query` before a query is sent to Brave, SearXNG or another external
   search provider;
@@ -137,14 +185,16 @@ imported/generated content:
 - `pre_model_egress` before evidence/context is sent to a remote LLM or
   embedding service.
 
-The interface is intentionally adapter-neutral. The shipped rc1.1 evaluator
-returns `ALLOW` for every stage. A later deployment may attach malware scanning,
-URL/domain policy, ICAP, YARA, DLP/redaction or custom inspection services.
-Evaluator failures propagate rather than being bypassed, so a configured
-required adapter can fail closed.
+The interface is intentionally adapter-neutral. `config.yaml:egress` controls
+the built-in classes with `allow`, `audit`, `guard` or `block`; only
+`research_query` is guarded by default. A deployment may additionally attach
+malware scanning, URL/domain policy, ICAP, YARA, DLP/redaction or custom
+inspection services. Evaluator failures propagate rather than being bypassed, so
+a configured required adapter can fail closed.
 
-The existence of these hook points must not be cited as a current rc1.1 malware,
-DLP, URL-filtering or egress-control guarantee.
+The deterministic guard is not semantic confidentiality classification. Its
+presence must not be represented as a general malware, DLP or data-classification
+guarantee.
 
 ## Shared retrieval knowledge versus protected evidence
 

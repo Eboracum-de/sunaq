@@ -1,4 +1,4 @@
-# SunaQ Recherche 0.3.4
+# SunaQ Recherche 0.3.16
 
 Schlankes Nextcloud-23+-Frontend für SunaQ / Eboracum Research Gateway 0.8.6.
 
@@ -7,6 +7,8 @@ Schlankes Nextcloud-23+-Frontend für SunaQ / Eboracum Research Gateway 0.8.6.
 - server-side proxy with the current Nextcloud UID (`X-RAG-User-ID`); the provider key never reaches browser JavaScript;
 - authenticated model discovery through `/v1/models`; the selector exposes only profiles allowed for the current user;
 - compact chat composer with model selection, source chips and Enter-to-send;
+- end-to-end SSE streaming for the bundled browser client: the answer is rendered incrementally while the legacy JSON `/chat` path remains available as a compatibility fallback;
+- streaming is a Nextcloud-client transport choice only; OpenWebUI and other OpenAI-compatible clients continue to choose their own `stream` request value;
 - collapsible per-user research sidebar;
 - safe framework-free Markdown subset (no raw HTML);
 - request progress polling through the identity-scoped SunaQ status endpoint;
@@ -14,7 +16,7 @@ Schlankes Nextcloud-23+-Frontend für SunaQ / Eboracum Research Gateway 0.8.6.
   `Prüfe Dokumente 11–15 von 48 …`;
 - per user question: **Erneut senden** and **Bearbeiten & erneut senden**;
 - provider follow-up actions are rendered as compact buttons below the current
-  answer, for example **Mit Tief erneut suchen** or **Anfrage präzisieren**;
+  answer, for example **Retry with Deep** (`Mit Tief erneut suchen`) or **Refine query** (`Anfrage präzisieren`);
 - a stronger-model suggestion is shown only when a strictly stronger profile is
   currently allowed for that user;
 - visible context-boundary hint: unrelated topics should use a new chat;
@@ -100,3 +102,12 @@ optional Kontakt-DB synchronization.
   enable/disable switch layered below the global administrator gate.
 - 0.3.4: optional source chips are hidden by default and shown only after an
   authenticated capability check confirms that the source is available.
+- 0.3.7: inspectable pre-retrieval search strategy via the identity-scoped
+  request-status channel; fixes client request-ID correlation.
+- 0.3.8: retrieval strategy distinguishes requested resolver capabilities from
+  the effective administrator-granted resolver plan.
+- 0.3.9: strategy inspection also records planner-not-run/planner-failed states
+  and shows the effective retriever/source plan after hard policy gates.
+
+- 0.3.15: adds an NC23-compatible SSE proxy and incremental browser rendering; keeps the existing JSON chat endpoint as fallback and preserves provider follow-up actions through the request-status channel.
+- 0.3.16: adds the SunaQ filename-suggestion action to Nextcloud Files, keeping the NC23-25 legacy adapter and adding separate current Files adapters for NC26-32 and NC33+; rename remains user-confirmed and is executed through Nextcloud's Node API.

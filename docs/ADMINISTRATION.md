@@ -4,7 +4,7 @@ This document covers the administrator-owned runtime state introduced for the
 multi-user beta. Normal administration should use the Admin UI or CLI. Direct
 SQLite changes are a diagnostic/emergency tool only.
 
-Fresh 0.8.6 installations use `/opt/sunaq` in the command examples below. A recognized legacy installation retains its existing installation prefix (for example `/opt/nextcloud-rag`); substitute that retained prefix consistently in commands and paths.
+Fresh 0.8.7-rc1 installations use `/opt/sunaq` in the command examples below. A recognized legacy installation retains its existing installation prefix (for example `/opt/nextcloud-rag`); substitute that retained prefix consistently in commands and paths.
 
 ## 1. SunaQ Admin and user UI paths
 
@@ -70,8 +70,8 @@ client_id::external_user_id
 
 SunaQ model entitlement is separate from Nextcloud document authorization.
 
-**Schnell** (`sunaq-standard`) is the safe default. Administrators may enable
-**Gründlich** and/or **Tief** per canonical user in **SunaQ Admin → Users** and may
+**Standard (Schnell)** (`sunaq-standard`) is the safe default. Administrators may enable
+**Thorough (Gründlich)** and/or **Deep (Tief)** per canonical user in **SunaQ Admin → Users** and may
 choose that user's default profile. The provider's authenticated `/v1/models`
 response returns only currently allowed profiles.
 
@@ -316,8 +316,8 @@ The mail worker is not started by the fresh-install baseline. It becomes active
 only after the administrator enables both `mail.enabled` and
 `mail.worker.enabled` and starts/enables the worker service. Native non-systemd
 `start-all.sh` does this automatically from the configuration; systemd
-deployments use `systemctl enable --now rag-mail-worker`, and Super-Light uses
-`docker compose up -d mail-worker` from `install/super-light/`.
+deployments use `systemctl enable --now rag-mail-worker`, and Dockerized deployments
+use `docker compose up -d mail-worker` from `install/dockerized/`.
 
 When active, the worker polls every enabled account across all enabled canonical
 users; a broken/missing credential for one user does not intentionally redefine the
@@ -359,9 +359,9 @@ It uses the Nextcloud credential already stored by Login Flow. The matching CLI 
 ./.venv/bin/python -m rag.contacts list
 ./.venv/bin/python -m rag.contacts sync --user alice
 
-# dockerized super-light
-install/super-light/contacts.sh list
-install/super-light/contacts.sh sync --user alice
+# dockerized
+install/dockerized/contacts.sh list
+install/dockerized/contacts.sh sync --user alice
 ```
 
 Add `--server URL` only if the same login exists on multiple Nextcloud instances.
@@ -416,18 +416,18 @@ middleware neither creates nor changes Elasticsearch users/roles.
 Do not use `verify_tls: false` as the normal solution for internally signed
 Nextcloud/Elasticsearch/LLM endpoints. Trust the issuing root/intermediate CA.
 
-For the **dockerized super-light deployment**, pass one or more PEM CA
+For the **Dockerized deployment**, pass one or more PEM CA
 certificates during installation:
 
 ```bash
-sudo ./install/install.sh --profile super-light \
+sudo ./install/install.sh --deployment dockerized \
   --ca-certificate /secure/path/company-root.crt ...
 ```
 
 The API/provider image receives the private anchors in addition to the public
 Debian CA bundle. A rerun rebuilds the image after CA changes.
 
-For the **native standard deployment**, install the CA into the host OS trust
+For the **Standard deployment**, install the CA into the host OS trust
 store. If the Python HTTP stack uses a separate CA bundle, set
 `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` in the SunaQ environment to the host's
 combined system bundle. Service-specific `ca_file` options (for example
@@ -498,21 +498,30 @@ retrieval_planner:
   verification_batch_size: 6
 ```
 
-Round 1 always starts with one Query Rewrite. Before the rewrite the provider
-asks the API for a compact Neo4j Seed-/Alias context. The model then emits one
-small `SearchSpec` with a human-style Nextcloud `elastic_query`, a natural
-`semantic_query`, and lightweight `entities`, `concepts`, `constraints` and
-`verification_requirements`. It does **not** emit raw Elasticsearch JSON and does
-not select a free-form workflow.
+Round 1 starts with one Query Rewrite. In ERG, bounded resolver/query-context
+may be supplied before the rewrite when that capability is granted. The model
+emits a backend-neutral `SearchSpec`: natural `semantic_query`, `entities`,
+`entity_hints`, `concepts`, `concept_groups`, `constraints` and
+`verification_requirements`. The current planner response contract does not
+contain `elastic_query` and never emits raw Elasticsearch JSON.
 
-The same SearchSpec drives the enabled backends:
+The same structured intent can drive multiple backends:
 
 ```text
-elastic_query  -> parsed/compiled to Elasticsearch JSON
-semantic_query -> Qdrant, when enabled
-Neo4j seeds    -> context for query rewrite / alias expansion
-analysis fields -> verifier + Graph-Light provenance
+entities + concept_groups + safe literals
+    -> deterministic Files compiler -> Elasticsearch JSON
+semantic_query
+    -> Qdrant, when granted and available
+resolver/query context
+    -> bounded identity/alias enrichment in ERG
+analysis fields
+    -> verifier + provenance / optional Findings
 ```
+
+Required concept groups compile to MUST(OR(...)); optional groups contribute
+ranking/context. This keeps semantic interpretation in the planner while
+backend syntax and occurrence semantics remain deterministic middleware
+responsibilities.
 
 The resulting candidate lists are fused, deduplicated and optionally reranked.
 Live Nextcloud ACL then removes unauthorized candidates. No lower-ranked
@@ -545,10 +554,11 @@ checks only the administrator-controlled authorized-candidate window. For a
 requested document type the document itself must be of that type; a bank
 statement that merely mentions an invoice is not an invoice match.
 
-Super-Light uses the exact same path with Qdrant and the local reranker disabled.
-Its normal verifier window is 10; concretely bounded and exhaustive requests use
-the separate 30-candidate limits above. These are verifier/candidate budgets, not
-claims that 30 relevant documents always exist.
+Standard and Dockerized deployments use the same retrieval path. Effective Qdrant
+and reranker availability is determined by architecture/capability configuration,
+not deployment packaging. Verifier windows are selected by the active SunaQ
+profile (Standard/Schnell 10, Thorough/Gründlich 30, Deep/Tief 50) and remain subject to administrator
+hard limits.
 
 Additional retrieval rounds remain optional. If `enabled:true` and
 `max_retrieval_rounds > 1`, a later round may produce a revised SearchSpec after
@@ -701,11 +711,11 @@ retrieval_policy:
 ```
 
 Neo4j entity resolution/query expansion is independent of the graph *document*
-retrieval arm. A super-light system can therefore use Neo4j aliases and SunaQ
-research findings while `retrieval_policy.internal.graph: disabled` and
+retrieval arm. An ERG deployment can therefore use Neo4j entity resolution/query expansion
+while `retrieval_policy.internal.graph: disabled` and
 `graph_retrieval.enabled: false`.
 
-## SunaQ Recherche 0.3.0
+## SunaQ Recherche 0.3.16
 
 The Nextcloud client is under `clients/nextcloud/sunaq`. It is intentionally a
 thin search frontend: Nextcloud session → server-side proxy → OpenAI-compatible

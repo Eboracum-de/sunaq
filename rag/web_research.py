@@ -3,10 +3,11 @@
 Design constraints:
 - search-engine snippets are discovery hints only, never answer evidence;
 - only successfully fetched HTML/PDF/text becomes WebEvidence;
-- an LLM relevance gate selects fetched sources before answer use/archive;
+- multiple search probes are discovery-only and are URL-deduplicated before fetch;
+- an LLM relevance gate evaluates fetched sources against one stable research goal;
 - selected sources can be snapshotted into the current user's Nextcloud via
-  WebDAV as one timestamped research run below a monthly folder;
-- each run gets recherche.md with query, parameters, selected sources and the
+  WebDAV as one logical Web research run;
+- each run gets recherche.md with research goal, probes, parameters, selected sources and the
   final answer-model output;
 - web evidence stays separate from ES/Qdrant/Neo4j during the live request.
 """
@@ -15,12 +16,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
-import ipaddress
 import json
 import logging
 import os
 import re
-import socket
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -39,6 +38,12 @@ from rag.credential_store import CredentialStore, UserWebSettings
 from rag.llm_backend import build_llm_backend
 from rag.logging_utils import get_logger
 from rag.nextcloud_tls import nextcloud_verify_value
+from rag.nextcloud_writer import NextcloudWriter
+from rag.network_policy import (
+    is_public_ip as _network_is_public_ip,
+    resolve_host_ips as _network_resolve_host_ips,
+    validated_public_connect_targets,
+)
 from rag.policy_hooks import (
     OUTBOUND_QUERY,
     POST_FETCH,
@@ -277,41 +282,13 @@ def _extract_pdf_text(data: bytes) -> str:
 
 
 def _is_public_ip(value: str) -> bool:
-    try:
-        address = ipaddress.ip_address(str(value or ""))
-    except ValueError:
-        return False
-    mapped = getattr(address, "ipv4_mapped", None)
-    if mapped is not None:
-        address = mapped
-    return bool(address.is_global) and not (
-        address.is_multicast
-        or address.is_reserved
-        or address.is_unspecified
-    )
+    """Compatibility wrapper around the shared outbound network policy."""
+    return _network_is_public_ip(value)
 
 
 def _resolve_host_ips(host: str, port: int) -> list[str]:
-    host = str(host or "").strip().rstrip(".")
-    if not host:
-        return []
-    try:
-        literal = ipaddress.ip_address(host)
-    except ValueError:
-        literal = None
-    if literal is not None:
-        return [str(literal)]
-    try:
-        infos = socket.getaddrinfo(
-            host,
-            port,
-            family=socket.AF_UNSPEC,
-            type=socket.SOCK_STREAM,
-            proto=socket.IPPROTO_TCP,
-        )
-    except socket.gaierror:
-        return []
-    return sorted({str(item[4][0]) for item in infos if item and item[4]})
+    """Compatibility wrapper around the shared outbound network policy."""
+    return _network_resolve_host_ips(host, port)
 
 
 def _validated_connect_targets(
@@ -320,48 +297,39 @@ def _validated_connect_targets(
     *,
     allowed_ports: set[int] | None = None,
 ) -> list[tuple[str, str, str]]:
-    """Return IP-pinned request targets for one validated HTTP(S) URL.
-
-    DNS is resolved exactly here. The caller connects to the returned IP
-    literal, while retaining the original Host header and TLS SNI hostname.
-    This closes the validation/connect DNS-rebinding window.
-    """
-    try:
-        parsed = urlparse(str(url or ""))
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    except ValueError as exc:
-        raise RuntimeError("invalid URL") from exc
-
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise RuntimeError("unsupported/non-HTTP URL")
-    if parsed.username is not None or parsed.password is not None:
-        raise RuntimeError("userinfo in URLs is not allowed")
-    if allowed_ports is not None and port not in allowed_ports:
-        raise RuntimeError(f"destination port {port} is not allowed")
-
-    folded = parsed.hostname.casefold().rstrip(".")
-    if folded == "localhost" or folded.endswith(".localhost"):
-        if not allow_private:
-            raise RuntimeError("private/local destination blocked")
-
-    addresses = _resolve_host_ips(parsed.hostname, port)
-    if not addresses:
-        raise RuntimeError("DNS resolution failed")
-    if not allow_private and any(not _is_public_ip(value) for value in addresses):
-        raise RuntimeError("private/local destination blocked")
-
-    default_port = 443 if parsed.scheme == "https" else 80
-    display_host = parsed.hostname
-    if ":" in display_host and not display_host.startswith("["):
-        display_host = f"[{display_host}]"
-    host_header = display_host if port == default_port else f"{display_host}:{port}"
-
-    original = httpx.URL(str(url))
-    targets: list[tuple[str, str, str]] = []
-    for address in addresses:
-        pinned = original.copy_with(host=address)
-        targets.append((str(pinned), host_header, parsed.hostname))
-    return targets
+    """Return IP-pinned request targets for one validated HTTP(S) URL."""
+    if allow_private:
+        # The Web arm retains its explicit lab-only compatibility escape hatch.
+        # Public production mode uses the shared strict public-egress validator.
+        try:
+            parsed = urlparse(str(url or ""))
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as exc:
+            raise RuntimeError("invalid URL") from exc
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise RuntimeError("unsupported/non-HTTP URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise RuntimeError("userinfo in URLs is not allowed")
+        if allowed_ports is not None and port not in allowed_ports:
+            raise RuntimeError(f"destination port {port} is not allowed")
+        addresses = _network_resolve_host_ips(parsed.hostname, port)
+        if not addresses:
+            raise RuntimeError("DNS resolution failed")
+        default_port = 443 if parsed.scheme == "https" else 80
+        display_host = parsed.hostname
+        if ":" in display_host and not display_host.startswith("["):
+            display_host = f"[{display_host}]"
+        host_header = display_host if port == default_port else f"{display_host}:{port}"
+        original = httpx.URL(str(url))
+        return [
+            (str(original.copy_with(host=address)), host_header, parsed.hostname)
+            for address in addresses
+        ]
+    return validated_public_connect_targets(
+        url,
+        allowed_ports=allowed_ports,
+        allowed_schemes={"http", "https"},
+    )
 
 
 def _is_public_host(host: str) -> bool:
@@ -410,7 +378,14 @@ class WebSearchProvider:
         query = apply_policy_hook(
             OUTBOUND_QUERY,
             content=query,
-            metadata={"provider": self.provider, "target": self.url},
+            metadata={
+                "provider": self.provider,
+                "target": self.url,
+                "egress_class": "research_query",
+                # Even a local metasearch proxy forwards this query toward
+                # public search infrastructure.
+                "external": True,
+            },
         )
         if not isinstance(query, str):
             raise TypeError("outbound_query policy hook must return str content")
@@ -727,6 +702,7 @@ class RelevanceGate:
         self.num_ctx = int(rel.get("num_ctx") or 16384)
         self.num_predict = int(rel.get("num_predict") or 800)
         self.max_sources = max(1, min(int(rel.get("max_sources") or 5), 12))
+        self.batch_size = max(1, min(int(rel.get("batch_size") or 8), 20))
         self.min_score = float(rel.get("min_score") or 0.58)
         self.preview_chars = max(800, int(rel.get("preview_chars") or 4200))
 
@@ -735,6 +711,57 @@ class RelevanceGate:
         return selected
 
     async def evaluate_with_decisions(
+        self, query: str, sources: list[FetchedSource]
+    ) -> tuple[list[tuple[FetchedSource, float, str]], list[dict[str, Any]]]:
+        """Evaluate one research goal over a bounded candidate set.
+
+        Large candidate sets may require several model calls for context safety,
+        but every batch sees the same research goal. Results are ranked and
+        capped globally, so batching is only an execution detail.
+        """
+        usable = [source for source in sources if source.text and not source.fetch_error]
+        if not usable:
+            return [], []
+        if len(usable) <= self.batch_size:
+            return await self._evaluate_batch_with_decisions(query, usable)
+
+        selected_all: list[tuple[FetchedSource, float, str]] = []
+        decisions_all: list[dict[str, Any]] = []
+        for batch_no, offset in enumerate(range(0, len(usable), self.batch_size), start=1):
+            batch = usable[offset:offset + self.batch_size]
+            selected, decisions = await self._evaluate_batch_with_decisions(query, batch)
+            selected_all.extend(selected)
+            for item in decisions:
+                record = dict(item)
+                try:
+                    record["id"] = offset + int(record.get("id") or 0)
+                except (TypeError, ValueError):
+                    pass
+                record["batch"] = batch_no
+                decisions_all.append(record)
+
+        selected_all.sort(key=lambda item: item[1], reverse=True)
+        selected_all = selected_all[: self.max_sources]
+        selected_keys = {
+            (source.search_rank, source.url, source.final_url)
+            for source, _score, _reason in selected_all
+        }
+        for item in decisions_all:
+            item["selected"] = (
+                item.get("search_rank"),
+                item.get("requested_url"),
+                item.get("final_url"),
+            ) in selected_keys
+        log.info(
+            "web relevance aggregate: goal=%r candidates=%d batches=%d selected=%d",
+            query[:160],
+            len(usable),
+            (len(usable) + self.batch_size - 1) // self.batch_size,
+            len(selected_all),
+        )
+        return selected_all, decisions_all
+
+    async def _evaluate_batch_with_decisions(
         self, query: str, sources: list[FetchedSource]
     ) -> tuple[list[tuple[FetchedSource, float, str]], list[dict[str, Any]]]:
         usable = [s for s in sources if s.text and not s.fetch_error]
@@ -758,9 +785,9 @@ class RelevanceGate:
             )
         system = (
             "Du bewertest bereits tatsächlich abgerufene Webquellen für eine Recherche. "
-            "Suchmaschinen-Snippets sind nicht Teil dieser Eingabe. Bewerte die Relevanz zur erkennbaren "
-            "Informationsabsicht der Suchanfrage, nicht nur dazu, ob eine grammatisch ausformulierte Frage "
-            "beantwortet wird. Die Suchanfrage kann auch nur aus einem Namen oder kurzen Suchbegriff bestehen. "
+            "Suchmaschinen-Snippets sind nicht Teil dieser Eingabe. Bewerte die Relevanz zum stabilen "
+            "Rechercheauftrag und seiner erkennbaren Informationsabsicht, nicht zu einzelnen Discovery-Queries. "
+            "Der Rechercheauftrag kann eine Frage oder auch nur ein Name bzw. kurzer Suchgegenstand sein. "
             "In diesem Fall ist eine Quelle relevant, wenn ihr abgerufener Text den gesuchten Gegenstand "
             "substanziell behandelt oder zu seiner eindeutigen Identifikation beiträgt. Verwirf eine Quelle "
             "nicht allein deshalb, weil die Suchanfrage keine vollständige Frage ist. Bevorzuge Primärquellen "
@@ -900,7 +927,7 @@ class RelevanceGate:
                 item.get("search_rank"), item.get("requested_url"), item.get("final_url")
             ) in selected_keys
         log.info(
-            "web relevance decisions: query=%r min_score=%.2f decisions=%s",
+            "web relevance decisions: goal=%r min_score=%.2f decisions=%s",
             query[:160],
             self.min_score,
             decision_log,
@@ -1067,7 +1094,7 @@ class PlaywrightRenderer:
 
 
 class NextcloudWebArchive:
-    """Per-user WebDAV archive for selected public evidence.
+    """Chat-dossier WebDAV snapshot writer for selected public evidence.
 
     Layout:
         <root>/YYYY-MM/DD-HHMMSS-xxxx/
@@ -1078,8 +1105,9 @@ class NextcloudWebArchive:
             01-source.pdf        (original PDF or optional Playwright HTML render)
             01-source.html       (optional raw HTML snapshot)
 
-    One directory is one web-research run.  The answer model output is written
-    in a second, fail-open finalize call after the provider has generated it.
+    Each directory is one logical Web research run below the provider-owned chat ResearchRun. Multiple
+    discovery probes share this run; the answer-model output is written in a second, fail-open finalize
+    call after the provider has generated it.
     """
 
     LLM_START = "<!-- LLM_OUTPUT_START -->"
@@ -1090,6 +1118,7 @@ class NextcloudWebArchive:
     def __init__(self, cfg: dict[str, Any], app_cfg: dict[str, Any]):
         archive = cfg.get("archive", {}) or {}
         self.cfg = cfg
+        self.app_cfg = app_cfg
         self.enabled = _truthy(archive.get("enabled"), True)
         # Multi-user archive targets are admin-managed in runtime/users.sqlite.
         # archive.root is retained only as an explicit single-user/upgrade fallback.
@@ -1109,7 +1138,14 @@ class NextcloudWebArchive:
         self.render_background_runs = max(1, min(int(render_cfg.get("background_runs") or 1), 4))
         self._render_gate = asyncio.Semaphore(self.render_background_runs)
         self._render_tasks: set[asyncio.Task[Any]] = set()
+        self._archive_ready: dict[str, asyncio.Event] = {}
         self.timeout = float(archive.get("timeout") or 30)
+        # Provider finalize requests use a 120s client timeout. Keep the
+        # cross-worker WebDAV fallback bounded below that while allowing slow
+        # deferred snapshot runs to complete without a 30s race.
+        self.finalize_wait_timeout = max(
+            30.0, min(float(archive.get("finalize_wait_timeout") or 100.0), 110.0)
+        )
         self.nextcloud_verify = nextcloud_verify_value(app_cfg, archive, "acl")
         self.acl = NextcloudLiveAcl(app_cfg)
         store_path = str(
@@ -1119,6 +1155,7 @@ class NextcloudWebArchive:
         self.store = CredentialStore(store_path)
         base = str(cfg_get(app_cfg, "nextcloud.base_url", default="") or "").rstrip("/")
         self.dav_base = base + "/remote.php/dav/files" if base else ""
+        self.nc_writer = NextcloudWriter(self.dav_base)
 
     def user_settings(self, rag_user_id: str | None) -> UserWebSettings | None:
         if self.acl.identity_mode != "credential_store":
@@ -1131,29 +1168,96 @@ class NextcloudWebArchive:
             return None
         return self.store.get_web_settings(canonical.canonical_user_id)
 
-    def _root_for_user(self, rag_user_id: str | None) -> str:
+    def _legacy_root_for_user(self, rag_user_id: str | None) -> str:
+        """Return the pre-rc2 standalone Webarchiv root for compatibility reads.
+
+        Reading retained evidence follows its Chatarchive lifecycle and current
+        WebDAV authorization; it is deliberately independent of today's Live-Web
+        enablement. New writes never use this root.
+        """
         if self.acl.identity_mode == "credential_store":
-            settings = self.user_settings(rag_user_id)
-            if settings is None or not settings.enabled or not settings.archive_enabled:
+            identity = str(rag_user_id or "").strip()
+            if not identity:
+                return ""
+            canonical = self.store.get_canonical_user_for_identity(identity)
+            if canonical is None or not canonical.enabled:
+                return ""
+            settings = self.store.get_web_settings(canonical.canonical_user_id)
+            if settings is None:
                 return ""
             return settings.target_path.strip(" /")
         return self.legacy_root
 
+    def _chat_root_for_user(self, rag_user_id: str | None) -> str:
+        """Return the active chat archive root that owns new Web Evidence.
+
+        Keep this fallback behavior aligned with ResearchArchive._root_for_user:
+        a canonical user without an explicit chat-settings row inherits the
+        globally configured/default chat archive root.  An explicit disabled
+        per-user setting still disables archival for that user.
+        """
+        chat = cfg_get(self.app_cfg, "chat_archive", default={}) or {}
+        if not _truthy(chat.get("enabled"), False):
+            return ""
+        default_root = str(chat.get("root") or "SunaQ-Chats").strip(" /")
+
+        if self.acl.identity_mode != "credential_store":
+            return default_root
+
+        identity = str(rag_user_id or "").strip()
+        if not identity:
+            return ""
+        canonical = self.store.get_canonical_user_for_identity(identity)
+        if canonical is None or not canonical.enabled:
+            return ""
+        settings = self.store.get_chat_settings(canonical.canonical_user_id)
+        if settings is None:
+            return default_root
+        if not settings.enabled:
+            return ""
+        return str(settings.target_path or default_root).strip(" /")
+
+    def _allowed_archive_roots_for_user(self, rag_user_id: str | None) -> tuple[str, ...]:
+        roots = {
+            self._chat_root_for_user(rag_user_id),
+            self._legacy_root_for_user(rag_user_id),
+        }
+        roots.discard("")
+        return tuple(sorted(roots, key=str.casefold))
+
+    def _validated_research_run_path(
+        self, run_path: str, rag_user_id: str | None
+    ) -> str:
+        clean = str(run_path or "").strip(" /")
+        root = self._chat_root_for_user(rag_user_id).strip(" /")
+        if not clean or any(part in {".", ".."} for part in clean.split("/")):
+            raise ValueError("invalid chat research run path")
+        if not root or not (clean == root or clean.startswith(root + "/")):
+            raise ValueError("research run path is outside current user's chat archive root")
+        if "/runs/" not in "/" + clean:
+            raise ValueError("research run path does not identify a chat research run")
+        return clean
+
     def _credential(self, rag_user_id: str | None) -> NextcloudCredential:
         return self.acl.credential_for_user(rag_user_id)
 
-    def _url(self, credential: NextcloudCredential, relpath: str) -> str:
-        pieces = [quote(credential.username, safe="")] + [quote(p, safe="") for p in relpath.strip("/").split("/") if p]
-        return self.dav_base.rstrip("/") + "/" + "/".join(pieces)
+    def _writer(self) -> NextcloudWriter:
+        writer = getattr(self, "nc_writer", None)
+        if writer is None:
+            writer = NextcloudWriter(self.dav_base)
+            self.nc_writer = writer
+        return writer
 
-    async def _ensure_dir(self, client: httpx.AsyncClient, credential: NextcloudCredential, relpath: str) -> None:
-        accum: list[str] = []
-        for part in [p for p in relpath.strip("/").split("/") if p]:
-            accum.append(part)
-            url = self._url(credential, "/".join(accum))
-            response = await client.request("MKCOL", url, auth=(credential.username, credential.password))
-            if response.status_code not in {201, 405}:
-                response.raise_for_status()
+    def _url(self, credential: NextcloudCredential, relpath: str) -> str:
+        return self._writer().url(credential, relpath)
+
+    async def _ensure_dir(
+        self,
+        client: httpx.AsyncClient,
+        credential: NextcloudCredential,
+        relpath: str,
+    ) -> None:
+        await self._writer().ensure_dir(client, credential, relpath)
 
     async def _put(
         self,
@@ -1175,12 +1279,13 @@ class NextcloudWebArchive:
         if not isinstance(content, (bytes, bytearray)):
             raise TypeError("pre_persist policy hook must return bytes content")
         content = bytes(content)
-        url = self._url(credential, target)
-        response = await client.put(
-            url,
+        response = await self._writer().request(
+            client,
+            "PUT",
+            credential,
+            target,
             content=content,
             headers={"Content-Type": content_type},
-            auth=(credential.username, credential.password),
         )
         response.raise_for_status()
         file_id = ""
@@ -1196,10 +1301,13 @@ class NextcloudWebArchive:
                 '<d:prop><oc:fileid/></d:prop></d:propfind>'
             ).encode("utf-8")
             try:
-                prop = await client.request(
-                    "PROPFIND", url, content=body,
+                prop = await self._writer().request(
+                    client,
+                    "PROPFIND",
+                    credential,
+                    target,
+                    content=body,
                     headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
-                    auth=(credential.username, credential.password),
                 )
                 if prop.status_code == 207:
                     tree = ET.fromstring(prop.content)
@@ -1210,21 +1318,22 @@ class NextcloudWebArchive:
                 log.debug("web archive fileid lookup failed for %s: %s", target, exc)
         if file_id:
             register_document(
-                f"files:{file_id}", "web_archive", source_path=target,
-                classification_source="web_archive",
+                f"files:{file_id}", "chat_archive", source_path=target,
+                classification_source="chat_web_evidence",
             )
             return file_id
         return None
 
     def _validated_archive_path(self, relpath: str, rag_user_id: str | None) -> str:
+        """Validate current chat-dossier paths and legacy standalone Webarchiv paths."""
         clean = str(relpath or "").strip(" /")
-        root = self._root_for_user(rag_user_id).strip(" /")
         if not clean or any(part in {".", ".."} for part in clean.split("/")):
-            raise ValueError("invalid web archive path")
-        if not root:
-            raise ValueError("no web archive target configured for current canonical user")
-        if not (clean == root or clean.startswith(root + "/")):
-            raise ValueError("web archive path is outside current user's configured archive root")
+            raise ValueError("invalid archived evidence path")
+        roots = self._allowed_archive_roots_for_user(rag_user_id)
+        if not roots:
+            raise ValueError("no archive root configured for current canonical user")
+        if not any(clean == root or clean.startswith(root + "/") for root in roots):
+            raise ValueError("archived evidence path is outside current user's archive roots")
         return clean
 
     async def read_text_snapshot(
@@ -1235,7 +1344,7 @@ class NextcloudWebArchive:
         This supports immediate /use:Wn without waiting for the next ES sync.
         The archived snapshot is used deliberately instead of refetching the URL.
         """
-        if not self.enabled or not self.dav_base:
+        if not self.dav_base:
             return None
         clean = self._validated_archive_path(relpath, rag_user_id)
         if not clean.lower().endswith(".txt"):
@@ -1295,10 +1404,19 @@ class NextcloudWebArchive:
                 elif key == "SOURCE-URL" and value:
                     source_url = value
 
+        chat_root = self._chat_root_for_user(rag_user_id).strip(" /")
+        in_chat_dossier = bool(
+            chat_root
+            and (clean == chat_root or clean.startswith(chat_root + "/"))
+        )
+        source_origin = "chat_archive" if in_chat_dossier else "web_archive"
         document_id = (
             f"files:{file_id}"
             if file_id
-            else "webarchive:" + hashlib.sha256(clean.encode("utf-8")).hexdigest()[:24]
+            else (
+                ("chatarchive:" if in_chat_dossier else "webarchive:")
+                + hashlib.sha256(clean.encode("utf-8")).hexdigest()[:24]
+            )
         )
         return {
             "document_id": document_id,
@@ -1308,8 +1426,9 @@ class NextcloudWebArchive:
             "context_text": content_text,
             "content_available": bool(content_text),
             "context_enriched": True,
-            "source_origin": "web_archive",
-            "webarchive_direct": True,
+            "source_origin": source_origin,
+            "web_evidence_direct": True,
+            "webarchive_direct": not in_chat_dossier,
             "acl_verified_by": "webdav_get",
         }
 
@@ -1358,6 +1477,7 @@ class NextcloudWebArchive:
         search = self.cfg.get("search", {}) or {}
         fetch = self.cfg.get("fetch", {}) or {}
         relevance = self.cfg.get("relevance", {}) or {}
+        probes = [str(value).strip() for value in (stats.get("queries") or [query]) if str(value).strip()]
         lines = [
             "# Web-Recherche",
             "",
@@ -1365,14 +1485,23 @@ class NextcloudWebArchive:
             f"- Zeitpunkt: {created_at.isoformat(timespec='seconds')}",
             f"- Benutzer: {rag_user_id or '(single-user/default)' }",
             "",
-            "## Suchanfrage",
+            "## Rechercheauftrag",
             "",
             str(query or "").strip(),
+            "",
+            "## Search Probes",
+            "",
+        ]
+        if probes:
+            lines.extend([f"{idx}. {probe}" for idx, probe in enumerate(probes, start=1)])
+        else:
+            lines.append("(keine)")
+        lines.extend([
             "",
             "## Parameter",
             "",
             f"- Search provider: `{stats.get('search_provider') or search.get('provider') or ''}`",
-            f"- Max. Suchtreffer: {int(search.get('max_results') or 10)}",
+            f"- Max. Suchtreffer je Probe: {int(search.get('max_results') or 10)}",
             f"- Search timeout: {search.get('timeout') or 20}s",
             f"- Fetch timeout: {fetch.get('timeout') or 25}s",
             f"- Max. Fetch-Größe: {int(fetch.get('max_bytes') or 15000000)} Bytes",
@@ -1383,14 +1512,15 @@ class NextcloudWebArchive:
             "",
             "## Laufstatistik",
             "",
-            f"- Suchtreffer: {int(stats.get('searched') or 0)}",
+            f"- Suchtreffer über alle Probes: {int(stats.get('searched') or 0)}",
+            f"- Eindeutige URLs vor Fetch: {int(stats.get('unique_hits') or stats.get('searched') or 0)}",
             f"- Tatsächlich geladen: {int(stats.get('fetched') or 0)}",
             f"- Als relevant ausgewählt: {len(selected)}",
             f"- Fetch-Log: `{fetch_log_path or '-'}`",
             "",
             "## Verwendete Quellen",
             "",
-        ]
+        ])
         for idx, ((source, score, reason), record) in enumerate(zip(selected, source_records), start=1):
             lines.extend([
                 f"### [W{idx}] {source.title or source.final_url}",
@@ -1645,6 +1775,61 @@ class NextcloudWebArchive:
                 len(jobs), completed, failed, elapsed_ms,
             )
 
+    def plan_archive_run(
+        self,
+        query: str,
+        selected: list[tuple[FetchedSource, float, str]],
+        *,
+        fetched: list[FetchedSource],
+        rag_user_id: str | None,
+        research_run_path: str = "",
+    ) -> dict[str, Any]:
+        """Reserve deterministic archive paths without performing WebDAV I/O."""
+        if not self.enabled or (not selected and not fetched):
+            return {"run_path": "", "source_records": [], "fetch_log_path": "", "skipped": True, "skipped_reason": "archive_disabled_or_empty"}
+        if not str(research_run_path or "").strip():
+            return {"run_path": "", "source_records": [], "fetch_log_path": "", "skipped": True, "skipped_reason": "no_chat_research_run"}
+        research_root = self._validated_research_run_path(research_run_path, rag_user_id)
+        created_at = datetime.now().astimezone()
+        salt = hashlib.sha256(
+            f"{query}\0{created_at.isoformat()}\0{os.getpid()}".encode("utf-8")
+        ).hexdigest()[:4]
+        run_id = f"{created_at:%H%M%S}-{salt}"
+        directory = f"{research_root}/web/{run_id}"
+        records: list[dict[str, str]] = []
+        for idx, (source, _score, _reason) in enumerate(selected, start=1):
+            stem = f"{idx:02d}-" + _safe_component(
+                source.title or urlparse(source.final_url).hostname or "source", max_len=70
+            )
+            stem += "-" + source.content_hash[:10]
+            text_path = f"{directory}/{stem}.txt" if self.write_text_snapshot else ""
+            raw_path = ""
+            pdf_path = ""
+            write_raw = (
+                (source.content_type == "application/pdf" and self.write_raw_pdf)
+                or (source.content_type == "text/html" and self.write_raw_html)
+            )
+            if write_raw and source.raw:
+                raw_ext = ".pdf" if source.content_type == "application/pdf" else ".html"
+                raw_path = f"{directory}/{stem}{raw_ext}"
+                if source.content_type == "application/pdf":
+                    pdf_path = raw_path
+            records.append({
+                "text_path": text_path,
+                "raw_path": raw_path,
+                "pdf_path": pdf_path,
+                "metadata_path": f"{directory}/.{stem}.metadata.json" if self.write_metadata_json else "",
+            })
+        self._archive_ready.setdefault(directory, asyncio.Event())
+        return {
+            "run_path": directory,
+            "run_id": run_id,
+            "created_at": created_at.isoformat(),
+            "source_records": records,
+            "fetch_log_path": f"{directory}/fetch-log.jsonl" if self.write_fetch_log and fetched else "",
+            "skipped": False,
+            "skipped_reason": "",
+        }
     async def archive_run(
         self,
         query: str,
@@ -1653,30 +1838,43 @@ class NextcloudWebArchive:
         fetched: list[FetchedSource],
         relevance_decisions: list[dict[str, Any]],
         rag_user_id: str | None,
+        research_run_path: str = "",
         stats: dict[str, Any],
         relevance_model: str = "",
+        plan: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not self.enabled or (not selected and not fetched):
-            return {"run_path": "", "source_records": [], "errors": [], "fetch_log_path": ""}
-        root = self._root_for_user(rag_user_id)
-        if not root:
-            reason = "archive_disabled_or_target_unconfigured"
+        plan = dict(plan or self.plan_archive_run(
+            query,
+            selected,
+            fetched=fetched,
+            rag_user_id=rag_user_id,
+            research_run_path=research_run_path,
+        ))
+        if bool(plan.get("skipped")):
+            reason = str(plan.get("skipped_reason") or "archive_skipped")
             log.info(
-                "web archive skipped: reason=%s rag_user_id=%r",
+                "web snapshot skipped: reason=%s rag_user_id=%r",
                 reason, str(rag_user_id or "")[:160],
             )
             return {
-                "run_path": "", "source_records": [], "errors": [],
-                "fetch_log_path": "", "skipped": True,
+                "run_path": str(plan.get("run_path") or ""),
+                "source_records": list(plan.get("source_records") or []),
+                "errors": [],
+                "fetch_log_path": str(plan.get("fetch_log_path") or ""),
+                "skipped": True,
                 "skipped_reason": reason,
             }
         if not self.dav_base:
-            raise RuntimeError("nextcloud.base_url missing for web archive")
+            raise RuntimeError("nextcloud.base_url missing for chat Web Evidence")
         credential = self._credential(rag_user_id)
-        directory, created_at, run_id = self._new_run_path(query, root)
-        records: list[dict[str, str]] = []
+        created_at = datetime.fromisoformat(str(plan["created_at"]))
+        run_id = str(plan["run_id"])
+        directory = str(plan["run_path"])
+        records: list[dict[str, str]] = [
+            dict(item) for item in (plan.get("source_records") or [])
+        ]
         errors: list[dict[str, str]] = []
-        fetch_log_path = ""
+        fetch_log_path = str(plan.get("fetch_log_path") or "")
         render_jobs: list[tuple[str, FetchedSource, float, str, dict[str, str], str]] = []
 
         verify = self.nextcloud_verify
@@ -1701,7 +1899,7 @@ class NextcloudWebArchive:
                     source.title or urlparse(source.final_url).hostname or "source", max_len=70
                 )
                 stem += "-" + source.content_hash[:10]
-                record: dict[str, str] = {
+                record = records[idx - 1] if idx - 1 < len(records) else {
                     "text_path": "",
                     "raw_path": "",
                     "pdf_path": "",
@@ -1709,24 +1907,15 @@ class NextcloudWebArchive:
                 }
                 rendered: RenderedSnapshot | None = None
                 try:
-                    if self.write_text_snapshot:
-                        record["text_path"] = f"{directory}/{stem}.txt"
+                    if record.get("text_path"):
                         await self._put(
                             client, credential, record["text_path"],
                             self._snapshot_bytes(query, source, score, reason),
                             "text/plain; charset=utf-8",
                         )
 
-                    write_raw = (
-                        (source.content_type == "application/pdf" and self.write_raw_pdf) or
-                        (source.content_type == "text/html" and self.write_raw_html)
-                    )
-                    if write_raw and source.raw:
-                        raw_ext = ".pdf" if source.content_type == "application/pdf" else ".html"
-                        record["raw_path"] = f"{directory}/{stem}{raw_ext}"
+                    if record.get("raw_path") and source.raw:
                         await self._put(client, credential, record["raw_path"], source.raw, source.content_type)
-                        if source.content_type == "application/pdf":
-                            record["pdf_path"] = record["raw_path"]
 
                     render_target = ""
                     render_status = ""
@@ -1767,7 +1956,8 @@ class NextcloudWebArchive:
                 except Exception as exc:
                     errors.append({"url": source.final_url, "error": f"{type(exc).__name__}: {exc}"})
                     log.warning("web archive source failed for %s: %s", source.final_url, exc)
-                records.append(record)
+                if idx > len(records):
+                    records.append(record)
 
             if self.write_research_markdown:
                 md = self._research_markdown(
@@ -1797,6 +1987,7 @@ class NextcloudWebArchive:
                 len(render_jobs), directory,
             )
 
+        self.mark_archive_ready(directory)
         return {
             "run_path": directory,
             "source_records": records,
@@ -1804,6 +1995,17 @@ class NextcloudWebArchive:
             "fetch_log_path": fetch_log_path,
             "render_pending": len(render_jobs),
         }
+
+    def mark_archive_ready(self, run_path: str) -> None:
+        path = str(run_path or "").strip("/")
+        ready = self._archive_ready.get(path)
+        if ready is not None:
+            ready.set()
+            try:
+                loop = asyncio.get_running_loop()
+                loop.call_later(300.0, lambda: self._archive_ready.pop(path, None))
+            except RuntimeError:
+                self._archive_ready.pop(path, None)
 
     async def finalize_run(
         self,
@@ -1816,20 +2018,43 @@ class NextcloudWebArchive:
     ) -> dict[str, Any]:
         if not self.enabled or not self.write_research_markdown or not run_path:
             return {"updated": False, "run_path": run_path}
-        clean = str(run_path or "").strip(" /")
-        root = self._root_for_user(rag_user_id).strip(" /")
-        if not root or not (clean == root or clean.startswith(root + "/")):
-            raise RuntimeError("archive run path is outside current user's configured web archive root")
+        clean = self._validated_archive_path(run_path, rag_user_id)
         if not self.dav_base:
             raise RuntimeError("nextcloud.base_url missing for web archive")
         credential = self._credential(rag_user_id)
         target = f"{clean}/recherche.md"
         verify = self.nextcloud_verify
+
+        # In the normal one-process path we know exactly when the deferred
+        # archive writer has finished. Await that event instead of racing it
+        # with repeated DAV GETs. If a different worker handles finalization or
+        # the process restarted, fall back to bounded WebDAV polling.
+        readiness_deadline = time.monotonic() + self.finalize_wait_timeout
+        ready = self._archive_ready.get(clean)
+        if ready is not None and not ready.is_set():
+            try:
+                await asyncio.wait_for(
+                    ready.wait(),
+                    timeout=max(0.1, readiness_deadline - time.monotonic()),
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "web archive readiness wait timed out run_path=%s timeout=%.1fs",
+                    clean,
+                    self.finalize_wait_timeout,
+                )
+
         async with httpx.AsyncClient(timeout=self.timeout, verify=verify) as client:
-            response = await client.get(
-                self._url(credential, target),
-                auth=(credential.username, credential.password),
-            )
+            while True:
+                response = await client.get(
+                    self._url(credential, target),
+                    auth=(credential.username, credential.password),
+                )
+                if response.status_code != 404 or time.monotonic() >= readiness_deadline:
+                    break
+                # Cross-worker/restart fallback. This is post-response work and
+                # therefore never delays the user's answer.
+                await asyncio.sleep(0.5)
             response.raise_for_status()
             text = response.text
             params = json.dumps(answer_parameters or {}, ensure_ascii=False, indent=2, sort_keys=True, default=str)
@@ -1851,6 +2076,39 @@ class NextcloudWebArchive:
         return text[: a + len(start)] + "\n" + body.rstrip() + "\n" + text[b:]
 
 
+async def _run_deferred_web_archive(
+    store: NextcloudWebArchive,
+    query: str,
+    selected: list[tuple[FetchedSource, float, str]],
+    *,
+    fetched: list[FetchedSource],
+    relevance_decisions: list[dict[str, Any]],
+    rag_user_id: str | None,
+    research_run_path: str,
+    stats: dict[str, Any],
+    relevance_model: str,
+    plan: dict[str, Any],
+) -> None:
+    started = time.perf_counter()
+    try:
+        result = await store.archive_run(
+            query, selected, fetched=fetched, relevance_decisions=relevance_decisions,
+            rag_user_id=rag_user_id, research_run_path=research_run_path,
+            stats=stats, relevance_model=relevance_model, plan=plan,
+        )
+        log.info(
+            "web deferred archive finished run_path=%s errors=%d elapsed_ms=%.1f",
+            result.get("run_path") or "", len(result.get("errors") or []),
+            (time.perf_counter() - started) * 1000.0,
+        )
+    except Exception as exc:
+        log.warning(
+            "web deferred archive failed after %.1fms: %s: %s",
+            (time.perf_counter() - started) * 1000.0, type(exc).__name__, exc,
+        )
+    finally:
+        store.mark_archive_ready(str(plan.get("run_path") or ""))
+
 class WebResearchArm:
     def __init__(self, app_cfg: dict[str, Any] | None = None, web_cfg: dict[str, Any] | None = None):
         self.app_cfg = app_cfg or load_app_config()
@@ -1860,17 +2118,81 @@ class WebResearchArm:
         self.fetcher = WebFetcher(self.cfg)
         self.gate = RelevanceGate(self.cfg)
         self.archive_store = NextcloudWebArchive(self.cfg, self.app_cfg)
+        self.search_concurrency = max(
+            1,
+            min(int((self.cfg.get("search", {}) or {}).get("concurrency") or 2), 8),
+        )
         self.fetch_concurrency = max(1, min(int((self.cfg.get("fetch", {}) or {}).get("concurrency") or 4), 8))
 
-    async def research(self, query: str, *, rag_user_id: str | None = None) -> dict[str, Any]:
+
+    async def research(
+        self,
+        query: str,
+        *,
+        rag_user_id: str | None = None,
+        research_run_path: str = "",
+        background_add_task: Any | None = None,
+    ) -> dict[str, Any]:
+        """Backward-compatible single-probe Web research."""
+        return await self.research_many(
+            [query],
+            research_goal=query,
+            rag_user_id=rag_user_id,
+            research_run_path=research_run_path,
+            background_add_task=background_add_task,
+        )
+
+    async def research_many(
+        self,
+        queries: list[str] | tuple[str, ...],
+        *,
+        research_goal: str,
+        rag_user_id: str | None = None,
+        research_run_path: str = "",
+        background_add_task: Any | None = None,
+    ) -> dict[str, Any]:
+        """Execute one logical Web research run from multiple discovery probes.
+
+        Search probes only widen discovery. URLs are deduplicated before fetch,
+        then all fetched pages are evaluated exactly once against the stable
+        research goal. Passage selection and archival use the same goal, so
+        probe wording can never redefine answer relevance.
+        """
+        goal = re.sub(r"\s+", " ", str(research_goal or "").strip())
+        probes: list[str] = []
+        seen_probes: set[str] = set()
+        for raw in queries:
+            probe = re.sub(r"\s+", " ", str(raw or "").strip())
+            folded = probe.casefold()
+            if not probe or folded in seen_probes:
+                continue
+            seen_probes.add(folded)
+            probes.append(probe)
+            if len(probes) >= 8:
+                break
+        if not goal and probes:
+            goal = probes[0]
+        if not probes and goal:
+            probes = [goal]
+
+        base_result = {
+            "query": goal,
+            "research_goal": goal,
+            "queries": probes,
+            "sources": [],
+            "searched": 0,
+            "unique_hits": 0,
+            "fetched": 0,
+            "selected": 0,
+            "archive_layout": "chat_research_run_v1",
+        }
         if not self.enabled:
-            return {"enabled": False, "query": query, "sources": [], "errors": ["web arm disabled"]}
+            return {**base_result, "enabled": False, "errors": ["web arm disabled"]}
         ready, readiness_error = self.searcher.readiness()
         if not ready:
             return {
+                **base_result,
                 "enabled": False,
-                "query": query,
-                "sources": [],
                 "errors": [readiness_error],
                 "reason": "search_backend_unconfigured",
             }
@@ -1878,28 +2200,124 @@ class WebResearchArm:
             settings = self.archive_store.user_settings(rag_user_id)
             if settings is None or not settings.enabled:
                 return {
+                    **base_result,
                     "enabled": False,
-                    "query": query,
-                    "sources": [],
                     "errors": ["web research is not enabled by admin for current canonical Nextcloud user"],
                 }
+        if not probes:
+            return {**base_result, "enabled": True}
+
         total_started = time.perf_counter()
-        stage_started = total_started
-        hits = await self.searcher.search(query)
+        search_semaphore = asyncio.Semaphore(self.search_concurrency)
+
+        async def search_probe(probe: str) -> tuple[str, list[SearchHit] | None, Exception | None]:
+            async with search_semaphore:
+                try:
+                    return probe, await self.searcher.search(probe), None
+                except Exception as exc:
+                    return probe, None, exc
+
+        stage_started = time.perf_counter()
+        probe_results = await asyncio.gather(*(search_probe(probe) for probe in probes))
         search_ms = round((time.perf_counter() - stage_started) * 1000.0, 1)
-        semaphore = asyncio.Semaphore(self.fetch_concurrency)
+
+        query_errors: list[dict[str, str]] = []
+        per_query: list[dict[str, Any]] = []
+        first_search_error: Exception | None = None
+        successful_searches = 0
+        searched_total = 0
+
+        def url_key(value: str) -> str:
+            parsed = urlparse(str(value or "").strip())
+            if not parsed.scheme or not parsed.netloc:
+                return str(value or "").strip()
+            return parsed._replace(
+                scheme=parsed.scheme.lower(),
+                netloc=parsed.netloc.lower(),
+                fragment="",
+            ).geturl()
+
+        unique_hits: list[SearchHit] = []
+        hit_index: dict[str, int] = {}
+        hit_probes: dict[str, list[str]] = {}
+
+        for probe, hits, exc in probe_results:
+            if exc is not None:
+                if first_search_error is None:
+                    first_search_error = exc
+                query_errors.append({"query": probe, "error": f"{type(exc).__name__}: {exc}"})
+                per_query.append({"query": probe, "searched": 0, "error": str(exc)})
+                log.warning(
+                    "web search probe failed query=%r: %s: %s",
+                    probe, type(exc).__name__, exc,
+                )
+                continue
+
+            successful_searches += 1
+            current_hits = list(hits or [])
+            searched_total += len(current_hits)
+            per_query.append({"query": probe, "searched": len(current_hits)})
+            for hit in current_hits:
+                key = url_key(hit.url)
+                if not key:
+                    continue
+                if key not in hit_index:
+                    hit_index[key] = len(unique_hits)
+                    unique_hits.append(
+                        SearchHit(
+                            rank=len(unique_hits) + 1,
+                            title=hit.title,
+                            url=hit.url,
+                            snippet=hit.snippet,
+                            provider=hit.provider,
+                        )
+                    )
+                    hit_probes[key] = [probe]
+                elif probe not in hit_probes[key]:
+                    hit_probes[key].append(probe)
+
+        if successful_searches == 0 and first_search_error is not None:
+            raise first_search_error
+
+        fetch_semaphore = asyncio.Semaphore(self.fetch_concurrency)
 
         async def fetch_one(hit: SearchHit) -> FetchedSource:
-            async with semaphore:
+            async with fetch_semaphore:
                 return await self.fetcher.fetch(hit)
 
         stage_started = time.perf_counter()
-        fetched = await asyncio.gather(*(fetch_one(hit) for hit in hits))
+        fetched_raw = await asyncio.gather(*(fetch_one(hit) for hit in unique_hits))
         fetch_ms = round((time.perf_counter() - stage_started) * 1000.0, 1)
+
+        # Distinct discovery URLs may redirect to the same canonical page.
+        # Collapse those aliases before relevance so one page is judged once.
+        fetched: list[FetchedSource] = []
+        fetched_keys: dict[str, int] = {}
+        for source in fetched_raw:
+            key = url_key(source.final_url or source.url)
+            if key not in fetched_keys:
+                fetched_keys[key] = len(fetched)
+                fetched.append(source)
+                continue
+            existing_idx = fetched_keys[key]
+            existing = fetched[existing_idx]
+            if existing.fetch_error and not source.fetch_error:
+                fetched[existing_idx] = source
+
         stage_started = time.perf_counter()
-        selected, relevance_decisions = await self.gate.evaluate_with_decisions(query, fetched)
+        selected, relevance_decisions = await self.gate.evaluate_with_decisions(goal, fetched)
         relevance_ms = round((time.perf_counter() - stage_started) * 1000.0, 1)
         fetched_count = sum(1 for source in fetched if source.text and not source.fetch_error)
+
+        stats = {
+            "search_provider": self.searcher.provider,
+            "research_goal": goal,
+            "queries": probes,
+            "per_query": per_query,
+            "searched": searched_total,
+            "unique_hits": len(unique_hits),
+            "fetched": fetched_count,
+        }
 
         archive_run_path = ""
         archive_fetch_log_path = ""
@@ -1907,55 +2325,90 @@ class WebResearchArm:
         archive_errors: list[dict[str, str]] = []
         archive_render_pending = 0
         archive_skipped_reason = ""
+        archive_mode = "none"
         archive_started = time.perf_counter()
         if fetched:
             try:
-                archived = await self.archive_store.archive_run(
-                    query,
+                plan = self.archive_store.plan_archive_run(
+                    goal,
                     selected,
                     fetched=fetched,
-                    relevance_decisions=relevance_decisions,
                     rag_user_id=rag_user_id,
-                    stats={
-                        "search_provider": self.searcher.provider,
-                        "searched": len(hits),
-                        "fetched": fetched_count,
-                    },
-                    relevance_model=self.gate.model,
+                    research_run_path=research_run_path,
                 )
-                archive_run_path = str(archived.get("run_path") or "")
-                archive_fetch_log_path = str(archived.get("fetch_log_path") or "")
-                archive_records = list(archived.get("source_records") or [])
-                archive_errors.extend(list(archived.get("errors") or []))
-                archive_render_pending = int(archived.get("render_pending") or 0)
-                archive_skipped_reason = str(archived.get("skipped_reason") or "")
+                archive_run_path = str(plan.get("run_path") or "")
+                archive_fetch_log_path = str(plan.get("fetch_log_path") or "")
+                archive_records = list(plan.get("source_records") or [])
+                archive_skipped_reason = str(plan.get("skipped_reason") or "")
+                if background_add_task is not None and not bool(plan.get("skipped")):
+                    background_add_task(
+                        _run_deferred_web_archive,
+                        self.archive_store,
+                        goal,
+                        selected,
+                        fetched=fetched,
+                        relevance_decisions=relevance_decisions,
+                        rag_user_id=rag_user_id,
+                        research_run_path=research_run_path,
+                        stats=stats,
+                        relevance_model=self.gate.model,
+                        plan=plan,
+                    )
+                    archive_mode = "deferred"
+                elif not bool(plan.get("skipped")):
+                    archived = await self.archive_store.archive_run(
+                        goal,
+                        selected,
+                        fetched=fetched,
+                        relevance_decisions=relevance_decisions,
+                        rag_user_id=rag_user_id,
+                        research_run_path=research_run_path,
+                        stats=stats,
+                        relevance_model=self.gate.model,
+                        plan=plan,
+                    )
+                    archive_run_path = str(archived.get("run_path") or archive_run_path)
+                    archive_fetch_log_path = str(archived.get("fetch_log_path") or archive_fetch_log_path)
+                    archive_records = list(archived.get("source_records") or archive_records)
+                    archive_errors.extend(list(archived.get("errors") or []))
+                    archive_render_pending = int(archived.get("render_pending") or 0)
+                    archive_skipped_reason = str(archived.get("skipped_reason") or archive_skipped_reason)
+                    archive_mode = "synchronous"
             except Exception as exc:
                 archive_errors.append({"url": "archive-run", "error": f"{type(exc).__name__}: {exc}"})
-                log.warning("web archive run failed: %s", exc)
+                log.warning("Web Evidence snapshot planning failed: %s", exc)
         archive_ms = round((time.perf_counter() - archive_started) * 1000.0, 1)
+        log.info(
+            "web snapshot archive result goal=%r probes=%d enabled=%s research_run=%r "
+            "archive_run=%r skipped_reason=%r archive_errors=%d",
+            goal, len(probes), self.archive_store.enabled, str(research_run_path or ""),
+            archive_run_path, archive_skipped_reason, len(archive_errors),
+        )
 
         evidence_started = time.perf_counter()
         evidence: list[WebEvidence] = []
         for idx, (source, score, reason) in enumerate(selected, start=1):
             record = archive_records[idx - 1] if idx - 1 < len(archive_records) else {}
-            evidence.append(WebEvidence(
-                index=idx,
-                title=source.title,
-                url=source.url,
-                final_url=source.final_url,
-                publisher=source.publisher,
-                published_at=source.published_at,
-                retrieved_at=source.retrieved_at,
-                content_type=source.content_type,
-                content_hash=source.content_hash,
-                evidence_text=best_passage(query, source.text),
-                relevance_score=score,
-                relevance_reason=reason,
-                archive_path=str(record.get("text_path") or ""),
-                archive_raw_path=str(record.get("raw_path") or ""),
-                archive_pdf_path=str(record.get("pdf_path") or ""),
-                archive_metadata_path=str(record.get("metadata_path") or ""),
-            ))
+            evidence.append(
+                WebEvidence(
+                    index=idx,
+                    title=source.title,
+                    url=source.url,
+                    final_url=source.final_url,
+                    publisher=source.publisher,
+                    published_at=source.published_at,
+                    retrieved_at=source.retrieved_at,
+                    content_type=source.content_type,
+                    content_hash=source.content_hash,
+                    evidence_text=best_passage(goal, source.text),
+                    relevance_score=score,
+                    relevance_reason=reason,
+                    archive_path=str(record.get("text_path") or ""),
+                    archive_raw_path=str(record.get("raw_path") or ""),
+                    archive_pdf_path=str(record.get("pdf_path") or ""),
+                    archive_metadata_path=str(record.get("metadata_path") or ""),
+                )
+            )
         passage_ms = round((time.perf_counter() - evidence_started) * 1000.0, 1)
         total_ms = round((time.perf_counter() - total_started) * 1000.0, 1)
         timings = {
@@ -1963,29 +2416,48 @@ class WebResearchArm:
             "fetch_ms": fetch_ms,
             "relevance_ms": relevance_ms,
             "archive_ms": archive_ms,
+            "archive_mode": archive_mode,
             "passage_ms": passage_ms,
             "total_ms": total_ms,
         }
         log.info(
-            "web timings query=%r searched=%d fetched=%d selected=%d search_ms=%.1f fetch_ms=%.1f relevance_ms=%.1f archive_ms=%.1f passage_ms=%.1f total_ms=%.1f",
-            query, len(hits), fetched_count, len(evidence), search_ms, fetch_ms, relevance_ms, archive_ms, passage_ms, total_ms,
+            "web timings goal=%r probes=%d searched=%d unique_hits=%d fetched=%d selected=%d "
+            "search_ms=%.1f fetch_ms=%.1f relevance_ms=%.1f archive_ms=%.1f "
+            "passage_ms=%.1f total_ms=%.1f",
+            goal, len(probes), searched_total, len(unique_hits), fetched_count, len(evidence),
+            search_ms, fetch_ms, relevance_ms, archive_ms, passage_ms, total_ms,
         )
+
+        fetch_errors: list[dict[str, Any]] = []
+        for source in fetched:
+            if source.fetch_error:
+                fetch_errors.append(
+                    {
+                        "url": source.url,
+                        "error": source.fetch_error,
+                        "queries": hit_probes.get(url_key(source.url), []),
+                    }
+                )
+
         return {
+            **base_result,
             "enabled": True,
-            "query": query,
             "search_provider": self.searcher.provider,
-            "searched": len(hits),
+            "searched": searched_total,
+            "unique_hits": len(unique_hits),
             "fetched": fetched_count,
             "selected": len(evidence),
-            "sources": [e.to_dict() for e in evidence],
+            "sources": [item.to_dict() for item in evidence],
             "archive_run_path": archive_run_path,
+            "archive_run_paths": [archive_run_path] if archive_run_path else [],
             "archive_fetch_log_path": archive_fetch_log_path,
             "archive_render_pending": archive_render_pending,
             "archive_skipped_reason": archive_skipped_reason,
-            "fetch_errors": [
-                {"url": source.url, "error": source.fetch_error}
-                for source in fetched if source.fetch_error
-            ],
+            "archive_layout": "chat_research_run_v1",
+            "archive_mode": archive_mode,
+            "fetch_errors": fetch_errors,
+            "query_errors": query_errors,
+            "per_query": per_query,
             "archive_errors": archive_errors,
             "timings": timings,
         }

@@ -1,6 +1,6 @@
 # Threat model and security boundaries
 
-**Reference:** `0.8.6-rc1`
+**Reference:** `0.8.7-rc1` development line
 
 This document states the security assumptions of SunaQ as they exist in the current release-candidate line. It separates **retrieval knowledge**, **authorization**, and **answer evidence** because these have deliberately different sharing rules.
 
@@ -14,7 +14,8 @@ It is an engineering threat model, not a certification or a claim that every dep
 4. **Shared retrieval knowledge is not the same thing as shared evidence.** Names, aliases and curated identity work may improve retrieval for other users; this does not grant access to the source document that originally motivated that knowledge.
 5. **Graph observations remain provenance-bearing.** Document-grounded claims are not silently promoted to unqualified global truth edges.
 6. **ACL uncertainty must never become destructive.** Lazy Finding cleanup is permitted only after a successful live-ACL request definitively denies a numeric Nextcloud file; backend, network, TLS, credential or configuration failures do not authorize deletion.
-6. **Remote model roles are explicit trust-boundary choices.** Administrators decide which roles may send which bounded context to a remote provider.
+7. **Portable retrieval provenance starts after live ACL for private candidates.** ResearchRun execution records must not expose raw pre-ACL hit counts, denied candidate identities, backend ranks or scores.
+8. **Remote model roles are explicit trust-boundary choices.** Administrators decide which roles may send which bounded context to a remote provider.
 
 ## 2. Assets and trust zones
 
@@ -146,6 +147,10 @@ window. A fixed-size, predeclared pre-rerank ACL candidate pool remains a
 possible future optimization. The design still does not call for adaptive
 "keep fetching until N authorized results exist" behavior.
 
+### Post-ACL provenance rule
+
+The same no-leak principle applies to stored diagnostics that travel with a user's ResearchRun. `retrieval-execution.v1.json` may record executed backend queries, but candidate identity and verifier decisions are projected only from the post-live-ACL result set. Ranks are expressed within that authorized set. Raw Elasticsearch/Qdrant hit counts, denied candidate identities, pre-ACL ES/RRF/vector ranks and backend scores are deliberately excluded. Richer pre-ACL diagnostics belong only in protected operator logs.
+
 ## 7. Untrusted content and prompt injection
 
 Content is not trustworthy merely because it is indexed.
@@ -160,7 +165,7 @@ Particularly untrusted inputs include:
 
 A passage such as "ignore previous instructions" is document content, not an instruction to SunaQ.
 
-SunaQ is not a general tool-using agent. Model output is not executed as Elasticsearch JSON DSL, Cypher, SQL or shell code. Elasticsearch and Qdrant are candidate-retrieval backends; the normal LLM rewrite produces a constrained SearchSpec, and live Nextcloud authorization is independent of document instructions. For that reason, indirect prompt injection in ordinary document retrieval is primarily an **evidence-integrity / retrieval-quality risk**, not an arbitrary-code-execution or ACL-bypass path.
+SunaQ is not a general tool-using agent. Model output is not executed as Elasticsearch JSON DSL, Cypher, SQL or shell code. Elasticsearch and Qdrant are candidate-retrieval backends; the normal LLM rewrite produces backend-neutral structured SearchSpec intent, deterministic middleware compiles backend requests, and live Nextcloud authorization is independent of document instructions. For that reason, indirect prompt injection in ordinary document retrieval is primarily an **evidence-integrity / retrieval-quality risk**, not an arbitrary-code-execution or ACL-bypass path.
 
 The more relevant boundaries are persistence and egress:
 

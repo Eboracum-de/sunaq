@@ -1,6 +1,6 @@
 # Roadmap
 
-**Baseline:** `0.8.6-rc1`
+**Baseline:** `0.8.7-rc1` development line
 
 This roadmap starts from the capabilities already delivered in the 0.8.6 release
 candidate. Historical work completed in 0.8.5 and earlier belongs in the
@@ -8,29 +8,30 @@ CHANGELOG and release notes rather than in the forward-looking roadmap.
 
 ## 0.8.6-rc1 baseline
 
-The current release candidate establishes the SunaQ product and architecture
+The 0.8.6 release candidate established the SunaQ product and architecture
 baseline:
 
-- user-visible research profiles **Schnell**, **Gründlich** and **Tief** with
+- user-visible research profiles **Standard (Schnell)**, **Thorough (Gründlich)** and **Deep (Tief)** with
   per-user entitlements;
 - request-local model/profile configuration and role-specific LLM routing;
 - startup-loaded administrator-owned model packages and prompt packs;
 - live Nextcloud ACL as the final authorization boundary for private evidence;
 - client-neutral source scopes with ordinary documents as the implicit provider
   default;
-- SunaQ Recherche 0.3.0 with profile selection, source chips, progress and
+- SunaQ Recherche 0.3.16 with profile selection, source chips, progress and
   deterministic follow-up actions;
 - SunaQ Admin for user/model permissions, credentials, Graph-Lite and Findings
   curation;
-- Super-Light as the Elasticsearch-centric deployment profile, with optional
-  Neo4j seeds/Graph-Lite and no required Qdrant/local reranker;
+- independent Standard/Dockerized deployment modes plus enforced SRC / ERG Internal /
+  ERG Full tiers; Dockerized SRC remains Elasticsearch-centric with no required
+  Qdrant or local reranker;
 - fresh-install prefix `/opt/sunaq` with legacy-installation compatibility;
 - explicit maintenance mode, smoke diagnostics and console backup/restore for
   SunaQ-owned operational state;
 - optional ACL metadata prefilter, exact extracted-content duplicate grouping,
   Research Findings and lazy ACL-based cleanup of uncurated Finding provenance.
 
-The rc1 profile comparison deliberately varies **budget only**. All shipped
+The 0.8.6 rc1 profile comparison deliberately varied **budget only**. All shipped
 profiles currently use one retrieval round, Evidence Review is off and planner
 thinking is off.
 
@@ -65,7 +66,51 @@ The existing modular policy-hook contract remains available, but concrete
 malware/DLP/URL-reputation adapters are not required for rc1.2. Core SSRF and SRC
 enforcement are application controls and do not depend on an optional evaluator.
 
-## 0.8.6-rc2 target
+## 0.8.7-rc1: retrieval architecture and provenance
+
+0.8.7-rc1 turns the earlier architecture terminology into a more explicit retrieval design.
+
+Implemented direction:
+
+- refine the historical two-envelope `src|erg` model into three enforced
+  retrieval/data-plane tiers: `src`, `erg_internal` and `erg_full`;
+- map shipped `core|workgroup|full` presets to SRC / ERG Internal / ERG Full
+  while keeping deployment/infrastructure availability orthogonal;
+- keep Qdrant availability deployment-owned: workgroup/full permit vector
+  retrieval as optional but do not force `qdrant.enabled`;
+- establish explicit Provider/Orchestrator, Resolver, `SrcRetriever` and
+  `ErgRetriever` responsibility boundaries;
+- make the normal Query Rewriter backend-neutral: it emits entities, concepts,
+  concept groups, constraints, semantic query and verification requirements
+  rather than Elasticsearch syntax;
+- compile required lexical alternatives deterministically into Files queries,
+  including MUST(OR(...)) concept groups and safe literal constraints;
+- preserve structured SearchSpec intent across the Provider → API transport
+  boundary and remove the historical short-query Fast Path from normal
+  SearchSpec execution;
+- keep SRC a first-class lexical retrieval system; ERG vector/graph capabilities
+  extend recall/research rather than serving as a required repair layer;
+- repair ResearchRun reservation/persistence ordering so provenance writers can
+  safely materialize a reserved run and provenance-only writes follow run start;
+- split provenance into `retrieval-decision.v2.json` and
+  `retrieval-execution.v1.json`;
+- make execution provenance post-live-ACL for private candidates: actual queries
+  may be recorded, but raw hit counts, denied candidate identities, pre-ACL
+  backend ranks and scores are excluded;
+- apply the same authorized-rank projection to `documents.json`;
+- run the static config check before trusting service health so architecture,
+  TLS and security contradictions are visible even when processes are reachable.
+
+Historical `architecture.tier: erg` remains an upgrade alias for
+`erg_full`. Model-processing and embedding egress remain orthogonal
+administrator decisions.
+
+The current branch deliberately keeps Standard/Thorough/Deep (Schnell/Thorough (Gründlich) / Deep (Tief)) at one retrieval
+round while the first-pass query architecture is stabilized. More retrieval
+rounds are a later quality experiment, not a substitute for correct first-pass
+semantic planning and deterministic compilation.
+
+## Post-0.8.7-rc1 targets
 
 ### Retrieval-quality experiments
 
@@ -73,7 +118,7 @@ enforcement are application controls and do not depend on an optional evaluator.
   broad search;
 - measure incremental relevant evidence, irrelevant-document growth, latency and
   LLM calls on real workloads;
-- keep Schnell at one round initially and evaluate bounded gap-driven rounds for
+- keep Standard (Schnell) at one round initially and evaluate bounded gap-driven rounds for
   Gründlich/Tief;
 - tune budgets/retrieval rounds independently so quality changes remain
   attributable.
@@ -102,7 +147,7 @@ enforcement are application controls and do not depend on an optional evaluator.
 Experimental additional ERG retrieval sources may be tested internally in this
 phase before any decision to make them part of the public supported surface.
 
-## Later 0.8.6 candidates
+## Later pre-1.0 candidates
 
 These items should remain independent so field results remain attributable.
 
@@ -122,13 +167,12 @@ because a question asks for "all" documents.
 
 ### Profile tuning
 
-Use real rc1 workloads to tune Schnell/Gründlich/Tief rather than changing the
-first release-candidate experiment prematurely.
+Use real workloads to tune Schnell/Gründlich/Tief after the 0.8.7-rc1 first-pass retrieval architecture has accumulated field data.
 
 Likely experiments include:
 
 - adjusting candidate and answer-context budgets;
-- evaluating whether Tief needs a larger window in normal corpora;
+- evaluating whether Deep (Tief) needs a larger window in normal corpora;
 - introducing an additional retrieval round for Gründlich/Tief only when evidence
   gaps justify it;
 - evaluating model/planner thinking with strict time and token limits. Reasoning
@@ -178,8 +222,8 @@ The following work is more important than additional UI features.
   logs and internal protocol vocabulary must not change with the selected locale;
 - separate model/profile IDs from their display names. For example,
   `sunaq-standard`, `sunaq-thorough` and `sunaq-deep` remain stable while
-  the visible labels may be `Schnell / Gründlich / Tief`,
-  `Fast / Thorough / Deep` or another configured localization;
+  the visible labels may be `Standard / Thorough / Deep`,
+  `Schnell / Gründlich / Tief` or another configured localization;
 - make SunaQ Recherche, SunaQ Admin, progress text, help text and other
   human-facing status/error messages locale-aware;
 - make human-readable API messages/default descriptions **English by default**

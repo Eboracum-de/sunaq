@@ -9,6 +9,7 @@ search:
   url: ""
   api_key_env: "WEB_SEARCH_API_KEY"
   max_results: 10
+  concurrency: 2
   timeout: 20
   verify_tls: true
 
@@ -19,7 +20,7 @@ fetch:
   max_redirects: 5
   max_bytes: 15000000
   max_text_chars: 300000
-  user_agent: "SunaQ-WebEvidence/0.8.6"
+  user_agent: "SunaQ-WebEvidence/0.8.7"
   # Public-Web retrieval is restricted to normal Web ports by default.
   allowed_ports: [80, 443]
   # UNSAFE compatibility escape hatch for controlled lab networks only.
@@ -35,12 +36,15 @@ relevance:
   preview_chars: 4200
   min_score: 0.58
   max_sources: 5
+  batch_size: 8
 
 archive:
-  # Live web and web archiving are separate opt-in capabilities.
+  # Persist full Web snapshots (text/raw/PDF/render metadata) below the current
+  # Chat ResearchRun. Live Web retrieval still works when this is false.
   enabled: false
-  # No root here in multi-user beta mode: target_path is per canonical user.
-  # An explicit archive.root is accepted only as a single-user compatibility fallback.
+  # Deprecated compatibility fields: old standalone Webarchiv roots remain
+  # readable and classified as Chatarchive evidence, but new runs never write there.
+  # root: "Webarchiv"
   exclude_from_internal_retrieval: true
   write_research_markdown: true
   write_text_snapshot: true

@@ -1,0 +1,43 @@
+version: "2.4"
+
+services:
+  api:
+    image: sunaq:0.8.7-rc1
+    build:
+      context: ../..
+      dockerfile: install/dockerized/Dockerfile.provider
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ../../runtime.container.env
+    environment:
+      RAG_API_HOST: "127.0.0.1"
+      RAG_API_PORT: "8765"
+    command: ["python", "-m", "uvicorn", "rag.api:app", "--host", "127.0.0.1", "--port", "8765"]
+    volumes:
+      - ../../config.yaml:/app/config.yaml:ro,z
+      - ../../web.yaml:/app/web.yaml:ro,z
+      - ../../models:/app/models:ro,z
+      - ../../runtime:/app/runtime:z
+      - ../../runtime/service-secrets:/run/sunaq-secrets:ro,z
+
+  provider:
+    image: sunaq:0.8.7-rc1
+    build:
+      context: ../..
+      dockerfile: install/dockerized/Dockerfile.provider
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ../../runtime.container.env
+    environment:
+      PROVIDER_HOST: "127.0.0.1"
+      PROVIDER_PORT: "8766"
+      RAG_MIDDLEWARE_URL: "http://127.0.0.1:8765"
+    command: ["python", "-m", "rag.provider_entrypoint"]
+    volumes:
+      - ../../config.yaml:/app/config.yaml:ro,z
+      - ../../web.yaml:/app/web.yaml:ro,z
+      - ../../models:/app/models:ro,z
+      - ../../runtime:/app/runtime:z
+      - ../../runtime/service-secrets:/run/sunaq-secrets:ro,z

@@ -15,11 +15,13 @@
   <nav class="primary-nav" aria-label="Hauptnavigation">
     <a class="{{ 'active' if path == '/rag-admin/' else '' }}" href="{{ request.app.url_path_for('admin_overview') }}">Übersicht</a>
     <a class="{{ 'active' if path.startswith('/rag-admin/users') else '' }}" href="{{ request.app.url_path_for('admin_users') }}">Benutzer</a>
-    <a class="{{ 'active' if graph_area else '' }}" href="{{ request.app.url_path_for('admin_findings') }}">Graph</a>
+    {% if graph_enabled %}<a class="{{ 'active' if graph_area else '' }}" href="{{ request.app.url_path_for('admin_findings') }}">Graph</a>{% endif %}
+    {% if vector_enabled %}<a class="{{ 'active' if path.startswith('/rag-admin/vector') else '' }}" href="{{ request.app.url_path_for('admin_vector') }}">Vektor</a>{% endif %}
+    <a class="{{ 'active' if path.startswith('/rag-admin/system') else '' }}" href="{{ request.app.url_path_for('admin_system') }}">System</a>
     <a class="{{ 'active' if path.startswith('/rag-admin/security') else '' }}" href="{{ request.app.url_path_for('admin_security') }}">Sicherheit</a>
   </nav>
 </header>
-{% if graph_area %}
+{% if graph_area and graph_enabled %}
 {% set scope_user_id = request.query_params.get('canonical_user_id', '') %}
 <nav class="sectionnav" aria-label="Graph-Navigation">
   <div>
@@ -43,6 +45,6 @@
   {% if message %}<div class="alert success">{{ message }}</div>{% endif %}
   {% block content %}{% endblock %}
 </main>
-<footer>AKI RAG Middleware · Administration, Sicherheit und Graph-Kuration · Secret-Werte werden nie angezeigt.</footer>
+<footer>SunaQ · Administration und Sicherheit{% if graph_enabled %} · Graph-Kuration{% endif %} · Secret-Werte werden nie angezeigt.</footer>
 </body>
 </html>

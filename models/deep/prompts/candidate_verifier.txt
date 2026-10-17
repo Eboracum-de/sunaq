@@ -21,10 +21,12 @@ Regeln:
    - concepts: wichtige unmittelbar behandelte Sachbegriffe.
    - mentioned_entities: Entitäten, die nur erwähnt, zitiert oder über ein anderes Dokument/einen anderen Vorgang referenziert werden.
 4. Unter "SICHERE EXPLIZITE CONSTRAINTS" angegebene Jahre, konkrete Daten, Identifikatoren oder vollständige Dateinamen sind bei status=match verbindlich. Fehlt die Evidenz, verwende uncertain. Ordnet der Dokumentinhalt den gesuchten Vorgang eindeutig einem widersprechenden Wert zu, verwende reject.
-5. Binde Entitäten an die vom Benutzer verlangten Rollen, Beziehungen oder den verlangten Gegenstand. Ein Dokument ist nur dann match, wenn DAS DOKUMENT SELBST die gesuchte Beziehung, Rollenrichtung oder den gesuchten Gegenstand direkt belegt.
-   Eine bloße Erwähnung, ein Zitat, eine Referenz auf eine andere Dokumentnummer oder ein verwandter Vorgang genügt nicht.
-   - relation_binding=direct: Das Dokument selbst belegt die verlangte Rollen-/Beziehungszuordnung bzw. den verlangten Gegenstand. Dies ist die einzige Bindung, die status=match erlaubt.
-   - relation_binding=reference_only: Die gesuchte Beziehung/Entität/Dokumentnummer wird nur erwähnt oder referenziert; status=reject.
+5. Binde Entitäten an den tatsächlichen Informationsbedarf des Benutzers.
+   - Bei einer konkreten Rollen-, Beziehungs- oder Dokumenttyp-Anfrage muss DAS DOKUMENT SELBST genau diese Rollenrichtung, Beziehung oder den verlangten Dokumenttyp belegen. Eine bloße Erwähnung, ein Zitat, eine Referenz auf eine andere Dokumentnummer oder ein verwandter Vorgang genügt dann nicht.
+   - Eine Anfrage, die im Wesentlichen nur aus einem Entitätsnamen besteht (z. B. "Example Holdings GmbH"), ist eine breite Entitäts-/Informationsanfrage. Ein Dokument ist dafür direkt passend, sobald es substanzielle Tatsachen über genau diese Entität enthält. Die Entität muss weder Hauptgegenstand des Dokuments noch des ursprünglichen Chats sein.
+   - Bei source_origin=chat_archive gehören auch im archivierten Chat wiedergegebene, fachlich aussagekräftige Quellen-/Elasticsearch-Ausschnitte zum prüfbaren Chatinhalt. Wenn ein solcher Ausschnitt der gesuchten Entität konkrete Eigenschaften, Personen, Rollen, Beteiligungen, Adressen oder Vorgänge zuordnet, ist das KEINE bloße Referenz. Dass die Information innerhalb eines Ausschnitts, Zitats oder Querverweises steht, macht sie nicht zu reference_only.
+   - relation_binding=direct: Das Dokument selbst enthält substanzielle, der gesuchten Entität klar zuordenbare Information für den verlangten Informationsbedarf. Bei breiten Entitätsanfragen umfasst dies auch inhaltlich aussagekräftige Querverweise und Quellen-/Suchausschnitte.
+   - relation_binding=reference_only: Die gesuchte Entität/Beziehung/Dokumentnummer wird lediglich genannt oder zitiert, ohne dass ihr eine für die Anfrage nutzbare Tatsache zugeordnet wird; status=reject.
    - relation_binding=contradicted: Das Dokument selbst belegt eine andere oder entgegengesetzte Rollen-/Beziehungszuordnung; status=reject.
    - relation_binding=unclear: OCR/Layoutverlust oder unzureichender Inhalt erlaubt keine sichere Bindung; status=uncertain.
 6. Firmennamen dürfen als Vollname oder als im Dokument plausibel erkennbare Kurzform vorkommen. Erfinde keine Aliase.

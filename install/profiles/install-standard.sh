@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Bootstrap a blank Linux VM into a usable SunaQ / Eboracum Research Gateway node.
-# 0.8.6-rc1.2 standard profile implementation.
+# 0.8.7-rc1 standard deployment implementation.
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PREFIX="/opt/sunaq"
@@ -11,18 +11,27 @@ PREFIX_EXPLICIT=0
 RAG_USER="rag"
 RAG_GROUP="rag"
 NEXTCLOUD_URL=""
+ALLOW_INSECURE_NEXTCLOUD=0
+ALLOW_INSECURE_NEXTCLOUD_EXPLICIT=0
 CA_CERTIFICATES=()
 ELASTICSEARCH_URL=""
 ELASTICSEARCH_INDEX=""
 INSTALL_SYSTEM_PACKAGES=1
 WITH_QDRANT=0
+QDRANT_EXPLICIT=0
+QDRANT_FROM_STATE=0
 WITH_NEO4J=0
+NEO4J_EXPLICIT=0
+NEO4J_FROM_STATE=0
+WITH_RESOLVER=0
+RESOLVER_EXPLICIT=0
+RESOLVER_FROM_STATE=0
 WITH_OPENWEBUI=0
 OPENWEBUI_EXPLICIT=0
 WITH_PLAYWRIGHT=0
 PLAYWRIGHT_EXPLICIT=0
 OPENWEBUI_FROM_STATE=0
-WITH_PROXY=1
+WITH_PROXY=0
 PROXY_EXPLICIT=0
 PROXY_FROM_STATE=0
 PROXY_HTTP_PORT=80
@@ -41,6 +50,22 @@ X509_STRICT=0
 X509_STRICT_EXPLICIT=0
 PRESET_FILE=""
 PRESET_NAME=""
+PRESET_IMPLICIT=0
+RERUN_DISABLE_EXPLICIT=0
+PRESET_COMPONENT_DISABLE_EXPLICIT=0
+ARCHITECTURE_TIER_REQUEST=""
+ARCHITECTURE_TIER_EXPLICIT=0
+LLM_SELECTION=""
+
+normalize_architecture_tier() {
+  local value="${1,,}"
+  case "$value" in
+    src) printf 'src' ;;
+    erg-internal|erg_internal) printf 'erg_internal' ;;
+    erg-full|erg_full|erg) printf 'erg_full' ;;
+    *) return 1 ;;
+  esac
+}
 
 usage() {
   cat <<USAGE
@@ -50,28 +75,29 @@ Options:
   --prefix PATH             Install directory (default: /opt/sunaq)
   --user USER               Service user (default: rag)
   --nextcloud-url URL       Override Nextcloud base URL in config.yaml
+  --allow-insecure-nextcloud Explicit lab exception permitting http:// Nextcloud
   --ca-certificate FILE     Trust one private CA certificate for Nextcloud; repeatable
   --elasticsearch-url URL   Override Elasticsearch URL in config.yaml
   --elasticsearch-index ID  Override Elasticsearch index in config.yaml
-  --preset core|workgroup   Apply a shipped capability preset
+  --architecture-tier TIER  Set normative tier: src | erg-internal | erg-full
+  --preset core|workgroup|full  Apply a recommended tier + capability combination
   --preset-file FILE        Apply a safe YAML capability overlay
+  --llm local|openai        Select canonical LLM routing (fresh default: local/Ollama)
   --skip-system-packages    Do not install OS packages/Docker
   --with-qdrant             Install/start a local Qdrant container
-  --with-neo4j              Install/start a local Neo4j container
-  --core                    Local data stack: Qdrant + Neo4j
+  --with-neo4j              Install/start local Neo4j where permitted by architecture
+  --with-resolver           Install/start local ERG resolver where permitted by architecture
+  --core                    Removed legacy shorthand; use --preset core or explicit components
   --with-openwebui          Start/retain bundled OpenWebUI
-  --no-openwebui            Disable/remove bundled OpenWebUI on this host
   --with-playwright         Enable/build/start Playwright Web-archive renderer
-  --no-playwright           Disable/remove Playwright Web-archive renderer
   --with-proxy              Start/retain bundled nginx reverse proxy
-  --no-proxy                Disable/remove bundled nginx reverse proxy
   --proxy-http-port PORT     nginx HTTP listen port (default: 80)
   --proxy-https-port PORT    nginx HTTPS listen port (default: 443)
   --no-proxy-basic-auth     Disable nginx Basic Auth gate; rate limits remain active
   --multi-user             Explicitly select the default multi-user credential_store mode
   --single-user            Explicit one-user mode; live ACL remains enabled
   --acl-off                Diagnostic only: disable live document ACL explicitly
-  --full                   Full bundled stack: Qdrant + Neo4j + OpenWebUI
+  --full                   Removed legacy shorthand; use --preset full or explicit components
   --with-systemd           Also install/enable optional systemd services
   --no-systemd             Legacy alias; keep systemd integration disabled
   --with-reranker-download Pre-download local Hugging Face reranker model (opt-in)
@@ -79,16 +105,25 @@ Options:
   --x509-strict            Enable Python/OpenSSL VERIFY_X509_STRICT (default: off)
   --no-x509-strict         Compatibility alias; keep strict mode disabled
   --plan                    Show the installation plan and exit without changes
+
+Rerun/removal only (not fresh-install composition):
+  --no-qdrant               Disable/remove local Qdrant
+  --no-neo4j                Disable/remove local Neo4j
+  --no-resolver             Disable/remove local ERG resolver
+  --no-openwebui            Disable/remove bundled OpenWebUI
+  --no-playwright           Disable/remove Playwright renderer
+  --no-proxy                Disable/remove bundled nginx reverse proxy
   -y, --yes                Assume yes; run non-interactively without confirmation
   -h, --help               Show this help
 
 Examples:
-  sudo ./install/install.sh                 # minimal: proxy + middleware, external Nextcloud/Ollama
-  sudo ./install/install.sh --core
-  sudo ./install/install.sh --full
+  sudo ./install/install.sh --preset core
+  sudo ./install/install.sh --preset workgroup --with-qdrant
+  sudo ./install/install.sh --architecture-tier erg-internal --with-neo4j
+  sudo ./install/install.sh --preset full --with-openwebui
   sudo ./install/install.sh --single-user
   sudo ./install/install.sh --plan --full
-  sudo ./install/install.sh -y --with-qdrant --with-neo4j --with-openwebui
+  sudo ./install/install.sh -y --preset workgroup --with-qdrant --with-openwebui
 USAGE
 }
 
@@ -97,35 +132,61 @@ while [[ $# -gt 0 ]]; do
     --prefix) PREFIX="$2"; PREFIX_EXPLICIT=1; shift 2 ;;
     --user) RAG_USER="$2"; RAG_GROUP="$2"; shift 2 ;;
     --nextcloud-url) [[ $# -ge 2 ]] || { echo "--nextcloud-url requires a URL" >&2; exit 2; }; NEXTCLOUD_URL="$2"; shift 2 ;;
+    --allow-insecure-nextcloud) ALLOW_INSECURE_NEXTCLOUD=1; ALLOW_INSECURE_NEXTCLOUD_EXPLICIT=1; shift ;;
     --ca-certificate) [[ $# -ge 2 ]] || { echo "--ca-certificate requires a file" >&2; exit 2; }; CA_CERTIFICATES+=("$2"); shift 2 ;;
     --elasticsearch-url) [[ $# -ge 2 ]] || { echo "--elasticsearch-url requires a URL" >&2; exit 2; }; ELASTICSEARCH_URL="$2"; shift 2 ;;
     --elasticsearch-index) [[ $# -ge 2 ]] || { echo "--elasticsearch-index requires an index" >&2; exit 2; }; ELASTICSEARCH_INDEX="$2"; shift 2 ;;
+    --architecture-tier|--architecture_tier)
+      [[ $# -ge 2 ]] || { echo "--architecture-tier requires src, erg-internal or erg-full" >&2; exit 2; }
+      ARCHITECTURE_TIER_REQUEST="$(normalize_architecture_tier "$2")" || { echo "Unknown architecture tier: $2" >&2; exit 2; }
+      ARCHITECTURE_TIER_EXPLICIT=1
+      shift 2 ;;
+    --architecture-tier=*|--architecture_tier=*)
+      raw_tier="${1#*=}"
+      ARCHITECTURE_TIER_REQUEST="$(normalize_architecture_tier "$raw_tier")" || { echo "Unknown architecture tier: $raw_tier" >&2; exit 2; }
+      ARCHITECTURE_TIER_EXPLICIT=1
+      shift ;;
     --preset)
-      [[ $# -ge 2 ]] || { echo "--preset requires core or workgroup" >&2; exit 2; }
-      case "$2" in core|workgroup) PRESET_NAME="$2"; PRESET_FILE="$SOURCE_DIR/install/presets/$2.yaml" ;; *) echo "Unknown preset: $2" >&2; exit 2 ;; esac
+      [[ $# -ge 2 ]] || { echo "--preset requires core, workgroup or full" >&2; exit 2; }
+      case "$2" in core|workgroup|full) PRESET_NAME="$2"; PRESET_FILE="$SOURCE_DIR/install/presets/$2.yaml" ;; *) echo "Unknown preset: $2" >&2; exit 2 ;; esac
       shift 2 ;;
     --preset-file)
       [[ $# -ge 2 ]] || { echo "--preset-file requires a readable YAML file" >&2; exit 2; }
       PRESET_NAME="custom"; PRESET_FILE="$2"; shift 2 ;;
+    --llm)
+      [[ $# -ge 2 ]] || { echo "--llm requires local or openai" >&2; exit 2; }
+      case "$2" in local|openai) LLM_SELECTION="$2" ;; *) echo "Unknown LLM selection: $2" >&2; exit 2 ;; esac
+      shift 2 ;;
+    --llm=*)
+      case "${1#*=}" in local|openai) LLM_SELECTION="${1#*=}" ;; *) echo "Unknown LLM selection: ${1#*=}" >&2; exit 2 ;; esac
+      shift ;;
     --skip-system-packages) INSTALL_SYSTEM_PACKAGES=0; shift ;;
-    --with-qdrant) WITH_QDRANT=1; shift ;;
-    --with-neo4j) WITH_NEO4J=1; shift ;;
-    --core) WITH_QDRANT=1; WITH_NEO4J=1; shift ;;
+    --with-qdrant) WITH_QDRANT=1; QDRANT_EXPLICIT=1; shift ;;
+    --no-qdrant) WITH_QDRANT=0; QDRANT_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; PRESET_COMPONENT_DISABLE_EXPLICIT=1; shift ;;
+    --with-neo4j) WITH_NEO4J=1; NEO4J_EXPLICIT=1; shift ;;
+    --no-neo4j) WITH_NEO4J=0; NEO4J_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; PRESET_COMPONENT_DISABLE_EXPLICIT=1; shift ;;
+    --with-resolver) WITH_RESOLVER=1; RESOLVER_EXPLICIT=1; shift ;;
+    --no-resolver) WITH_RESOLVER=0; RESOLVER_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; PRESET_COMPONENT_DISABLE_EXPLICIT=1; shift ;;
+    --core)
+      echo "--core was a legacy component shorthand (Qdrant + Neo4j) and conflicts with --preset core = SRC. Use --preset core or explicit --with-* component switches." >&2
+      exit 2 ;;
     --with-ollama|--ollama-gpu|--ollama-models) echo "Bundled Ollama is not part of this release; install/manage Ollama or another compatible backend separately and configure its URL in config.yaml/provider.env." >&2; exit 2 ;;
     --with-openwebui) WITH_OPENWEBUI=1; OPENWEBUI_EXPLICIT=1; shift ;;
-    --no-openwebui) WITH_OPENWEBUI=0; OPENWEBUI_EXPLICIT=1; shift ;;
+    --no-openwebui) WITH_OPENWEBUI=0; OPENWEBUI_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; shift ;;
     --with-playwright) WITH_PLAYWRIGHT=1; PLAYWRIGHT_EXPLICIT=1; shift ;;
-    --no-playwright) WITH_PLAYWRIGHT=0; PLAYWRIGHT_EXPLICIT=1; shift ;;
+    --no-playwright) WITH_PLAYWRIGHT=0; PLAYWRIGHT_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; shift ;;
     --with-searxng) echo "--with-searxng was removed from the bundled stack; install/configure SearXNG externally and point web.yaml to it." >&2; exit 2 ;;
     --with-proxy) WITH_PROXY=1; PROXY_EXPLICIT=1; shift ;;
-    --no-proxy) WITH_PROXY=0; PROXY_EXPLICIT=1; shift ;;
+    --no-proxy) WITH_PROXY=0; PROXY_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; shift ;;
     --proxy-http-port) [[ $# -ge 2 ]] || { echo "--proxy-http-port requires a port" >&2; exit 2; }; PROXY_HTTP_PORT="$2"; PROXY_HTTP_PORT_EXPLICIT=1; shift 2 ;;
     --proxy-https-port) [[ $# -ge 2 ]] || { echo "--proxy-https-port requires a port" >&2; exit 2; }; PROXY_HTTPS_PORT="$2"; PROXY_HTTPS_PORT_EXPLICIT=1; shift 2 ;;
     --no-proxy-basic-auth) PROXY_BASIC_AUTH=0; shift ;;
     --multi-user) MULTI_USER=1; ACL_OFF=0; ACL_MODE_EXPLICIT=1; shift ;;
     --single-user) MULTI_USER=0; ACL_OFF=0; ACL_MODE_EXPLICIT=1; shift ;;
     --acl-off) MULTI_USER=0; ACL_OFF=1; ACL_MODE_EXPLICIT=1; shift ;;
-    --full) WITH_QDRANT=1; WITH_NEO4J=1; WITH_OPENWEBUI=1; shift ;;
+    --full)
+      echo "--full was a legacy component shorthand and is ambiguous with --preset full = ERG Full. Use --preset full plus explicit local component switches." >&2
+      exit 2 ;;
     --with-systemd) WITH_SYSTEMD=1; shift ;;
     --no-systemd) WITH_SYSTEMD=0; shift ;;
     --with-reranker-download) DOWNLOAD_RERANKER=1; shift ;;
@@ -200,6 +261,8 @@ load_install_state() {
 
   local state_local_qdrant=0
   local state_local_neo4j=0
+  local state_local_resolver=0
+  local state_local_resolver_seen=0
   local state_local_openwebui=0
   local state_local_playwright=0
   local state_local_proxy=1
@@ -213,6 +276,7 @@ load_install_state() {
     case "$key" in
       LOCAL_QDRANT) state_local_qdrant="$(read_state_bool "$key" "$value")" ;;
       LOCAL_NEO4J) state_local_neo4j="$(read_state_bool "$key" "$value")" ;;
+      LOCAL_RESOLVER) state_local_resolver="$(read_state_bool "$key" "$value")"; state_local_resolver_seen=1 ;;
       LOCAL_OPENWEBUI) state_local_openwebui="$(read_state_bool "$key" "$value")" ;;
       LOCAL_PLAYWRIGHT) state_local_playwright="$(read_state_bool "$key" "$value")" ;;
       LOCAL_PROXY) state_local_proxy="$(read_state_bool "$key" "$value")" ;;
@@ -231,8 +295,18 @@ load_install_state() {
 
   # Reruns are additive: previously installed local components stay selected
   # unless an explicit removal mechanism is added in a later release.
-  [[ $WITH_QDRANT -eq 0 && $state_local_qdrant -eq 1 ]] && WITH_QDRANT=1
-  [[ $WITH_NEO4J -eq 0 && $state_local_neo4j -eq 1 ]] && WITH_NEO4J=1
+  if [[ $QDRANT_EXPLICIT -eq 0 && $state_local_qdrant -eq 1 ]]; then
+    WITH_QDRANT=1
+    QDRANT_FROM_STATE=1
+  fi
+  if [[ $NEO4J_EXPLICIT -eq 0 && $state_local_neo4j -eq 1 ]]; then
+    WITH_NEO4J=1
+    NEO4J_FROM_STATE=1
+  fi
+  if [[ $RESOLVER_EXPLICIT -eq 0 && $state_local_resolver_seen -eq 1 ]]; then
+    WITH_RESOLVER=$state_local_resolver
+    [[ $state_local_resolver -eq 1 ]] && RESOLVER_FROM_STATE=1
+  fi
   if [[ $OPENWEBUI_EXPLICIT -eq 0 ]]; then
     WITH_OPENWEBUI=$state_local_openwebui
     [[ $state_local_openwebui -eq 1 ]] && OPENWEBUI_FROM_STATE=1
@@ -252,6 +326,72 @@ load_install_state() {
 
 validate_install_prefix
 load_install_state
+
+# Fresh installations start from the conservative core capability baseline.
+# --architecture-tier may widen only the policy envelope; it does not
+# implicitly enable ERG components. Named presets remain explicit shortcuts.
+if [[ -z "$PRESET_NAME" && $PREFIX_RECOGNIZED_SUNAQ -eq 0 ]]; then
+  # Safe implementation baseline only; this is deliberately not a named
+  # preset. Publicly, a tier-only install has no capability preset selected.
+  PRESET_FILE="$SOURCE_DIR/install/presets/core.yaml"
+  PRESET_IMPLICIT=1
+fi
+
+if [[ $RERUN_DISABLE_EXPLICIT -eq 1 && $PREFIX_RECOGNIZED_SUNAQ -eq 0 ]]; then
+  echo "Negative component switches (--no-*) are rerun/removal operations only." >&2
+  echo "On a fresh install, omit the component instead of disabling it explicitly." >&2
+  exit 2
+fi
+if [[ $PRESET_COMPONENT_DISABLE_EXPLICIT -eq 1 && "$PRESET_NAME" =~ ^(core|workgroup|full)$ ]]; then
+  echo "Named presets are atomic shortcuts and cannot be combined with --no-qdrant/--no-neo4j/--no-resolver." >&2
+  echo "Select --architecture-tier and list the wanted --with-* components instead." >&2
+  exit 2
+fi
+
+yaml_component_enabled() {
+  local section="$1" file="$2"
+  [[ -r "$file" ]] || return 1
+  awk -v section="$section" '
+    $0 ~ "^" section ":[[:space:]]*$" { in_section=1; next }
+    in_section && /^[^[:space:]#]/ { exit }
+    in_section && /^  enabled:[[:space:]]*/ {
+      value=$0
+      sub(/^  enabled:[[:space:]]*/, "", value)
+      sub(/[[:space:]]+#.*$/, "", value)
+      gsub(/[[:space:]"]/, "", value)
+      exit !(tolower(value) ~ /^(1|true|yes|on)$/)
+    }
+    END { if (!in_section) exit 1 }
+  ' "$file"
+}
+
+apply_preset_component_defaults() {
+  if [[ $QDRANT_EXPLICIT -eq 0 && $QDRANT_FROM_STATE -eq 0 ]]; then
+    case "$PRESET_NAME" in
+      workgroup|full) WITH_QDRANT=1 ;;
+      core) WITH_QDRANT=0 ;;
+      custom) yaml_component_enabled qdrant "$PRESET_FILE" && WITH_QDRANT=1 || WITH_QDRANT=0 ;;
+      "") yaml_component_enabled qdrant "$PREFIX/config.yaml" && WITH_QDRANT=1 || WITH_QDRANT=0 ;;
+    esac
+  fi
+  if [[ $NEO4J_EXPLICIT -eq 0 && $NEO4J_FROM_STATE -eq 0 ]]; then
+    case "$PRESET_NAME" in
+      workgroup|full) WITH_NEO4J=1 ;;
+      core) WITH_NEO4J=0 ;;
+      custom) yaml_component_enabled neo4j "$PRESET_FILE" && WITH_NEO4J=1 || WITH_NEO4J=0 ;;
+      "") yaml_component_enabled neo4j "$PREFIX/config.yaml" && WITH_NEO4J=1 || WITH_NEO4J=0 ;;
+    esac
+  fi
+  if [[ $RESOLVER_EXPLICIT -eq 0 && $RESOLVER_FROM_STATE -eq 0 ]]; then
+    case "$PRESET_NAME" in
+      workgroup|full) WITH_RESOLVER=1 ;;
+      core) WITH_RESOLVER=0 ;;
+      custom) yaml_component_enabled resolver "$PRESET_FILE" && WITH_RESOLVER=1 || WITH_RESOLVER=0 ;;
+      "") yaml_component_enabled resolver "$PREFIX/config.yaml" && WITH_RESOLVER=1 || WITH_RESOLVER=0 ;;
+    esac
+  fi
+}
+apply_preset_component_defaults
 
 validate_port() {
   local name="$1" value="$2"
@@ -286,7 +426,140 @@ for ca_source in "${CA_CERTIFICATES[@]}"; do
   fi
 done
 
+read_architecture_tier_from_yaml() {
+  local file="$1"
+  [[ -r "$file" ]] || return 1
+  awk '
+    /^architecture:[[:space:]]*$/ { in_architecture=1; next }
+    in_architecture && /^[^[:space:]#]/ { exit }
+    in_architecture && /^  tier:[[:space:]]*/ {
+      value=$0
+      sub(/^  tier:[[:space:]]*/, "", value)
+      sub(/[[:space:]#].*$/, "", value)
+      gsub(/["[:space:]]/, "", value)
+      print tolower(value)
+      exit
+    }
+  ' "$file"
+}
+preset_architecture_tier() {
+  local tier=""
+  case "$PRESET_NAME" in
+    core) tier="src" ;;
+    workgroup) tier="erg_internal" ;;
+    full) tier="erg_full" ;;
+    custom) tier="$(read_architecture_tier_from_yaml "$PRESET_FILE" || true)" ;;
+  esac
+  case "$tier" in
+    erg|erg-full) tier="erg_full" ;;
+    erg-internal) tier="erg_internal" ;;
+  esac
+  printf '%s' "$tier"
+}
+
+validate_preset_architecture_compatibility() {
+  [[ $ARCHITECTURE_TIER_EXPLICIT -eq 1 ]] || return 0
+  [[ $PRESET_IMPLICIT -eq 0 ]] || return 0
+  local preset_tier
+  preset_tier="$(preset_architecture_tier)"
+  [[ -n "$preset_tier" ]] || return 0
+  if [[ "$preset_tier" != "$ARCHITECTURE_TIER_REQUEST" ]]; then
+    echo "Preset '$PRESET_NAME' selects architecture tier '$preset_tier', but --architecture-tier '$ARCHITECTURE_TIER_REQUEST' was requested." >&2
+    echo "Use a matching tier or configure capabilities without that preset." >&2
+    exit 2
+  fi
+}
+
+requested_architecture_tier() {
+  local tier=""
+  if [[ $ARCHITECTURE_TIER_EXPLICIT -eq 1 ]]; then
+    printf '%s' "$ARCHITECTURE_TIER_REQUEST"
+    return 0
+  fi
+  if [[ $PRESET_IMPLICIT -eq 1 ]]; then
+    printf 'src'
+    return 0
+  fi
+  case "$PRESET_NAME" in
+    core) tier="src" ;;
+    workgroup) tier="erg_internal" ;;
+    full) tier="erg_full" ;;
+    custom)
+      tier="$(read_architecture_tier_from_yaml "$PRESET_FILE" || true)"
+      if [[ -z "$tier" && -r "$PREFIX/config.yaml" ]]; then
+        tier="$(read_architecture_tier_from_yaml "$PREFIX/config.yaml" || true)"
+      fi
+      [[ -n "$tier" ]] || tier="$(read_architecture_tier_from_yaml "$SOURCE_DIR/config.yaml" || true)"
+      ;;
+    "")
+      if [[ -r "$PREFIX/config.yaml" ]]; then
+        tier="$(read_architecture_tier_from_yaml "$PREFIX/config.yaml" || true)"
+      fi
+      [[ -n "$tier" ]] || tier="$(read_architecture_tier_from_yaml "$SOURCE_DIR/config.yaml" || true)"
+      ;;
+  esac
+  case "$tier" in
+    erg|erg-full) tier="erg_full" ;;
+    erg-internal) tier="erg_internal" ;;
+  esac
+  printf '%s' "$tier"
+}
+
+validate_requested_architecture_capabilities() {
+  local tier
+  tier="$(requested_architecture_tier)"
+  case "$tier" in
+    src)
+      [[ $WITH_QDRANT -eq 0 ]] || {
+        echo "Invalid architecture selection: SRC cannot install/retain Qdrant derived state." >&2
+        exit 2
+      }
+      [[ $WITH_NEO4J -eq 0 ]] || {
+        echo "Invalid architecture selection: SRC cannot install/retain Neo4j derived state." >&2
+        exit 2
+      }
+      if [[ $RESOLVER_EXPLICIT -eq 1 && $WITH_RESOLVER -eq 1 ]]; then
+        echo "Invalid architecture selection: SRC cannot enable the ERG resolver." >&2
+        exit 2
+      fi
+      [[ $RESOLVER_EXPLICIT -eq 1 ]] || WITH_RESOLVER=0
+      if [[ $WITH_PLAYWRIGHT -eq 1 ]]; then
+        echo "Invalid architecture selection: Playwright/Web acquisition requires ERG Full; SRC cannot enable --with-playwright." >&2
+        echo "Use --preset full or remove --with-playwright." >&2
+        exit 2
+      fi
+      ;;
+    erg_internal)
+      if [[ $WITH_PLAYWRIGHT -eq 1 ]]; then
+        echo "Invalid architecture selection: Playwright/Web acquisition requires ERG Full; ERG Internal cannot enable --with-playwright." >&2
+        echo "Use --preset full or remove --with-playwright." >&2
+        exit 2
+      fi
+      ;;
+    erg_full) ;;
+    *)
+      echo "Cannot determine a supported architecture tier for the requested plan: ${tier:-<unset>}" >&2
+      exit 2
+      ;;
+  esac
+}
+
+validate_preset_architecture_compatibility
+validate_requested_architecture_capabilities
 log() { printf '\n==> %s\n' "$*"; }
+
+detect_host_name() {
+  local name=""
+  if command -v hostname >/dev/null 2>&1; then
+    name="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
+  fi
+  if [[ -z "$name" ]] && command -v uname >/dev/null 2>&1; then
+    name="$(uname -n 2>/dev/null || true)"
+  fi
+  [[ -n "$name" ]] || name="sunaq-local"
+  printf '%s' "$name"
+}
+
 
 probe_service_url() {
   local label="$1" url="$2"
@@ -322,7 +595,7 @@ print_plan() {
   fi
 
   local docker_needed=0
-  if [[ $WITH_PROXY -eq 1 || $WITH_QDRANT -eq 1 || $WITH_NEO4J -eq 1 || $WITH_OPENWEBUI -eq 1 || $WITH_PLAYWRIGHT -eq 1 ]]; then
+  if [[ $WITH_PROXY -eq 1 || $WITH_QDRANT -eq 1 || $WITH_NEO4J -eq 1 || $WITH_RESOLVER -eq 1 || $WITH_OPENWEBUI -eq 1 || $WITH_PLAYWRIGHT -eq 1 ]]; then
     docker_needed=1
   fi
 
@@ -338,14 +611,17 @@ Reverse proxy/nginx:     $([[ $WITH_PROXY -eq 1 ]] && echo "install/start; HTTPS
 Proxy Basic Auth gate:    $([[ $WITH_PROXY -eq 1 && $PROXY_BASIC_AUTH -eq 1 ]] && echo enabled || echo disabled)
 Qdrant:                  $([[ $WITH_QDRANT -eq 1 ]] && echo install/start || echo disabled/external)
 Neo4j:                   $([[ $WITH_NEO4J -eq 1 ]] && echo install/start || echo disabled/external)
+ERG resolver:             $([[ $WITH_RESOLVER -eq 1 ]] && echo local/component || echo disabled)
 Python venv/dependencies: install/update
 Reranker model cache:     $([[ $DOWNLOAD_RERANKER -eq 1 ]] && echo "pre-download requested (used only for backend=local)" || echo "skip (default; reranker opt-in)")
 LLM/embedding backend:    external/admin-managed (Ollama or compatible service)
 Nextcloud URL override:   ${NEXTCLOUD_URL:-<preserve/configure in config.yaml>}
+Insecure Nextcloud HTTP:  $([[ $ALLOW_INSECURE_NEXTCLOUD -eq 1 ]] && echo "explicitly allowed (LAB ONLY)" || echo "blocked")
 Nextcloud private CA:      ${#CA_CERTIFICATES[@]} certificate(s) supplied on this run
 Elasticsearch URL:       ${ELASTICSEARCH_URL:-<preserve/configure in config.yaml>}
 Elasticsearch index:     ${ELASTICSEARCH_INDEX:-<preserve/configure in config.yaml>}
-Capability preset:       ${PRESET_NAME:-<none; preserve site configuration>}
+Architecture tier:       $(requested_architecture_tier)
+Capability preset:       ${PRESET_NAME:-<none>}
 OpenWebUI:                $([[ $WITH_OPENWEBUI -eq 1 ]] && echo "install/start$([[ $OPENWEBUI_FROM_STATE -eq 1 ]] && echo ' (retained from existing install; use --no-openwebui to disable)')" || echo external/skip)
 Playwright renderer:      $([[ $PLAYWRIGHT_EXPLICIT -eq 1 ]] && ([[ $WITH_PLAYWRIGHT -eq 1 ]] && echo enable/build/start || echo disable/remove) || ([[ $WITH_PLAYWRIGHT -eq 1 ]] && echo "retain enabled state" || echo "preserve web.yaml state"))
 Web search service:       external/admin-managed (not bundled)
@@ -411,7 +687,7 @@ preflight_existing_install() {
   fi
 
   local docker_selected=0
-  [[ $WITH_PROXY -eq 1 || $WITH_QDRANT -eq 1 || $WITH_NEO4J -eq 1 || $WITH_OPENWEBUI -eq 1 || $WITH_PLAYWRIGHT -eq 1 ]] && docker_selected=1
+  [[ $WITH_PROXY -eq 1 || $WITH_QDRANT -eq 1 || $WITH_NEO4J -eq 1 || $WITH_RESOLVER -eq 1 || $WITH_OPENWEBUI -eq 1 || $WITH_PLAYWRIGHT -eq 1 ]] && docker_selected=1
 
   if command -v docker >/dev/null 2>&1; then
     if docker info >/dev/null 2>&1; then
@@ -478,6 +754,12 @@ preflight_existing_install() {
   echo "[INFO] Existing SunaQ installation is stopped; rerun may update it."
 }
 
+if [[ -n "$NEXTCLOUD_URL" && "$NEXTCLOUD_URL" == http://* && $ALLOW_INSECURE_NEXTCLOUD -ne 1 ]]; then
+  echo "Refusing http:// Nextcloud URL without explicit lab exception." >&2
+  echo "Use HTTPS, or add --allow-insecure-nextcloud for a deliberate lab-only installation." >&2
+  exit 2
+fi
+
 if [[ $PLAN_ONLY -eq 1 ]]; then
   print_plan
   exit 0
@@ -519,7 +801,7 @@ select_python() {
 }
 
 docker_needed() {
-  [[ $WITH_PROXY -eq 1 || $WITH_QDRANT -eq 1 || $WITH_NEO4J -eq 1 || $WITH_OPENWEBUI -eq 1 || $WITH_PLAYWRIGHT -eq 1 ]]
+  [[ $WITH_PROXY -eq 1 || $WITH_QDRANT -eq 1 || $WITH_NEO4J -eq 1 || $WITH_RESOLVER -eq 1 || $WITH_OPENWEBUI -eq 1 || $WITH_PLAYWRIGHT -eq 1 ]]
 }
 
 install_system_packages() {
@@ -665,27 +947,41 @@ if [[ -d "$PREFIX/install/nginx/tls" ]]; then
   cp -a "$PREFIX/install/nginx/tls/." "$INSTALL_TLS_BACKUP/" 2>/dev/null || true
 fi
 # Preserve local runtime/config files on reruns; copy source files around them.
-for item in rag prompts ontology install docs clients requirements.txt versions.lock.yaml pyproject.toml reset-rag.sh start-api.sh start-openwebui-provider.sh start-graph-worker.sh start-sync-worker.sh start-mail-worker.sh start-all.sh stop-all.sh status.sh provider.env.example README.md CHANGELOG.md SECURITY.md; do
+for item in rag erg_resolver prompts ontology install docs clients requirements.txt requirements-resolver.txt versions.lock.yaml pyproject.toml reset-rag.sh start-api.sh start-openwebui-provider.sh start-graph-worker.sh start-sync-worker.sh start-mail-worker.sh start-all.sh stop-all.sh status.sh provider.env.example README.md CHANGELOG.md SECURITY.md; do
   rm -rf "$PREFIX/$item"
   cp -a "$SOURCE_DIR/$item" "$PREFIX/$item"
 done
-# SunaQ model packages are administrator-owned configuration after first
-# installation. Seed the directory once, then add only newly shipped package
-# directories on upgrades. Existing packages are never overwritten, preserving
-# local profile/LLM/prompt tuning while allowing new bundled profiles to appear.
-if [[ ! -d "$PREFIX/models" ]]; then
-  cp -a "$SOURCE_DIR/models" "$PREFIX/models"
-else
-  for source_model in "$SOURCE_DIR"/models/*; do
-    [[ -d "$source_model" ]] || continue
-    model_name="$(basename "$source_model")"
-    if [[ ! -e "$PREFIX/models/$model_name" ]]; then
-      cp -a "$source_model" "$PREFIX/models/$model_name"
-      log "Added new SunaQ model package: $model_name"
-    fi
-  done
+# SunaQ model packages become administrator-owned configuration once
+# installed. Seed/add enabled shipped packages only; source packages marked
+# top-level "enabled: false" are development/experimental material and are not
+# installed automatically. Existing site-owned packages are never overwritten.
+model_package_enabled() {
+  local profile="$1/profile.yaml" value=""
+  [[ -f "$profile" ]] || return 0
+  value="$(sed -n 's/^enabled:[[:space:]]*//p' "$profile" | head -1 | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "$value" in
+    false|0|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+mkdir -p "$PREFIX/models"
+if [[ -f "$SOURCE_DIR/models/README.md" && ! -e "$PREFIX/models/README.md" ]]; then
+  cp -a "$SOURCE_DIR/models/README.md" "$PREFIX/models/README.md"
 fi
+for source_model in "$SOURCE_DIR"/models/*; do
+  [[ -d "$source_model" ]] || continue
+  model_name="$(basename "$source_model")"
+  if ! model_package_enabled "$source_model"; then
+    log "Skipping disabled SunaQ model package: $model_name"
+    continue
+  fi
+  if [[ ! -e "$PREFIX/models/$model_name" ]]; then
+    cp -a "$source_model" "$PREFIX/models/$model_name"
+    log "Added new SunaQ model package: $model_name"
+  fi
+done
 chmod 0755 "$PREFIX/install/maintenance-mode.sh"
+chmod 0755 "$PREFIX/install/smoke-test.sh"
 if [[ -n "$INSTALL_ENV_BACKUP" ]]; then
   mv "$INSTALL_ENV_BACKUP" "$PREFIX/install/.env"
 fi
@@ -702,6 +998,35 @@ done
 if [[ ! -e "$PREFIX/provider.env" ]]; then
   cp -a "$SOURCE_DIR/provider.env.example" "$PREFIX/provider.env"
 fi
+set_provider_env_value() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { found=0 }
+    index($0, key "=") == 1 { print key "=" value; found=1; next }
+    { print }
+    END { if (!found) print key "=" value }
+  ' "$PREFIX/provider.env" > "$tmp"
+  cat "$tmp" > "$PREFIX/provider.env"
+  rm -f "$tmp"
+}
+if [[ -n "$LLM_SELECTION" ]]; then
+  if [[ "$LLM_SELECTION" == "openai" ]]; then
+    set_provider_env_value LLM_BACKEND openai
+    set_provider_env_value LLM_BASE_URL https://api.openai.com/v1
+    set_provider_env_value LLM_MODEL gpt-5.6-luna
+    set_provider_env_value FOLLOWUP_MODEL gpt-5.6-luna
+    set_provider_env_value EVIDENCE_MODEL gpt-5.6-luna
+    set_provider_env_value ANSWER_MODEL gpt-5.6-luna
+  else
+    set_provider_env_value LLM_BACKEND ollama
+    set_provider_env_value LLM_BASE_URL http://127.0.0.1:11434
+    set_provider_env_value LLM_MODEL qwen3:8b
+    set_provider_env_value FOLLOWUP_MODEL qwen3:8b
+    set_provider_env_value EVIDENCE_MODEL qwen3:8b
+    set_provider_env_value ANSWER_MODEL qwen3:8b
+  fi
+fi
 cat > "$PREFIX/.sunaq-installation" <<MARKER
 SUNAQ_INSTALLATION=1
 DEPLOYMENT_PROFILE=standard
@@ -710,6 +1035,18 @@ MARKER
 chmod 0644 "$PREFIX/.sunaq-installation"
 mkdir -p "$PREFIX/runtime" "$PREFIX/runtime/ca"
 chmod 700 "$PREFIX/runtime"
+if [[ ! -f "$PREFIX/runtime/worker-control.json" ]]; then
+  cat > "$PREFIX/runtime/worker-control.json" <<'EOF'
+{
+  "version": 1,
+  "workers": {
+    "sync_worker": false,
+    "mail_worker": false
+  }
+}
+EOF
+  chmod 600 "$PREFIX/runtime/worker-control.json"
+fi
 NEXTCLOUD_CA_FILE=""
 if [[ ${#CA_CERTIFICATES[@]} -gt 0 ]]; then
   log "Installing private CA bundle for Nextcloud TLS"
@@ -771,7 +1108,7 @@ if [[ -n "$PRESET_FILE" ]]; then
   cp "$PRESET_FILE" "$PRESET_STAGE"
   chmod 0640 "$PRESET_STAGE"
   chown "$RAG_USER:$RAG_GROUP" "$PRESET_STAGE"
-  run_as_rag "$PREFIX/.venv/bin/python" -m rag.config_preset \
+  run_as_rag env PYTHONPATH="$PREFIX" "$PREFIX/.venv/bin/python" -m rag.config_preset \
     --config "$PREFIX/config.yaml" \
     --preset "$PRESET_STAGE"
   rm -f "$PRESET_STAGE"
@@ -972,6 +1309,15 @@ if grep -q '^NEO4J_PASSWORD=' "$PREFIX/install/.env"; then
 else
   printf '\nNEO4J_PASSWORD=%s\n' "$NEO4J_PASSWORD" >> "$PREFIX/install/.env"
 fi
+# The resolver gateway is local infrastructure; its Neo4j adapter follows the
+# installer-owned local Neo4j selection. External resolver adapters remain
+# explicit administrator choices in install/.env.
+if grep -q '^RESOLVER_NEO4J_ENABLED=' "$PREFIX/install/.env"; then
+  sed -i "s|^RESOLVER_NEO4J_ENABLED=.*|RESOLVER_NEO4J_ENABLED=$([[ $WITH_NEO4J -eq 1 ]] && echo true || echo false)|" "$PREFIX/install/.env"
+else
+  printf '\nRESOLVER_NEO4J_ENABLED=%s\n' "$([[ $WITH_NEO4J -eq 1 ]] && echo true || echo false)" >> "$PREFIX/install/.env"
+fi
+
 # Seed a fresh OpenWebUI connection without exposing the rest of runtime.env.
 # Keep this synchronized with the canonical PROVIDER_API_KEY in runtime.env.
 if grep -q '^OPENWEBUI_PROVIDER_API_KEY=' "$PREFIX/install/.env"; then
@@ -985,7 +1331,7 @@ chown "$RAG_USER:$RAG_GROUP" "$PREFIX/install/.env"
 # First-install component capability defaults. Existing site configuration is
 # preserved on reruns, but a fresh VM should not probe services the admin did
 # not select.
-run_as_rag "$PREFIX/.venv/bin/python" - "$PREFIX/config.yaml" "$PREFIX/web.yaml" "$WITH_QDRANT" "$WITH_NEO4J" "$MULTI_USER" "$ACL_OFF" "$ACL_MODE_EXPLICIT" "$FRESH_CONFIG" "$X509_STRICT" "$NEXTCLOUD_URL" "$NEXTCLOUD_CA_FILE" "$ELASTICSEARCH_URL" "$ELASTICSEARCH_INDEX" "$PLAYWRIGHT_EXPLICIT" "$WITH_PLAYWRIGHT" "$X509_STRICT_EXPLICIT" "$PRESET_NAME" <<'PYCFG'
+run_as_rag "$PREFIX/.venv/bin/python" - "$PREFIX/config.yaml" "$PREFIX/web.yaml" "$WITH_QDRANT" "$WITH_NEO4J" "$MULTI_USER" "$ACL_OFF" "$ACL_MODE_EXPLICIT" "$FRESH_CONFIG" "$X509_STRICT" "$NEXTCLOUD_URL" "$NEXTCLOUD_CA_FILE" "$ELASTICSEARCH_URL" "$ELASTICSEARCH_INDEX" "$PLAYWRIGHT_EXPLICIT" "$WITH_PLAYWRIGHT" "$X509_STRICT_EXPLICIT" "$PRESET_NAME" "$WITH_RESOLVER" "$RESOLVER_EXPLICIT" "$NEO4J_EXPLICIT" "$ALLOW_INSECURE_NEXTCLOUD" "$ALLOW_INSECURE_NEXTCLOUD_EXPLICIT" "$ARCHITECTURE_TIER_REQUEST" "$ARCHITECTURE_TIER_EXPLICIT" <<'PYCFG'
 import sys, yaml
 from pathlib import Path
 config_path, web_path = Path(sys.argv[1]), Path(sys.argv[2])
@@ -997,11 +1343,32 @@ playwright_explicit = bool(int(sys.argv[14]))
 playwright_enabled = bool(int(sys.argv[15]))
 x509_explicit = bool(int(sys.argv[16]))
 preset_name = str(sys.argv[17] or "")
+resolver_requested = bool(int(sys.argv[18]))
+resolver_explicit = bool(int(sys.argv[19]))
+neo4j_explicit = bool(int(sys.argv[20]))
+allow_insecure_nextcloud = bool(int(sys.argv[21]))
+allow_insecure_nextcloud_explicit = bool(int(sys.argv[22]))
+architecture_tier_request = str(sys.argv[23] or "")
+architecture_tier_explicit = bool(int(sys.argv[24]))
+# Pre-tier 0.8.6 standard installations had the historical full ERG envelope.
+# Materialize that compatibility default during upgrade so every process and
+# admin surface sees the same explicit architecture boundary.
+architecture = cfg.get('architecture')
+if architecture is None:
+    architecture = {}
+    cfg['architecture'] = architecture
+if isinstance(architecture, dict) and not str(architecture.get('tier') or '').strip():
+    architecture['tier'] = 'erg_full'
+    print('[INFO] Legacy config had no architecture.tier; migrated to erg_full.')
+if architecture_tier_explicit:
+    architecture['tier'] = architecture_tier_request
 if x509_explicit or (fresh and not preset_name):
     cfg.setdefault('tls', {})['x509_strict'] = x509_strict
 is_src = str((cfg.get('architecture') or {}).get('tier') or 'erg').strip().casefold() == 'src'
 if nextcloud_url:
     cfg.setdefault('nextcloud', {})['base_url'] = nextcloud_url
+if allow_insecure_nextcloud_explicit:
+    cfg.setdefault('security', {})['allow_insecure_nextcloud'] = allow_insecure_nextcloud
 if nextcloud_ca_file:
     nextcloud = cfg.setdefault('nextcloud', {})
     nextcloud['verify_tls'] = True
@@ -1010,9 +1377,19 @@ if elasticsearch_url:
     cfg.setdefault('elasticsearch', {})['url'] = elasticsearch_url
 if elasticsearch_index:
     cfg.setdefault('elasticsearch', {})['index'] = elasticsearch_index
+resolver = cfg.setdefault('resolver', {})
+if is_src:
+    resolver['enabled'] = False
+elif fresh or resolver_explicit or 'enabled' not in resolver:
+    # The ERG resolver is a standard ERG component. Legacy pre-resolver
+    # installations have no explicit key, so materialize the selected/default
+    # gateway state on upgrade while preserving an existing administrator-set
+    # enabled=false unless --with-resolver/--no-resolver was explicit.
+    resolver['enabled'] = resolver_requested
+    resolver.setdefault('url', 'http://127.0.0.1:8770')
 if fresh or bool(int(sys.argv[3])):
     cfg.setdefault('qdrant', {})['enabled'] = bool(int(sys.argv[3]))
-if fresh or bool(int(sys.argv[4])):
+if fresh or neo4j_explicit:
     cfg.setdefault('neo4j', {})['enabled'] = bool(int(sys.argv[4]))
 if fresh and not bool(int(sys.argv[4])):
     cfg.setdefault('graph_retrieval', {})['enabled'] = False
@@ -1020,17 +1397,18 @@ if fresh and not bool(int(sys.argv[4])):
     cfg.setdefault('sync', {}).setdefault('graph_queue', {})['enabled'] = False
 elif bool(int(sys.argv[4])):
     if is_src:
-        # SRC may keep Neo4j only as a clean seed/alias store. Document graph
-        # retrieval and graph-derived persistence remain disabled.
+        # Strict SRC has no Neo4j/resolver state. Leave graph features disabled;
+        # final architecture validation will reject the incompatible component
+        # selection rather than silently creating an SRC exception.
         cfg.setdefault('graph_retrieval', {})['enabled'] = False
         cfg.setdefault('graph_queue', {})['enabled'] = False
         cfg.setdefault('sync', {}).setdefault('graph_queue', {})['enabled'] = False
     else:
-        # ERG may use demand-driven document graph evidence while bulk graph
-        # extraction during sync stays opt-in.
+        # ERG Internal/Full may use Neo4j retrieval/resolution without
+        # automatically creating a persistent document-graph work queue.
         cfg.setdefault('graph_retrieval', {})['enabled'] = True
-        cfg.setdefault('graph_queue', {})['enabled'] = True
         if fresh:
+            cfg.setdefault('graph_queue', {})['enabled'] = False
             cfg.setdefault('sync', {}).setdefault('graph_queue', {})['enabled'] = False
 # Safe mode is the fresh-install default. Existing site choices are preserved
 # unless the administrator explicitly passes an ACL-mode flag.
@@ -1055,11 +1433,70 @@ if playwright_explicit:
 with web_path.open('w', encoding='utf-8') as f: yaml.safe_dump(web, f, sort_keys=False, allow_unicode=True)
 PYCFG
 
-log "Validating final SRC/ERG architecture configuration"
-if ! run_as_rag "$PREFIX/.venv/bin/python" -m rag.config_preset \
+if [[ $QDRANT_EXPLICIT -eq 1 ]]; then
+  if [[ $WITH_QDRANT -eq 1 ]]; then
+    sed -i "/^qdrant:/,/^[^[:space:]]/ s/^  enabled:.*/  enabled: true/" "$PREFIX/config.yaml"
+    sed -i "/^sync_worker:/,/^[^[:space:]]/ s/^  enabled:.*/  enabled: true/" "$PREFIX/config.yaml"
+  else
+    sed -i "/^qdrant:/,/^[^[:space:]]/ s/^  enabled:.*/  enabled: false/" "$PREFIX/config.yaml"
+    sed -i "/^sync_worker:/,/^[^[:space:]]/ s/^  enabled:.*/  enabled: false/" "$PREFIX/config.yaml"
+  fi
+fi
+
+log "Applying safe config upgrade migrations"
+run_as_rag env PYTHONPATH="$PREFIX" "$PREFIX/.venv/bin/python" -m rag.config_upgrade \
+  --config "$PREFIX/config.yaml" \
+  --deployment native
+
+log "Validating final architecture-tier configuration"
+if ! run_as_rag env PYTHONPATH="$PREFIX" "$PREFIX/.venv/bin/python" -m rag.config_preset \
   --config "$PREFIX/config.yaml" --validate-only; then
   exit 2
 fi
+
+log "Checking final static SunaQ configuration"
+if ! (
+  cd "$PREFIX"
+  run_as_rag env PYTHONPATH="$PREFIX" "$PREFIX/.venv/bin/python" -m rag.config_check \
+    --config config.yaml --web-config web.yaml
+); then
+  exit 2
+fi
+RESOLVER_ACTIVE="$(
+  run_as_rag "$PREFIX/.venv/bin/python" - "$PREFIX/config.yaml" <<'PYRESOLVER'
+import sys, yaml
+with open(sys.argv[1], encoding='utf-8') as f:
+    cfg = yaml.safe_load(f) or {}
+tier = str((cfg.get('architecture') or {}).get('tier') or 'erg').strip().casefold()
+enabled = bool((cfg.get('resolver') or {}).get('enabled', False))
+print('1' if enabled and tier != 'src' else '0')
+PYRESOLVER
+)"
+WITH_RESOLVER="$RESOLVER_ACTIVE"
+
+# The resolver process is shared by ERG Internal and ERG Full. External
+# adapters are a capability of ERG Full only; force them off in lower tiers
+# even if an older install/.env retained enabled values.
+ARCHITECTURE_TIER="$(
+  run_as_rag "$PREFIX/.venv/bin/python" - "$PREFIX/config.yaml" <<'PYTIER'
+import sys, yaml
+with open(sys.argv[1], encoding='utf-8') as f:
+    cfg = yaml.safe_load(f) or {}
+raw = str((cfg.get('architecture') or {}).get('tier') or 'erg_full').strip().casefold()
+aliases = {'erg': 'erg_full', 'erg-internal': 'erg_internal', 'erg-full': 'erg_full'}
+print(aliases.get(raw, raw))
+PYTIER
+)"
+if [[ "$ARCHITECTURE_TIER" != "erg_full" ]]; then
+  for key in RESOLVER_OPENREGISTER_ENABLED RESOLVER_OPENPLZ_ENABLED; do
+    if grep -q "^${key}=" "$PREFIX/install/.env"; then
+      sed -i "s|^${key}=.*|${key}=false|" "$PREFIX/install/.env"
+    else
+      printf '\n%s=false\n' "$key" >> "$PREFIX/install/.env"
+    fi
+  done
+fi
+
 CONFIG_TX_ACTIVE=0
 rm -rf "$CONFIG_TX_DIR"
 trap - EXIT
@@ -1072,8 +1509,7 @@ TLS_DIR="$PREFIX/install/nginx/tls"
 mkdir -p "$TLS_DIR"
 if [[ ! -s "$TLS_DIR/server.crt" || ! -s "$TLS_DIR/server.key" ]]; then
   log "Generating self-signed nginx bootstrap certificate"
-  CERT_CN="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo nextcloud-rag)"
-  [[ -n "$CERT_CN" ]] || CERT_CN="nextcloud-rag"
+  CERT_CN="$(detect_host_name)"
   SAN="DNS:${CERT_CN},DNS:localhost,IP:127.0.0.1"
   SHORT_HOST="$(hostname 2>/dev/null || true)"
   if [[ -n "$SHORT_HOST" && "$SHORT_HOST" != "$CERT_CN" ]]; then
@@ -1176,9 +1612,21 @@ fi
 cd "$PREFIX/install"
 # Explicit negative switches win over retained rerun state. Remove only the
 # container; persistent volumes are preserved for a later re-enable.
+if [[ $QDRANT_EXPLICIT -eq 1 && $WITH_QDRANT -eq 0 ]]; then
+  compose_cmd -f docker-compose.yml --env-file .env --profile qdrant stop qdrant >/dev/null 2>&1 || true
+  compose_cmd -f docker-compose.yml --env-file .env --profile qdrant rm -f qdrant >/dev/null 2>&1 || true
+fi
 if [[ $OPENWEBUI_EXPLICIT -eq 1 && $WITH_OPENWEBUI -eq 0 ]]; then
   compose_cmd -f docker-compose.yml --env-file .env --profile ui stop openwebui >/dev/null 2>&1 || true
   compose_cmd -f docker-compose.yml --env-file .env --profile ui rm -f openwebui >/dev/null 2>&1 || true
+fi
+if [[ $RESOLVER_EXPLICIT -eq 1 && $WITH_RESOLVER -eq 0 ]]; then
+  compose_cmd -f docker-compose.yml --env-file .env --profile resolver stop erg-resolver >/dev/null 2>&1 || true
+  compose_cmd -f docker-compose.yml --env-file .env --profile resolver rm -f erg-resolver >/dev/null 2>&1 || true
+fi
+if [[ $NEO4J_EXPLICIT -eq 1 && $WITH_NEO4J -eq 0 ]]; then
+  compose_cmd -f docker-compose.yml --env-file .env --profile neo4j stop neo4j >/dev/null 2>&1 || true
+  compose_cmd -f docker-compose.yml --env-file .env --profile neo4j rm -f neo4j >/dev/null 2>&1 || true
 fi
 if [[ $PROXY_EXPLICIT -eq 1 && $WITH_PROXY -eq 0 ]]; then
   compose_cmd -f docker-compose.yml --env-file .env stop proxy >/dev/null 2>&1 || true
@@ -1199,9 +1647,15 @@ if [[ $WITH_NEO4J -eq 1 ]]; then
   LOCAL_SERVICES+=(neo4j)
   LOCAL_PROFILE_ARGS+=(--profile neo4j)
 fi
+if [[ $WITH_RESOLVER -eq 1 ]]; then
+  log "Building ERG resolver component"
+  compose_cmd -f docker-compose.yml --env-file .env --profile resolver build erg-resolver
+  LOCAL_SERVICES+=(erg-resolver)
+  LOCAL_PROFILE_ARGS+=(--profile resolver)
+fi
 if [[ ${#LOCAL_SERVICES[@]} -gt 0 ]]; then
   log "Starting local data services: ${LOCAL_SERVICES[*]}"
-  compose_cmd -f docker-compose.yml --env-file .env "${LOCAL_PROFILE_ARGS[@]}" up -d "${LOCAL_SERVICES[@]}"
+  compose_cmd -f docker-compose.yml --env-file .env "${LOCAL_PROFILE_ARGS[@]}" up -d --force-recreate "${LOCAL_SERVICES[@]}"
 fi
 
 if [[ "$PLAYWRIGHT_ENABLED" -eq 1 ]]; then
@@ -1325,8 +1779,10 @@ if [[ $WITH_PROXY -eq 1 ]]; then
 fi
 
 cat > "$PREFIX/install/install-state.env" <<STATE
+ARCHITECTURE_TIER=$ARCHITECTURE_TIER
 LOCAL_QDRANT=$WITH_QDRANT
 LOCAL_NEO4J=$WITH_NEO4J
+LOCAL_RESOLVER=$WITH_RESOLVER
 LOCAL_OPENWEBUI=$WITH_OPENWEBUI
 LOCAL_PLAYWRIGHT=$PLAYWRIGHT_ENABLED
 LOCAL_PROXY=$WITH_PROXY
@@ -1392,7 +1848,11 @@ if [[ $WITH_SYSTEMD -eq 1 ]]; then
   else
     systemctl disable rag-mail-worker >/dev/null 2>&1 || true
   fi
-  if [[ $WITH_NEO4J -eq 1 ]]; then systemctl enable rag-graph-worker; fi
+  if [[ $WITH_NEO4J -eq 1 ]]; then
+    systemctl enable rag-graph-worker
+  else
+    systemctl disable rag-graph-worker >/dev/null 2>&1 || true
+  fi
   # Normal services remain stopped until maintenance mode is disabled.
 fi
 
@@ -1409,6 +1869,7 @@ cat <<SUMMARY
 Installed at: $PREFIX
 Qdrant:      $([[ $WITH_QDRANT -eq 1 ]] && echo local/running || echo external/not installed by this run)
 Neo4j:       $([[ $WITH_NEO4J -eq 1 ]] && echo local/running || echo external/not installed by this run)
+ERG resolver: $([[ $WITH_RESOLVER -eq 1 ]] && echo local/running || echo disabled)
 LLM backend: external/admin-managed
 OpenWebUI:   $([[ $WITH_OPENWEBUI -eq 1 ]] && echo local/running || echo external/not installed by this run)
 Playwright:  $([[ $PLAYWRIGHT_ENABLED -eq 1 ]] && echo local/running || echo disabled/not installed by this run)

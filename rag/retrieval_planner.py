@@ -380,7 +380,7 @@ def normalize_query_frame(value: Any) -> dict[str, Any]:
     Only the structural envelope is fixed.
     """
     if not isinstance(value, dict):
-        return {"intent": "", "entities": [], "relations": [], "constraints": [], "concepts": []}
+        return {"intent": "", "entities": [], "relations": [], "constraints": [], "concepts": [], "concept_groups": []}
 
     entities: list[dict[str, str]] = []
     known_ids: set[str] = set()
@@ -426,12 +426,31 @@ def normalize_query_frame(value: Any) -> dict[str, Any]:
             seen_concepts.add(folded)
             concepts.append(concept)
 
+    concept_groups: list[dict[str, Any]] = []
+    for item in (value.get("concept_groups") or [])[:12]:
+        if not isinstance(item, dict):
+            continue
+        terms: list[str] = []
+        seen_terms: set[str] = set()
+        for raw_term in (item.get("terms") or [])[:12]:
+            term = _clean_query(raw_term)[:240]
+            folded = term.casefold()
+            if term and folded not in seen_terms:
+                seen_terms.add(folded)
+                terms.append(term)
+        if terms:
+            concept_groups.append({
+                "required": bool(item.get("required", False)),
+                "terms": terms,
+            })
+
     return {
         "intent": _clean_query(value.get("intent"))[:240],
         "entities": entities,
         "relations": relations,
         "constraints": constraints,
         "concepts": concepts,
+        "concept_groups": concept_groups,
     }
 
 

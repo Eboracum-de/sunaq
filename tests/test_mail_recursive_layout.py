@@ -136,3 +136,76 @@ def test_mail_sync_uses_one_directory_per_message(tmp_path: Path):
     assert mail_dir + ('.mailmeta.json',) in paths
     assert mail_dir + ('a01_Bericht.pdf',) in paths
     assert mail_dir + ('message.eml',) in paths
+
+
+class CutoffSyncClient:
+    def __init__(self, raw: bytes):
+        self.raw = raw
+        self.selected = None
+        self.fetched_uids = []
+
+    def select(self, mailbox, readonly=True):
+        self.selected = mailbox
+        return 'OK', [b'4']
+
+    def response(self, name):
+        assert name == 'UIDVALIDITY'
+        return name, [b'123']
+
+    def uid(self, command, *args):
+        if command == 'search':
+            if args == (None, 'ALL'):
+                return 'OK', [b'1 2 3 4']
+            if args == (None, 'SINCE', '01-Jan-2020'):
+                return 'OK', [b'2 4']
+            raise AssertionError((command, args))
+        if command == 'fetch':
+            uid = int(args[0])
+            self.fetched_uids.append(uid)
+            return 'OK', [(f'{uid} (BODY[] {{1}})'.encode(), self.raw)]
+        raise AssertionError((command, args))
+
+
+def test_mail_sync_reopens_backfill_when_cutoff_is_removed(tmp_path: Path):
+    client = CutoffSyncClient(_raw_mail())
+    dav = RecordingDAV()
+    state = StateDB(tmp_path / 'mail_state.sqlite')
+    account = {
+        'name': 'main',
+        '_state_key': 'user:account',
+        'not_before': '2020-01-01',
+        'max_messages_per_run': 250,
+        'store_eml': False,
+        'store_attachments': False,
+    }
+    try:
+        imported, available, _ = sync_mailbox(
+            account, 'INBOX', state, dav, ['Mailarchiv'], ['Mailarchiv'],
+            None, False, client=client,
+        )
+        assert imported == 2
+        assert available == 2
+        assert client.fetched_uids == [4, 2]
+
+        client.fetched_uids.clear()
+        account['not_before'] = ''
+        imported, available, _ = sync_mailbox(
+            account, 'INBOX', state, dav, ['Mailarchiv'], ['Mailarchiv'],
+            None, False, client=client,
+        )
+        assert imported == 4
+        assert available == 4
+        assert client.fetched_uids == [4, 3, 2, 1]
+
+        client.fetched_uids.clear()
+        imported, available, _ = sync_mailbox(
+            account, 'INBOX', state, dav, ['Mailarchiv'], ['Mailarchiv'],
+            None, False, client=client,
+        )
+        assert imported == 0
+        assert available == 0
+        assert client.fetched_uids == []
+
+        assert state.cutoff_scope('user:account', 'INBOX') == ''
+    finally:
+        state.close()

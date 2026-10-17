@@ -120,6 +120,49 @@ All are range indexes created with `IF NOT EXISTS`:
 - ResearchFinding: `research_finding_frame_hash` on `frame_hash`; `research_finding_curation_hash` on `curation_hash`; `research_finding_provenance` on `provenance_code`
 - ResearchRun: `research_run_user` on `canonical_user_id`; `research_run_status` on `curation_status`
 
+## OpenRegister external evidence layer
+
+ERG register research keeps provider-derived register knowledge in a separate
+Neo4j namespace. It deliberately does **not** add labels to the curated
+`Entity` / `ResearchFinding` graph.
+
+The external layer uses:
+
+- `OpenRegisterRun` — one resolver research run; it carries no user identity or
+  Nextcloud archive path.
+- `OpenRegisterEntity` with optional `OpenRegisterOrganization` or
+  `OpenRegisterPerson` — deduplicated primarily by the stable OpenRegister ID.
+- `ExternalFinding:OpenRegisterFinding` — per-run provenance with
+  `provenance_code=openregister`, `curation_mode=external`, rank and
+  selection state (`selected`, `candidate`, `bycatch`).
+- `OpenRegisterFact` — structured list/history records retained from enriched
+  provider data, linked to the external entity and the originating finding.
+- `OPENREGISTER_ROLE` — time-bounded register roles such as board/director or
+  procuration positions. `valid_from`, `valid_to` and `current` come only
+  from provider-supplied structured data.
+- `OpenRegisterSourceDocument` — an archived provider-supplied source document
+  represented by its digest and non-user-specific metadata. User-specific
+  Nextcloud paths and URLs remain only in that user's research dossier. The
+  run-specific `SUPPORTED_BY` relationship may carry the numeric
+  `nextcloud_file_id` of the archived copy so the evidence can be resolved
+  back to Nextcloud without putting a user-specific copy ID on the global
+  hash-deduplicated document node.
+
+Relationships are `PRODUCED_EXTERNAL`, `DESCRIBES`,
+`HAS_EXTERNAL_FACT`, `DERIVED_FROM`, `OPENREGISTER_ROLE`,
+`HAS_SOURCE_DOCUMENT` and `SUPPORTED_BY`.
+
+Search candidates that were not selected are retained rather than discarded.
+The first unresolved candidate is marked `candidate`; additional results are
+`bycatch`. A later research run may select the same stable external entity
+without changing the historic status of the earlier run.
+
+The external graph is written fail-open after resolver processing. Its schema is
+created idempotently by `rag.openregister_graph` when register research is used
+and Neo4j is enabled. Ordinary SunaQ graph retrieval and Graph-Lite curation do
+not query these labels, so provider-derived register observations cannot become
+curated internal facts implicitly.
+
 ## Query assumptions and warning policy
 
 Queries may assume that constrained identifiers are present on matching nodes. They must not assume that any optional field or relationship type exists anywhere in the database. Neo4j emits an `UnknownPropertyKeyWarning` when a query directly names a property token that has never existed, and an `UnknownRelationshipTypeWarning` when a read query statically names a relationship type that has never been created.
@@ -155,7 +198,7 @@ python -m rag.graph --config /opt/sunaq/config.yaml init
 
 Recognized legacy installations retain their existing installation prefix; substitute that prefix (for example `/opt/nextcloud-rag/config.yaml`) when running the command manually.
 
-The Super-Light installer runs the same command inside the API image. API startup also attempts the idempotent migration for independently managed deployments; failure is logged and deferred because Neo4j remains a degradable backend. Installer-selected local Neo4j failure is fatal.
+The Dockerized installer runs the same command inside the API image. API startup also attempts the idempotent migration for independently managed deployments; failure is logged and deferred because Neo4j remains a degradable backend. Installer-selected local Neo4j failure is fatal.
 
 ## Legacy and migration notes
 

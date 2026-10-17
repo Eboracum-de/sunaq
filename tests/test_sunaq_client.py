@@ -7,7 +7,7 @@ APP = ROOT / "clients" / "nextcloud" / "sunaq"
 
 def test_sunaq_client_is_packaged_for_nextcloud_23_plus():
     root = ET.parse(APP / "appinfo" / "info.xml").getroot()
-    assert root.findtext("version") == "0.3.4"
+    assert root.findtext("version") == "0.3.16"
     dependency = root.find("./dependencies/nextcloud")
     assert dependency is not None
     assert dependency.attrib.get("min-version") == "23"
@@ -61,7 +61,7 @@ def test_sunaq_chat_routes_use_nextcloud23_compatible_noadmin_docblocks():
 
     # Nextcloud 23's ControllerMethodReflector matches annotations only on
     # dedicated docblock lines of the form " * @NoAdminRequired".
-    for method in ("send", "models", "status", "listChats", "load", "rename", "delete"):
+    for method in ("send", "stream", "models", "status", "listChats", "load", "rename", "delete"):
         marker = f"public function {method}"
         method_pos = controller.index(marker)
         doc_start = controller.rfind("/**", 0, method_pos)
@@ -110,13 +110,14 @@ def test_sunaq_026_archive_registration_is_bounded_and_damaged_chats_remain_dele
     assert "count($matches) > 1" in store
     assert 'strpos($content, "\\n- Chat-ID: " . $id . "\\n")' in store
     assert store.count("$this->recoverMarkdownName($folder, $id)") >= 2
-    assert "$previousArchiveFile === '' && ($metadataCorrupt || is_array($existing))" in store
+    assert "archive_layout' => 'research_dossier_v1'" in store
+    assert "$this->dossierFolder($folder, $id, true)" in store
     assert "elseif ($metadataCorrupt || is_array($record))" in store
     assert "Storage/read failures still propagate." in store
     assert "Gespeicherter Chat ist beschädigt und kann nicht umbenannt werden." in store
     assert "$item['sources'] = $sources;" in store
     assert "### Quellen" not in store
-    assert readme.startswith("# SunaQ Recherche 0.3.4")
+    assert readme.startswith("# SunaQ Recherche 0.3.16")
     assert "persistent per-user chat history as Markdown plus metadata" in readme
     assert "Legacy-HTML" in readme
 
@@ -159,11 +160,11 @@ def test_sunaq_client_exposes_user_allowed_sunaq_models_and_sends_selection():
     assert "'/models'" in routes
     assert "public function models()" in controller
     assert "public function send($messages = [], $sourceScopes = [], $conversationId = '', $model = '', $requestId = '')" in controller
-    assert "$this->proxy->chat($messages, $sourceScopes, $model, $requestId)" in controller
+    assert "$this->proxy->chat($messages, $sourceScopes, $conversationId, $model, $requestId)" in controller
 
     assert "$baseUrl . '/v1/models'" in proxy
     assert "'X-RAG-User-ID' => $uid" in proxy
-    assert "public function chat(array $messages, array $sourceScopes = [], $modelId = '', $requestId = '')" in proxy
+    assert "public function chat(array $messages, array $sourceScopes = [], $conversationId = '', $modelId = '', $requestId = '')" in proxy
     assert "$payload['model'] = $modelId" in proxy
 
     assert 'id="sunaq-model"' in main
@@ -182,7 +183,7 @@ def test_sunaq_client_polls_identity_scoped_pipeline_progress():
     assert "/status/{requestId}" in routes
     assert "public function status($requestId = '')" in controller
     assert "$this->proxy->status($requestId)" in controller
-    assert "public function chat(array $messages, array $sourceScopes = [], $modelId = '', $requestId = '')" in proxy
+    assert "public function chat(array $messages, array $sourceScopes = [], $conversationId = '', $modelId = '', $requestId = '')" in proxy
     assert "$headers['X-RAG-Request-ID'] = $requestId" in proxy
     assert "$baseUrl . '/v1/status/' . rawurlencode($requestId)" in proxy
     assert "'X-RAG-User-ID' => $uid" in proxy
@@ -272,3 +273,177 @@ def test_sunaq_032_obeys_server_chat_archive_policy_and_cleans_manual_deletes():
     assert "resolveArchiveFile" in store
     assert "deleteMetadataFiles" in store
     assert "stale hidden metadata must not keep the chat" in store
+
+
+def test_sunaq_client_forwards_stable_conversation_id():
+    proxy = (APP / "lib" / "Service" / "RagProxy.php").read_text(encoding="utf-8")
+    controller = (APP / "lib" / "Controller" / "ChatController.php").read_text(encoding="utf-8")
+    js = (APP / "js" / "app.js").read_text(encoding="utf-8")
+
+    assert "$headers['X-RAG-Conversation-ID'] = $conversationId" in proxy
+    assert "$this->proxy->chat($messages, $sourceScopes, $conversationId, $model, $requestId)" in controller
+    assert "function newConversationId()" in js
+    assert "if (!conversationId)" in js
+    assert "conversationId = newConversationId();" in js
+
+
+def test_sunaq_chat_archive_uses_stable_research_dossier_layout():
+    store = (APP / "lib" / "Service" / "ChatStore.php").read_text(encoding="utf-8")
+    listener = (APP / "lib" / "Listener" / "ChatArchiveDeleteListener.php").read_text(encoding="utf-8")
+
+    assert "LEGACY_DOSSIER_CHAT_FILE = 'chat.md'" in store
+    assert "DOSSIER_META_FILE = '.conversation.json'" in store
+    assert "DOSSIER_RUNS_FOLDER = 'runs'" in store
+    assert "archive_layout' => 'research_dossier_v1'" in store
+    assert "$this->dossierFolder($folder, $id, true)" in store
+    assert "$this->ensureRunsFolder($dossier)" in store
+    assert "$chatFile = $this->markdownName($record)" in store
+    assert "$record['archive_file'] = $chatFile" in store
+    assert "$record['dossier_path'] = $this->archivePath() . '/' . $id" in store
+    assert "$record['runs_path'] = $record['dossier_path'] . '/' . self::DOSSIER_RUNS_FOLDER" in store
+    assert "$record['archive_path'] = $record['dossier_path'] . '/' . $chatFile" in store
+    assert "Existing chat.md" in store
+    assert "Legacy flat archive compatibility" in store
+    assert "migrated to the dossier layout" in store
+
+    assert "$parent->nodeExists('.conversation.json')" in listener
+    assert "$archiveFile === $name" in listener
+    assert "(string)$parent->getName() === $id" in listener
+    assert "['.conversation.json', 'runs']" in listener
+    assert "lifecycle anchor" in listener
+
+
+def test_sunaq_dossier_preserves_server_run_before_first_client_save():
+    store = (APP / "lib" / "Service" / "ChatStore.php").read_text(encoding="utf-8")
+
+    assert "A server-side research run may intentionally create runs/ before" in store
+    assert "if (!$dossier->nodeExists(self::DOSSIER_META_FILE))" in store
+    assert "$this->recoverDossierMarkdownName($dossier, $id) === ''" in store
+    assert "!$dossier->nodeExists(self::DOSSIER_RUNS_FOLDER)" in store
+
+
+def test_sunaq_server_guarantees_first_turn_conversation_id():
+    controller = (APP / "lib" / "Controller" / "ChatController.php").read_text(encoding="utf-8")
+    store = (APP / "lib" / "Service" / "ChatStore.php").read_text(encoding="utf-8")
+    proxy = (APP / "lib" / "Service" / "RagProxy.php").read_text(encoding="utf-8")
+
+    assert "public function ensureConversationId($id)" in store
+    ensure = "$conversationId = $this->store->ensureConversationId($conversationId);"
+    handoff = "$this->proxy->chat($messages, $sourceScopes, $conversationId, $model, $requestId)"
+    assert ensure in controller
+    assert handoff in controller
+    assert controller.index(ensure) < controller.index(handoff)
+    assert "$headers['X-RAG-Conversation-ID'] = $conversationId;" in proxy
+
+def test_sunaq_markdown_tables_wrap_long_cell_content():
+    css = (APP / "css" / "style.css").read_text(encoding="utf-8")
+    assert ".sunaq-table" in css
+    assert "table-layout: fixed" in css
+    assert "white-space: normal" in css
+    assert "overflow-wrap: anywhere" in css
+    assert "hyphens: auto" in css
+
+def test_sunaq_source_picker_has_no_separate_webarchive_category():
+    main = (APP / "templates" / "main.php").read_text(encoding="utf-8")
+    js = (APP / "js" / "app.js").read_text(encoding="utf-8")
+    assert 'value="webarchive"' not in main
+    assert "webarchive: 'Webarchiv'" not in js
+    for scope in ("documents", "mailarchive", "chatarchive", "web"):
+        assert f'value="{scope}"' in main
+
+
+
+def test_sunaq_0315_streams_only_bundled_nextcloud_client_and_keeps_json_fallback():
+    routes = (APP / "appinfo" / "routes.php").read_text(encoding="utf-8")
+    controller = (APP / "lib" / "Controller" / "ChatController.php").read_text(encoding="utf-8")
+    proxy = (APP / "lib" / "Service" / "RagProxy.php").read_text(encoding="utf-8")
+    response = (APP / "lib" / "Http" / "SseResponse.php").read_text(encoding="utf-8")
+    js = (APP / "js" / "app.js").read_text(encoding="utf-8")
+    readme = (APP / "README.md").read_text(encoding="utf-8")
+
+    assert "chat#stream" in routes
+    assert "'/chat/stream'" in routes
+    assert "public function stream(" in controller
+    assert "$this->proxy->streamChat(" in controller
+    assert "public function send(" in controller
+    assert "$this->proxy->chat(" in controller
+
+    assert "'stream' => false" in proxy
+    assert "public function streamChat(" in proxy
+    assert "'stream' => true" in proxy
+    assert "'Accept: text/event-stream'" in proxy
+    assert "CURLOPT_WRITEFUNCTION" in proxy
+    assert "CURLOPT_FOLLOWLOCATION => false" in proxy
+    assert "CURLOPT_CAINFO" in proxy
+    assert "getAbsoluteBundlePath" in proxy
+    assert "CURLOPT_PROXY" in proxy
+    assert "CURLOPT_NOPROXY" in proxy
+    assert "$this->status($requestId)" in proxy
+
+    assert "implements ICallbackResponse" in response
+    assert "text/event-stream; charset=utf-8" in response
+    assert "X-Accel-Buffering" in response
+    assert "ob_flush" in response
+
+    assert "function streamChatRequest(" in js
+    assert "response.body.getReader" in js
+    assert "window.TextDecoder" in js
+    assert "appendMarkdown(streamContentNode, content)" in js
+    assert "sunaq_meta" in js
+    assert "sunaqStreamFallback" in js
+    assert "apiRequest('/chat', 'POST', requestPayload)" in js
+
+    assert "OpenWebUI and other OpenAI-compatible clients" in readme
+    assert "legacy JSON `/chat` path remains available" in readme
+
+
+def test_sunaq_0316_registers_filename_action_across_nextcloud_files_generations():
+    routes = (APP / "appinfo" / "routes.php").read_text(encoding="utf-8")
+    application = (APP / "lib" / "AppInfo" / "Application.php").read_text(encoding="utf-8")
+    listener = (APP / "lib" / "Listener" / "FilesLoadAdditionalScriptsListener.php").read_text(encoding="utf-8")
+    controller = (APP / "lib" / "Controller" / "FileActionController.php").read_text(encoding="utf-8")
+    legacy = (APP / "js" / "files-actions.js").read_text(encoding="utf-8")
+    modern = (APP / "js" / "files-actions-modern.js").read_text(encoding="utf-8")
+
+    assert "fileAction#suggestName" in routes
+    assert "'/files/suggest-name'" in routes
+    assert "fileAction#rename" in routes
+    assert "'/files/rename'" in routes
+
+    assert "LoadAdditionalScriptsEvent::class" in application
+    assert "FilesLoadAdditionalScriptsListener::class" in application
+    assert "$major > 0 && $major < 26" in application
+    assert "loadAdditionalScripts" in application
+    assert "method_exists(Util::class, 'addInitScript')" in listener
+    assert "Util::addInitScript('sunaq', 'files-actions-modern')" in listener
+    assert "Util::addScript('sunaq', 'files-actions-modern')" in listener
+
+    assert "/use:" in controller
+    assert "files:" in controller
+    assert "normalizeFileId" in controller
+    assert "preg_match('/^[0-9]{1,24}$/'" in controller
+    assert "$this->rootFolder->getUserFolder" in controller
+    assert "(string)$node->getId() !== $fileId" in controller
+    assert "$node->move($targetPath)" in controller
+    assert "normalizeRenameCandidate" in controller
+
+    assert "OC.Plugins.register('OCA.Files.FileList', plugin)" in legacy
+    assert "window._nc_fileactions" in modern
+    assert "window._nc_files_scope.v4_0" in modern
+    assert "String(node.id)" in modern
+    assert "postJson('/files/suggest-name'" in modern
+    assert "postJson('/files/rename'" in modern
+    assert "typeof node.rename === 'function'" in modern
+
+
+def test_sunaq_file_action_controller_keeps_noadmin_annotations_nc23_compatible():
+    controller = (APP / "lib" / "Controller" / "FileActionController.php").read_text(encoding="utf-8")
+    for method in ("suggestName", "rename"):
+        marker = f"public function {method}"
+        method_pos = controller.index(marker)
+        doc_start = controller.rfind("/**", 0, method_pos)
+        doc_end = controller.find("*/", doc_start, method_pos)
+        assert doc_start >= 0
+        assert doc_end >= 0
+        docblock = controller[doc_start:doc_end + 2]
+        assert "\n     * @NoAdminRequired\n" in docblock

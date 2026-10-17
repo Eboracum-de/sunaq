@@ -1,0 +1,47 @@
+# SunaQ capability preset: full
+# ERG Full adds external information acquisition and research egress to the
+# ERG Internal derived-state envelope. It does not enable provider credentials
+# or per-user access by itself.
+architecture:
+  tier: erg_full
+acl:
+  enabled: true
+retrieval_policy:
+  internal:
+    files: required
+    vector: optional
+    graph: disabled
+  optional_default: include
+  web: explicit
+qdrant:
+  enabled: true
+neo4j:
+  enabled: true
+resolver:
+  enabled: true
+sync_worker:
+  enabled: true
+sync:
+  graph_queue:
+    enabled: false
+graph_queue:
+  enabled: false
+  auto_enqueue_cited_documents: false
+  worker:
+    enabled: false
+research_findings:
+  enabled: true
+graph_indexer:
+  enabled: false
+graph_entity_discovery:
+  enabled: false
+graph_relation_discovery:
+  enabled: false
+mail_metadata:
+  enabled: true
+mail:
+  enabled: true
+  worker:
+    enabled: true
+chat_archive:
+  enabled: true

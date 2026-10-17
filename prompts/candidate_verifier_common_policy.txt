@@ -1,0 +1,9 @@
+GEMEINSAMER VERIFIER-VERTRAG (gilt zusätzlich zu Profil-Prompts und hat bei Widerspruch Vorrang):
+
+- Eine Benutzeranfrage, die im Wesentlichen nur aus einem konkreten Entitätsnamen besteht, ist eine breite Informationssuche zu dieser Entität.
+- Für eine solche Anfrage muss die Entität NICHT Hauptgegenstand des Dokuments oder eines archivierten Chats sein. Entscheidend ist, ob der Kandidat substanzielle, klar dieser Entität zuordenbare Tatsachen enthält.
+- Konkrete Angaben zu Personen/Funktionen, Beteiligungen, Gruppenzugehörigkeit, Adressen, Geschäftsvorgängen oder anderen Eigenschaften sind substanzielle Tatsachen.
+- Bei source_origin=chat_archive gehören auch im archivierten Chat wiedergegebene fachliche Quellen-, Dokument- oder Elasticsearch-Ausschnitte zum prüfbaren Chatinhalt. Ein Ausschnitt, der der gesuchten Entität konkrete Tatsachen zuordnet, ist direct und NICHT reference_only, nur weil er als Ausschnitt, Zitat oder Querverweis erscheint.
+- reference_only ist nur für eine bloße Namens-/Referenznennung ohne nutzbare Sachinformation vorgesehen.
+- Eine verification_requirement, die lediglich sicherstellen soll, dass wirklich die genannte Entität und nicht eine ähnlich benannte gemeint ist, ist eine Identitätsprüfung. Sie darf NICHT in eine Forderung umgedeutet werden, dass das ganze Dokument hauptsächlich von dieser Entität handeln müsse.
+- Konkrete Rollen-, Beziehungs-, Dokumenttyp- und harte Constraint-Anfragen bleiben streng: dort muss der Kandidat die tatsächlich verlangte Beziehung bzw. Bedingung selbst belegen.

@@ -1,5 +1,6 @@
 import pytest
 
+from rag.egress_policy import configure_runtime_egress_policy, reset_runtime_egress_policy
 from rag.policy_hooks import (
     ALLOW,
     BLOCK,
@@ -18,13 +19,37 @@ from rag.policy_hooks import (
 @pytest.fixture(autouse=True)
 def _reset_policy_hook_evaluator():
     reset_policy_evaluator()
+    reset_runtime_egress_policy()
     yield
     reset_policy_evaluator()
+    reset_runtime_egress_policy()
 
 
 def test_default_policy_hooks_are_noop_allow():
     payload = {"value": "unchanged"}
     assert apply_policy_hook(PRE_PERSIST, content=payload) is payload
+
+
+def test_builtin_research_egress_guard_runs_before_optional_evaluator():
+    configure_runtime_egress_policy({
+        "egress": {
+            "research_query": {"mode": "guard"},
+            "guard": {"internal_identifiers": [r"CASE-[0-9]+"]},
+        }
+    })
+    seen = []
+
+    def evaluator(request):
+        seen.append(request.content)
+        return PolicyHookDecision(action=ALLOW, content=request.content)
+
+    install_policy_evaluator(evaluator)
+    assert apply_policy_hook(
+        OUTBOUND_QUERY,
+        content="CASE-42 Beispiel GmbH",
+        metadata={"external": True, "provider": "brave"},
+    ) == "[REDACTED] Beispiel GmbH"
+    assert seen == ["[REDACTED] Beispiel GmbH"]
 
 
 def test_policy_hook_can_modify_content():

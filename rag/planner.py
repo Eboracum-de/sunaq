@@ -31,10 +31,15 @@ class SearchPlan(BaseModel):
 
     semantic_query: str
 
-    # In SearchSpec mode the LLM may provide a human-style Nextcloud full-text
-    # expression (+must, -exclude, quoted phrase).  The executor compiles it to
-    # Elasticsearch JSON; this is not raw Elasticsearch DSL.
+    # Legacy compatibility only. New structured retrieval intent never grants
+    # the planner ownership of backend query syntax.
     elastic_query: str = ""
+
+    # Backend-neutral lexical groups compiled deterministically by search.py.
+    # Each group is an OR over terms; required groups become MUST(OR(...)).
+    lexical_groups: list[dict[str, Any]] = Field(
+        default_factory=list
+    )
 
     must: list[str] = Field(
         default_factory=list
@@ -1053,24 +1058,84 @@ def plan_from_search_spec(
     spec: dict[str, Any],
     entity_context: dict[str, Any] | None = None,
     *,
+    original_query: str = "",
     entity_recall: bool = False,
 ) -> SearchPlan:
-    """Build the mature backend plan from the small provider SearchSpec.
+    """Compile structured retrieval intent into the mature backend plan.
 
-    The LLM owns only the semantic rewrite.  Elasticsearch/Qdrant syntax and
-    Neo4j alias expansion remain deterministic middleware concerns.
+    The planner describes intent; it never owns Elasticsearch syntax. Entities,
+    concept alternative groups and safe literal constraints become deterministic
+    lexical groups. elastic_query is retained only as a legacy fallback for
+    callers that do not yet provide structured intent.
     """
     value = dict(spec or {})
+    lexical_groups: list[dict[str, Any]] = []
+    seen_groups: set[tuple[bool, tuple[str, ...]]] = set()
+
+    def add_group(*, required: bool, terms: list[str], kind: str) -> None:
+        cleaned: list[str] = []
+        seen_terms: set[str] = set()
+        for raw in terms:
+            text = str(raw or "").strip()
+            folded = text.casefold()
+            if text and folded not in seen_terms:
+                seen_terms.add(folded)
+                cleaned.append(text)
+        if not cleaned:
+            return
+        key = (bool(required), tuple(term.casefold() for term in cleaned))
+        if key in seen_groups:
+            return
+        seen_groups.add(key)
+        lexical_groups.append({
+            "required": bool(required),
+            "kind": str(kind or "concept"),
+            "terms": cleaned,
+        })
+
+    for entity in value.get("entities") or []:
+        text = str(entity or "").strip()
+        if text:
+            add_group(required=True, terms=[text], kind="entity")
+
+    for group in value.get("concept_groups") or []:
+        if not isinstance(group, dict):
+            continue
+        add_group(
+            required=bool(group.get("required", False)),
+            terms=[str(term) for term in (group.get("terms") or [])],
+            kind="concept",
+        )
+
+    if original_query:
+        # Import lazily to keep retrieval_planner -> planner imports acyclic.
+        from rag.retrieval_planner import extract_safe_hard_constraints
+
+        safe = extract_safe_hard_constraints(original_query)
+        for constraint_kind in ("filenames", "identifiers", "dates", "years"):
+            for constraint in safe.get(constraint_kind) or []:
+                add_group(
+                    required=True,
+                    terms=[str(constraint)],
+                    kind=f"constraint:{constraint_kind}",
+                )
+
+    structured_intent = bool(lexical_groups)
     plan = SearchPlan(
         search_mode="search_spec",
         semantic_query=str(value.get("semantic_query") or "").strip(),
-        elastic_query=str(value.get("elastic_query") or "").strip(),
+        elastic_query=(
+            ""
+            if structured_intent
+            else str(value.get("elastic_query") or "").strip()
+        ),
+        lexical_groups=lexical_groups,
         must=[str(x).strip() for x in (value.get("must") or []) if str(x).strip()],
         should=[str(x).strip() for x in (value.get("should") or []) if str(x).strip()],
         must_not=[str(x).strip() for x in (value.get("must_not") or []) if str(x).strip()],
         phrases=[str(x).strip() for x in (value.get("phrases") or []) if str(x).strip()],
         must_not_phrases=[str(x).strip() for x in (value.get("must_not_phrases") or []) if str(x).strip()],
-        notes="structured query rewrite",
+        notes="structured retrieval intent",
     )
     return _apply_entity_context(
         plan,

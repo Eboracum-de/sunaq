@@ -1,21 +1,26 @@
 # SunaQ capability preset: workgroup
-# Conservative ERG baseline. Optional sources still require their own global
-# and per-user configuration; this preset does not create credentials or enable Web.
+# ERG Internal baseline: SunaQ-owned persistent derived state from the
+# authoritative internal Nextcloud information space is allowed. External
+# information acquisition (Mail/Web/external resolver/delegated research) is not.
 architecture:
-  tier: erg
+  tier: erg_internal
 acl:
   enabled: true
 retrieval_policy:
   internal:
     files: required
-    vector: disabled
+    vector: optional
     graph: disabled
   optional_default: include
-  web: explicit
+  web: disabled
 qdrant:
-  enabled: false
+  enabled: true
+neo4j:
+  enabled: true
+resolver:
+  enabled: true
 sync_worker:
-  enabled: false
+  enabled: true
 sync:
   graph_queue:
     enabled: false
@@ -33,7 +38,7 @@ graph_entity_discovery:
 graph_relation_discovery:
   enabled: false
 mail_metadata:
-  enabled: true
+  enabled: false
 mail:
   enabled: false
   worker:

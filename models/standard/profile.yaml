@@ -5,7 +5,7 @@ description: Ausgewogene Recherche mit den validierten 0.8.5-rc5.1 Budgets.
 default: true
 aliases:
   - nextcloud-hybrid-rag
-legacy_config_overlay: true  # 0.8.5 upgrade bridge; inert on fresh 0.8.6 configs
+legacy_config_overlay: true  # 0.8.5 upgrade bridge; inert on fresh installs
 
 search:
   es_limit: 50
@@ -93,24 +93,28 @@ answer_context:
   max_total_chars: 25000
 
 deployment_overrides:
-  super-light:
+  dockerized:
     retrieval_planner:
       # Budget-only experiment: keep the same 10-document Standard window.
       verification_candidate_limit: 10
       bounded_verification_candidate_limit: 10
       exhaustive_verification_candidate_limit: 10
-    graph_retrieval:
-      # Neo4j remains available for entity/alias expansion only.
-      enabled: false
-    reranker:
-      backend: "none"
-
 
 # Underlying LLM routing is independent from the SunaQ model.
 # Add planner/verifier/evidence/answer overrides here when desired.
+resolver_research:
+  enabled: false
+  direct_answer: false
+  sources: []
+  enrich_resolved: false
+  include_holdings: false
+  archive_supplied_documents: false
+  persist_external_graph: false
+
 roles: {}
 
 prompts:
+  query_rewriter: query_rewriter.txt
   planner: retrieval_planner.txt
   verifier: candidate_verifier.txt
   evidence: evidence_decision.txt

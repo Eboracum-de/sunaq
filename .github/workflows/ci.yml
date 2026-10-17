@@ -25,5 +25,15 @@ jobs:
       - name: Shell syntax check
         run: |
           while IFS= read -r -d '' f; do bash -n "$f"; done < <(find . -type f \( -name '*.sh' -o -name '*.bash' \) -print0)
+      - name: Generate release manifest
+        run: python scripts/generate_manifest.py --output /tmp/MANIFEST.sha256
+      - name: Upload generated release manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest
+          path: /tmp/MANIFEST.sha256
+          retention-days: 1
+      - name: Verify committed release manifest
+        run: python scripts/generate_manifest.py --check
       - name: Tests
         run: python -m pytest -q

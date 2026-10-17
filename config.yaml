@@ -1,8 +1,9 @@
 # SunaQ architecture tier. Existing/full reference configuration is ERG-capable.
 architecture:
-  tier: erg  # src | erg; see docs/SRC-ERG.md
+  # src | erg_internal | erg_full. Legacy "erg" is accepted as erg_full.
+  tier: erg_full
 
-# SunaQ / Eboracum Research Gateway - 0.8.6-rc1.2
+# SunaQ / Eboracum Research Gateway - 0.8.7-rc1
 
 health:
   timeout_seconds: 4
@@ -63,6 +64,81 @@ embedding:
 # profiles and their prompt files once at startup. Infrastructure, security,
 # source access and background-worker policy remain global in this file.
 
+# Optional delegated public research. This is deliberately not a retriever:
+# the external provider owns public-web search plus answer synthesis. In the
+# first slice delegation is allowed only for Web-only requests; no Nextcloud
+# document evidence or internal retrieval context is sent through this path.
+#
+# Environment override for evaluation:
+#   SUNAQ_RESEARCH_PROVIDER=openai
+# Optional:
+#   SUNAQ_RESEARCH_MODEL=<model>
+#   SUNAQ_RESEARCH_BASE_URL=https://api.openai.com/v1
+delegated_research:
+  enabled: false
+  provider: openai
+  delegate_web_only: true
+  openai:
+    base_url: "https://api.openai.com/v1"
+    # Separate from ANSWER_MODEL: the latter may be a local/private model.
+    model: "gpt-5.5"
+    # Reuse the existing OpenAI LLM credential unless a separate secret is wanted.
+    api_key_env: "LLM_API_KEY"
+    verify_tls: true
+    ca_file: ""
+    timeout: 180
+    # Empty = provider/model default. Set low/medium/high/xhigh only for models
+    # that support configurable reasoning.
+    reasoning_effort: ""
+
+# Optional named research backends. The service definition remains administrator
+# owned; individual SunaQ profiles only reference a backend ID through
+# research.web_backend. These entries do not change old profiles, which still
+# use the deprecated global delegated_research selection until migrated.
+# Brave Search is provided by the existing configured web.yaml search engine.
+research_backends:
+  brave-search:
+    kind: web_retrieval
+    adapter: brave_search
+    enabled: true
+  openai-research:
+    kind: delegated_research
+    adapter: openai
+    enabled: false   # Admin must explicitly permit this backend for a model.
+    model: "gpt-5.5"
+    base_url: "https://api.openai.com/v1"
+    api_key_env: "LLM_API_KEY"
+    verify_tls: true
+    timeout: 180
+
+# Central outbound-data policy. The same boundary is used by public research,
+# external model roles and external embeddings, but enforcement is deliberately
+# class-specific so security controls do not silently destroy model quality.
+#
+# research_query: Brave/Search, delegated research and external resolver queries.
+# model_processing: planner/verifier/evidence/answer/follow-up model payloads.
+# embedding: document/query text sent to an embedding service.
+#
+# allow = pass unchanged; audit = pass unchanged + metadata-only log;
+# guard = deterministic credential/admin-regex redaction; block = fail closed.
+egress:
+  enabled: true
+  research_query:
+    mode: guard
+  model_processing:
+    mode: audit
+  embedding:
+    mode: allow
+  guard:
+    redact_credentials: true
+    replacement: "[REDACTED]"
+    # Administrator-owned regexes for identifiers that must not leave the trust
+    # zone through guarded query/research paths. Empty by default because generic
+    # business facts cannot be classified safely without site-specific rules.
+    internal_identifiers: []
+    # Example:
+    #   - '\bDL-[0-9]{4}-[0-9]+\b'
+
 # Retrieval capability policy. Normal automatic retrieval uses files plus optional
 # vector; Neo4j is used for entity/alias expansion unless /graph is explicitly
 # requested. Backend routing is not decided by the LLM.
@@ -83,6 +159,8 @@ retrieval_policy:
 sync_worker:
   enabled: true
   poll_interval_seconds: 300
+  # Cooperative pause granularity for an already running full sync.
+  pause_check_documents: 25
   # 0 = unlimited. Keep 0 for a background worker so documents later in the
   # Elasticsearch index cannot be starved by a fixed scan limit.
   max_documents: 0
@@ -96,10 +174,12 @@ sync:
   # Add the file basename to the model input only; Qdrant evidence text stays raw.
   embedding_include_basename: true
   max_documents: 0
-  state_db: "state.sqlite"
+  state_db: "runtime/state.sqlite"
   # Context-length failures that remain after adaptive splitting are deferred here.
   # The sync continues; existing Qdrant/state for that document stays untouched.
-  embedding_deferred_file: "embedding-deferred.jsonl"
+  embedding_deferred_file: "runtime/embedding-deferred.jsonl"
+  # Lightweight last-run summary consumed by the Admin vector overview.
+  status_file: "runtime/sync-status.json"
 
   # Semantic corpus gate. Qdrant/GraphQueue see only text already extracted by
   # Elasticsearch/Nextcloud FullTextSearch; binary files are never decoded here.
@@ -193,11 +273,13 @@ graph:
     blocked_generic_names: []
 
 graph_queue:
-  enabled: true
-  # Capability and automatic processing are separate. Keep the worker off until
-  # the administrator explicitly wants automatic graph extraction.
+  # Master switch for the persistent document-graph queue. Keep this opt-in:
+  # Neo4j/entity seeds may be enabled without accumulating document graph jobs.
+  enabled: false
+  # Independent provider hook: when the queue is enabled, cited answer documents
+  # are queued only when this is explicitly enabled as well.
   auto_enqueue_cited_documents: false
-  database: "graph_queue.sqlite"
+  database: "runtime/graph_queue.sqlite"
   priority: 100
   priorities:
     high: 50
@@ -339,6 +421,27 @@ chat_archive:
   enabled: false
   root: "SunaQ-Chats"
 
+# Durable provider-side outbox for ResearchRun metadata/provenance writes.
+# The request path commits locally first; one provider writer serializes
+# delivery per conversation and retries transient Nextcloud WebDAV locks.
+dossier_writer:
+  enabled: true
+  database: "runtime/dossier_queue.sqlite"
+  poll_seconds: 0.5
+  retry_seconds: 2
+  max_retry_seconds: 60
+  max_attempts: 0  # 0 = retry classified transient delivery failures indefinitely
+  completed_retention_jobs: 1000
+
+# Optional ERG-side reference resolver. Disabled by default so SRC/current
+# retrieval behavior is unchanged until an administrator explicitly enables it.
+# The provider sends only Query-Rewriter entity references plus bounded local
+# context hints to this gateway. Individual adapters own any further egress.
+resolver:
+  enabled: false
+  url: "http://127.0.0.1:8770"
+  timeout: 8
+
 mail_metadata:
   enabled: true
   timeout: 10
@@ -348,7 +451,7 @@ mail_metadata:
 # runtime/users.sqlite. The schema is 1:n; the beta admin UI exposes one account.
 mail:
   enabled: false
-  state_file: mail_state.sqlite
+  state_file: runtime/mail_state.sqlite
   poll_interval_seconds: 300
   worker:
     # Mail capability/account configuration may exist without background polling.

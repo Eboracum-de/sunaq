@@ -99,6 +99,7 @@ class LLMBackend:
                 "backend": self.kind,
                 "base_url": self.base_url,
                 "model": model,
+                "egress_class": "model_processing",
             },
         )
         if not isinstance(checked, list) or any(

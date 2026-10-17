@@ -7,8 +7,8 @@ import httpx
 import yaml
 
 from rag.logging_utils import get_logger
-from rag.architecture_policy import is_src
 from rag.network_policy import pinned_private_target
+from rag.policy_hooks import PRE_MODEL_EGRESS, apply_policy_hook
 
 
 # ------------------------------------------------------------
@@ -48,7 +48,9 @@ TEI_BATCH_SIZE = int(reranker_config.get("tei_batch_size", 32) or 32)
 FALLBACK_BACKEND = str(
     reranker_config.get("fallback_backend", "none") or "none"
 ).strip().lower()
-PRIVATE_NETWORK_ONLY = is_src(config)
+PRIVATE_NETWORK_ONLY = str(
+    reranker_config.get("private_network_only", "false") or "false"
+).strip().casefold() in {"1", "true", "yes", "on"}
 
 _VALID_BACKENDS = {"none", "local", "tei"}
 _VALID_FALLBACKS = {"none", "local"}
@@ -332,6 +334,29 @@ class Reranker:
         try:
             for start in range(0, len(texts), self.tei_batch_size):
                 batch_texts = texts[start:start + self.tei_batch_size]
+                checked = apply_policy_hook(
+                    PRE_MODEL_EGRESS,
+                    content={"query": query, "texts": batch_texts},
+                    metadata={
+                        "kind": "reranker",
+                        "backend": "tei",
+                        "base_url": self.tei_url,
+                        "model": self.model_name,
+                        "egress_class": "model_processing",
+                        "external": False if self.private_network_only else None,
+                    },
+                )
+                if (
+                    not isinstance(checked, dict)
+                    or not isinstance(checked.get("query"), str)
+                    or not isinstance(checked.get("texts"), list)
+                    or any(not isinstance(value, str) for value in checked["texts"])
+                ):
+                    raise TypeError(
+                        "pre_model_egress policy hook must preserve reranker query/texts"
+                    )
+                batch_query = checked["query"]
+                batch_texts = checked["texts"]
                 calls += 1
                 target_url = endpoint
                 target_headers: dict[str, str] | None = None
@@ -348,7 +373,7 @@ class Reranker:
                         headers=target_headers,
                         extensions=target_extensions,
                         json={
-                            "query": query,
+                            "query": batch_query,
                             "texts": batch_texts,
                             "truncate": True,
                             "raw_scores": False,

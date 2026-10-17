@@ -122,6 +122,111 @@ def test_ollama_embed_sends_dimensions(monkeypatch):
     })]
 
 
+def test_ollama_model_tag_case_is_resolved_from_installed_tags(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+            self.text = __import__('json').dumps(payload)
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url):
+            assert url == "http://ollama/api/tags"
+            return FakeResponse(200, {"models": [{"name": "Qwen3-Embedding:4B"}]})
+
+        def post(self, url, json):
+            calls.append((url, dict(json)))
+            if json["model"] == "qwen3-embedding:4b":
+                return FakeResponse(404, {"error": "model not found"})
+            return FakeResponse(200, {"embeddings": [[0.1, 0.2, 0.3, 0.4]]})
+
+    monkeypatch.setattr(embeddings.httpx, "Client", FakeClient)
+    backend = embeddings.OllamaEmbeddings(
+        "http://ollama", "qwen3-embedding:4b", dimensions=4
+    )
+    assert backend.embed(["hello"]) == [[0.1, 0.2, 0.3, 0.4]]
+    assert backend.model == "Qwen3-Embedding:4B"
+    assert [call[1]["model"] for call in calls] == [
+        "qwen3-embedding:4b",
+        "Qwen3-Embedding:4B",
+    ]
+
+
+def test_embedding_health_accepts_ollama_model_tag_case_difference(monkeypatch):
+    import rag.api as api
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"models": [{"name": "Qwen3-Embedding:4B"}]}
+
+    monkeypatch.setattr(api, "EMBEDDING_BACKEND", "ollama")
+    monkeypatch.setattr(api, "EMBEDDING_URL", "http://ollama")
+    monkeypatch.setattr(api, "EMBEDDING_MODEL", "qwen3-embedding:4b")
+    monkeypatch.setattr(
+        api,
+        "_probe_http",
+        lambda *args, **kwargs: {
+            "status": "ok",
+            "http_status": 200,
+            "latency_ms": 1.0,
+            "response": FakeResponse(),
+        },
+    )
+
+    result = api._health_embedding(4.0)
+    assert result["status"] == "ok"
+    assert result["model_present"] is True
+    assert "error" not in result
+
+
+def test_embedding_health_does_not_accept_different_explicit_ollama_tag(monkeypatch):
+    import rag.api as api
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"models": [{"name": "Qwen3-Embedding:8B"}]}
+
+    monkeypatch.setattr(api, "EMBEDDING_BACKEND", "ollama")
+    monkeypatch.setattr(api, "EMBEDDING_URL", "http://ollama")
+    monkeypatch.setattr(api, "EMBEDDING_MODEL", "qwen3-embedding:4b")
+    monkeypatch.setattr(
+        api,
+        "_probe_http",
+        lambda *args, **kwargs: {
+            "status": "ok",
+            "http_status": 200,
+            "latency_ms": 1.0,
+            "response": FakeResponse(),
+        },
+    )
+
+    result = api._health_embedding(4.0)
+    assert result["status"] == "down"
+    assert result["model_present"] is False
+
+
 def test_ollama_dimension_mismatch_fails(monkeypatch):
     class FakeResponse:
         status_code = 200

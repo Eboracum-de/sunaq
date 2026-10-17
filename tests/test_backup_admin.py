@@ -217,3 +217,126 @@ def test_inventory_rejects_super_light_ca_alias_escape(tmp_path: Path) -> None:
 
     assert "secret.pem" not in state["archive_paths"]
     assert {"kind": "ca_file", "path": "/app/secret.pem"} in state["external_paths"]
+
+
+def test_inventory_includes_current_operator_owned_state(tmp_path: Path) -> None:
+    root = tmp_path
+    (root / "runtime").mkdir()
+    (root / "models/standard").mkdir(parents=True)
+    (root / "install/dockerized").mkdir(parents=True)
+    (root / "install/nginx").mkdir(parents=True)
+    (root / "runtime/retrieval-records").mkdir(parents=True)
+    _write_config(root)
+    (root / "runtime.env").write_text(
+        "RAG_CREDENTIAL_MASTER_KEY_FILE=runtime/credential-master.key\n",
+        encoding="utf-8",
+    )
+    (root / ".sunaq-installation").write_text("SUNAQ_INSTALLATION=1\n", encoding="utf-8")
+    (root / "models/standard/profile.yaml").write_text("description: custom\n", encoding="utf-8")
+    (root / "install/dockerized/.env").write_text("LOCAL=1\n", encoding="utf-8")
+    (root / "install/dockerized/docker-compose.override.yml").write_text("services: {}\n", encoding="utf-8")
+    (root / "install/nginx/internal-auth.conf").write_text("proxy_set_header X-AKI-Internal-Key test;\n", encoding="utf-8")
+    (root / "runtime/worker-control.json").write_text('{"version":1,"workers":{"sync_worker":true}}\n', encoding="utf-8")
+    (root / "runtime/retrieval-records/test.json").write_text("{}\n", encoding="utf-8")
+
+    state = inventory(root)
+
+    for expected in (
+        ".sunaq-installation",
+        "models",
+        "install/dockerized/.env",
+        "install/dockerized/docker-compose.override.yml",
+        "install/nginx/internal-auth.conf",
+        "runtime/worker-control.json",
+        "runtime/retrieval-records",
+    ):
+        assert expected in state["archive_paths"]
+
+
+def test_inventory_excludes_qdrant_sync_state_and_includes_configured_mail_state(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path
+    (root / "runtime").mkdir()
+    (root / "data").mkdir()
+    (root / "config.yaml").write_text(
+        "auth:\n"
+        "  credential_store: runtime/users.sqlite\n"
+        "sync:\n"
+        "  state_db: runtime/state.sqlite\n"
+        "mail:\n"
+        "  state_file: data/mail.sqlite\n",
+        encoding="utf-8",
+    )
+    (root / "runtime.env").write_text(
+        "RAG_CREDENTIAL_MASTER_KEY_FILE=runtime/credential-master.key\n",
+        encoding="utf-8",
+    )
+    _sqlite(root / "runtime/users.sqlite")
+    _sqlite(root / "runtime/state.sqlite")
+    _sqlite(root / "data/mail.sqlite")
+
+    state = inventory(root)
+
+    assert state["qdrant_sync_state"]["relative"] == "runtime/state.sqlite"
+    assert state["qdrant_sync_state"]["included"] is False
+    assert "runtime/state.sqlite" not in state["sqlite"]
+    assert "runtime/state.sqlite" not in state["archive_paths"]
+    assert "data/mail.sqlite" in state["sqlite"]
+    assert "data/mail.sqlite" in state["archive_paths"]
+
+
+def test_inventory_blocks_external_non_rebuildable_sqlite_state(tmp_path: Path) -> None:
+    root = tmp_path
+    (root / "runtime").mkdir()
+    (root / "config.yaml").write_text(
+        "auth:\n"
+        "  credential_store: runtime/users.sqlite\n"
+        "mail:\n"
+        "  state_file: /srv/sunaq-state/mail.sqlite\n",
+        encoding="utf-8",
+    )
+    (root / "runtime.env").write_text(
+        "RAG_CREDENTIAL_MASTER_KEY_FILE=runtime/credential-master.key\n",
+        encoding="utf-8",
+    )
+    _sqlite(root / "runtime/users.sqlite")
+
+    state = inventory(root)
+
+    assert {"kind": "mail_state", "path": "/srv/sunaq-state/mail.sqlite"} in state["blocking_external_paths"]
+
+
+def test_inventory_includes_dossier_outbox_and_blocks_external_path(tmp_path: Path) -> None:
+    root = tmp_path
+    (root / "runtime").mkdir()
+    (root / "config.yaml").write_text(
+        "auth:\n"
+        "  credential_store: runtime/users.sqlite\n"
+        "dossier_writer:\n"
+        "  database: runtime/dossier_queue.sqlite\n",
+        encoding="utf-8",
+    )
+    (root / "runtime.env").write_text(
+        "RAG_CREDENTIAL_MASTER_KEY_FILE=runtime/credential-master.key\n",
+        encoding="utf-8",
+    )
+    _sqlite(root / "runtime/users.sqlite")
+    _sqlite(root / "runtime/dossier_queue.sqlite")
+
+    state = inventory(root)
+    assert "runtime/dossier_queue.sqlite" in state["sqlite"]
+    assert "runtime/dossier_queue.sqlite" in state["archive_paths"]
+
+    (root / "config.yaml").write_text(
+        "auth:\n"
+        "  credential_store: runtime/users.sqlite\n"
+        "dossier_writer:\n"
+        "  database: /srv/sunaq-state/dossier.sqlite\n",
+        encoding="utf-8",
+    )
+    state = inventory(root)
+    assert {
+        "kind": "dossier_writer",
+        "path": "/srv/sunaq-state/dossier.sqlite",
+    } in state["blocking_external_paths"]

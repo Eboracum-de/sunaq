@@ -1,9 +1,11 @@
 """Source-origin classification and source-scope policy.
 
 The default internal RAG pool deliberately contains ordinary Nextcloud files
-only. Mail, public-web snapshots and saved SunaQ chat archives are explicit
-opt-in source scopes.  Explicit source scopes are orthogonal to retrieval engines: the
-same scope policy is applied to Elasticsearch, Qdrant and Graph candidates.
+only. Mail and saved SunaQ research/chat dossiers are explicit opt-in source
+scopes. Persisted public-web evidence belongs to the chat dossier lifecycle and
+is therefore retrieved through chatarchive. Explicit source scopes remain
+orthogonal to retrieval engines: the same policy is applied to Elasticsearch,
+Qdrant and Graph candidates.
 """
 from __future__ import annotations
 
@@ -19,7 +21,8 @@ import yaml
 
 log = logging.getLogger("rag-source-origin")
 BASE_DIR = Path(__file__).resolve().parent.parent
-ALLOWED_SOURCE_SCOPES = frozenset({"documents", "mailarchive", "webarchive", "chatarchive"})
+ALLOWED_SOURCE_SCOPES = frozenset({"documents", "mailarchive", "chatarchive"})
+LEGACY_SOURCE_SCOPE_ALIASES = {"webarchive": "chatarchive"}
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -280,8 +283,9 @@ def internal_exclude_paths() -> list[str]:
     """
     roots: set[str] = set(chat_archive_roots())
     roots.update(mail_archive_roots())
-    if exclude_web_archive_from_internal():
-        roots.update(web_archive_roots())
+    # Historical Webarchiv roots are now part of the Chatarchive source class
+    # and must never fall back into ordinary document retrieval.
+    roots.update(web_archive_roots())
     roots.discard("")
     return sorted(roots, key=str.casefold)
 
@@ -293,21 +297,29 @@ def path_is_under(path: str, root: str) -> bool:
 
 
 def is_machine_sidecar_path(path: str) -> bool:
-    """Technical hidden sidecars must never become ordinary RAG evidence."""
+    """Hidden Nextcloud files are control/metadata space, not RAG evidence.
+
+    SunaQ sidecars are deliberately dot-prefixed, but this rule is broader on
+    purpose: any file whose basename begins with "." is excluded from normal
+    document retrieval and derived semantic corpora.  Directory components are
+    not considered here, so a normal document below a dot-directory is not
+    rejected merely because of its parent path.
+    """
     name = PurePosixPath(normalize_path(path)).name.casefold()
-    return bool(
-        name == ".mailmeta.json"
-        or (name.startswith(".") and name.endswith(".mailmeta.json"))
-        or (name.startswith(".") and name.endswith(".sunaq.json"))
-        or (name.startswith(".") and name.endswith(".akirag.json"))
-        or (name.startswith(".") and name.endswith(".metadata.json"))
-    )
+    return bool(name.startswith("."))
 
 
 def normalize_source_scopes(values: Iterable[str] | None) -> set[str] | None:
     if values is None:
         return None
-    scopes = {str(value or "").strip().casefold() for value in values if str(value or "").strip()}
+    scopes = {
+        LEGACY_SOURCE_SCOPE_ALIASES.get(
+            str(value or "").strip().casefold(),
+            str(value or "").strip().casefold(),
+        )
+        for value in values
+        if str(value or "").strip()
+    }
     invalid = scopes - ALLOWED_SOURCE_SCOPES
     if invalid:
         raise ValueError("Unbekannte Quellenbereiche: " + ", ".join(sorted(invalid)))
@@ -319,13 +331,16 @@ def source_origins_for_scopes(scopes: Iterable[str] | None) -> set[str] | None:
     normalized = normalize_source_scopes(scopes)
     if normalized is None:
         return None
-    mapping = {
-        "documents": "internal",
-        "mailarchive": "mail_archive",
-        "webarchive": "web_archive",
-        "chatarchive": "chat_archive",
-    }
-    return {mapping[scope] for scope in normalized if scope in mapping}
+    origins: set[str] = set()
+    if "documents" in normalized:
+        origins.add("internal")
+    if "mailarchive" in normalized:
+        origins.add("mail_archive")
+    if "chatarchive" in normalized:
+        # web_archive remains a legacy provenance value for snapshots created
+        # before Web Evidence moved into the chat dossier lifecycle.
+        origins.update({"chat_archive", "web_archive"})
+    return origins
 
 def classify_source_origin(path: str, document_id: str | None = None) -> str:
     registered = registered_origin(str(document_id or "").strip()) if document_id else None
@@ -356,7 +371,8 @@ def source_scope_allows_record(document_id: str, path: str, scopes: Iterable[str
     mapping = {
         "internal": "documents",
         "mail_archive": "mailarchive",
-        "web_archive": "webarchive",
+        # Legacy web_archive provenance is intentionally folded into Chats.
+        "web_archive": "chatarchive",
         "chat_archive": "chatarchive",
     }
     scope = mapping.get(origin)

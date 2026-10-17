@@ -26,9 +26,9 @@ def test_elasticsearch_failure_returns_degraded_payload_not_exception(monkeypatc
     assert payload["retrieval_mode"] == "degraded_no_results"
     assert payload["results"] == []
     assert payload["backend_status"]["files"]["available"] is False
-    assert "files" in payload["retrieval_message"]
-    assert "keinen verwertbaren Treffer" in payload["retrieval_message"]
-    assert "mit den verbleibenden Diensten bearbeitet" not in payload["retrieval_message"]
+    assert "Dokumentensuche" in payload["retrieval_message"]
+    assert "kein weiterer Suchdienst" in payload["retrieval_message"]
+    assert "übrigen verfügbaren Suchdienste" not in payload["retrieval_message"]
 
 
 def test_disabled_vector_is_not_reported_as_failed(monkeypatch):
@@ -78,3 +78,17 @@ def test_provider_turns_elasticsearch_503_into_user_message():
     assert text is not None
     assert "Dokumentensuche" in text
     assert "Elasticsearch" in text
+
+
+def test_degraded_message_mentions_other_services_only_when_one_remains_available():
+    message = search._degraded_retrieval_message(
+        {
+            "files": {"requested": True, "enabled": True, "available": False},
+            "vector": {"requested": True, "enabled": True, "available": True},
+            "graph": {"requested": False, "enabled": False, "available": False},
+        },
+        ["files"],
+    )
+    assert "Dokumentensuche" in message
+    assert "übrigen verfügbaren Suchdienste" in message
+    assert "kein weiterer Suchdienst" not in message

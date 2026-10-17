@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 import subprocess
 from pathlib import Path
 
@@ -25,6 +26,7 @@ def test_service_secret_materializer_handles_quotes_empty_override_and_rotation(
         "RAG_INTERNAL_API_KEY='internal-machine'\n"
         "RAG_PROVIDER_INTERNAL_KEY=\"provider-runtime\"\n"
         "RAG_ADMIN_PASSWORD='admin pass'\n"
+        "NEO4J_PASSWORD='neo4j-secret'\n"
         "LLM_API_KEY=\n"
         "OPENROUTER_KEY='openrouter-secret'\n"
         "CUSTOM_CREDENTIAL='custom-secret'\n"
@@ -45,6 +47,8 @@ def test_service_secret_materializer_handles_quotes_empty_override_and_rotation(
     assert result.returncode == 0, result.stderr
 
     secrets = runtime / "service-secrets"
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o700
+    assert stat.S_IMODE(secrets.stat().st_mode) == 0o711
     assert (secrets / "RAG_INTERNAL_API_KEY").read_text() == "internal-machine"
     assert (secrets / "RAG_PROVIDER_INTERNAL_KEY").read_text() == "provider-runtime"
     assert (secrets / "RAG_ADMIN_PASSWORD").read_text() == "admin pass"
@@ -52,6 +56,9 @@ def test_service_secret_materializer_handles_quotes_empty_override_and_rotation(
     assert (secrets / "LLM_API_KEY").read_text() == ""
     assert (secrets / "OPENROUTER_KEY").read_text() == "openrouter-secret"
     assert (secrets / "CUSTOM_CREDENTIAL").read_text() == "custom-secret"
+    assert (secrets / "neo4j_auth").read_text() == "neo4j/neo4j-secret"
+    assert stat.S_IMODE((secrets / "neo4j_auth").stat().st_mode) == 0o444
+    assert stat.S_IMODE((secrets / "NEO4J_PASSWORD").stat().st_mode) == 0o600
     assert not (secrets / "STALE_API_KEY").exists()
 
     container_env = (prefix / "runtime.container.env").read_text()
