@@ -119,7 +119,7 @@ def test_store_research_findings_persists_only_positive_direct_matches():
     assert len(write_calls) == 1
     assert len(write_calls[0]["rows"]) == 1
     assert write_calls[0]["rows"][0]["document_id"] == "files:66732"
-    assert write_calls[0]["provenance_label"] == "AKI Recherche"
+    assert write_calls[0]["provenance_label"] == "SunaQ Recherche"
     assert write_calls[0]["query_id"] == "q-test"
     assert "user_query" not in write_calls[0]
 
@@ -199,42 +199,42 @@ def test_store_reuses_existing_finding_by_curation_hash_even_when_intent_differs
 
 def test_evidence_frame_view_and_candidates_surface_relation_endpoints():
     evidence = {
-        "constraints": [{"kind": "betroffene Person", "status": "match", "value": "Ariane Seeger"}],
+        "constraints": [{"kind": "betroffene Person", "status": "match", "value": "Alice Example"}],
         "entities": [],
         "mentioned_entities": [],
         "relations": [
-            {"source": "Alexander Eichner", "predicate": "adressiert ein Schreiben an", "target": "Ariane Seeger"},
-            {"source": "Ariane Seeger", "predicate": "wird in einer E-Mail angesprochen", "target": "Alexander Eichner"},
+            {"source": "Bob Example", "predicate": "adressiert ein Schreiben an", "target": "Alice Example"},
+            {"source": "Alice Example", "predicate": "wird in einer E-Mail angesprochen", "target": "Bob Example"},
         ],
     }
     view = evidence_frame_view(evidence)
     assert view["has_content"] is True
     assert view["relations"][0]["predicate"] == "adressiert ein Schreiben an"
     candidates = evidence_entity_candidates(evidence)
-    assert [item["text"] for item in candidates] == ["Ariane Seeger", "Alexander Eichner"]
+    assert [item["text"] for item in candidates] == ["Alice Example", "Bob Example"]
     assert merge_entity_candidates(
-        [{"text": "Ariane Seeger", "role": "query"}], candidates
+        [{"text": "Alice Example", "role": "query"}], candidates
     ) == [
-        {"text": "Ariane Seeger", "role": "query"},
-        {"text": "Alexander Eichner", "role": "Relationsquelle"},
+        {"text": "Alice Example", "role": "query"},
+        {"text": "Bob Example", "role": "Relationsquelle"},
     ]
 
 
 def test_relation_targets_are_not_promoted_to_entity_candidates():
     evidence = {
         "relations": [{
-            "source": "Ariane Seeger",
+            "source": "Alice Example",
             "predicate": "klärt",
             "target": "Belege und deren Buchung durch eine Kollegin",
         }]
     }
     assert evidence_entity_candidates(evidence) == [
-        {"text": "Ariane Seeger", "role": "Relationsquelle"}
+        {"text": "Alice Example", "role": "Relationsquelle"}
     ]
     assert merge_entity_candidates([
         {"text": "alter Zieltext", "role": "Relationsziel"},
-        {"text": "FLG Automation AG", "role": "Erwähnung"},
-    ]) == [{"text": "FLG Automation AG", "role": "Erwähnung"}]
+        {"text": "Example Automation AG", "role": "Erwähnung"},
+    ]) == [{"text": "Example Automation AG", "role": "Erwähnung"}]
 
 
 def test_evidence_candidates_ignore_planner_local_relation_ids():

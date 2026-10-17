@@ -111,7 +111,7 @@ def test_supervisory_board_membership_requires_explicit_membership_cue():
         object_type="Organization",
         object_kind="Company",
         relation_text="Aufsichtsratsmitglied",
-        evidence_text="Alexander Eichner ist Aufsichtsratsmitglied der FLG Automation AG.",
+        evidence_text="Bob Example ist Aufsichtsratsmitglied der Example Automation AG.",
     )
     assert allowed is None
 
@@ -123,6 +123,6 @@ def test_supervisory_board_membership_requires_explicit_membership_cue():
         object_type="Organization",
         object_kind="Company",
         relation_text="Nacharbeit eines Aufsichtsratschreibens",
-        evidence_text="Frau Seeger, bitte um Nacharbeit des Aufsichtsratschreibens von Alexander Eichner.",
+        evidence_text="Alice Example, bitte um Nacharbeit des Aufsichtsratschreibens von Bob Example.",
     )
     assert insufficient == "missing_explicit_relation_cue"

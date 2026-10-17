@@ -2,7 +2,7 @@
 
 ## Baseline
 
-`0.8.6-rc1` is the current release-candidate baseline. The 0.8.6 line adds startup-loaded SunaQ research profiles, per-user entitlement and request-local profile/runtime routing while retaining the rc5.1 live-ACL and deployment security boundaries.
+`0.8.7-rc1` is the current release-candidate baseline. The 0.8.7 line keeps startup-loaded SunaQ research profiles and live Nextcloud ACL while separating Standard/Dockerized packaging from the enforced SRC / ERG Internal / ERG Full architecture tiers and the core/workgroup/full capability presets.
 
 ## Repository layout
 
@@ -44,7 +44,7 @@ python -m pytest
 
 Some graph/vector tests require the optional runtime client libraries listed in `requirements.txt`. The deployment regression tests also inspect Docker/installer/config files directly and therefore catch accidental changes to the supported topology.
 
-GitHub Actions runs the complete pytest suite on Python 3.13 plus Python compile and shipped-shell syntax checks. The 0.8.6-rc1 branch is additionally validated on a fresh Super-Light VM against a real Nextcloud/Elasticsearch estate before public release.
+GitHub Actions runs the complete pytest suite on Python 3.13 plus Python compile and shipped-shell syntax checks. The 0.8.7-rc1 release line is additionally validated against real Nextcloud/Elasticsearch estates with a fresh Dockerized installation and an in-place Standard upgrade.
 
 ## Release rule
 
@@ -52,7 +52,7 @@ Keep functional changes separate from repository/documentation cleanup where pra
 
 1. run the full pytest suite in a clean environment;
 2. run the installer on a blank VM using the intended component flags;
-3. execute the acceptance matrix for the profile being released (for Super-Light: API/provider, AKI/Login Flow, two-user live ACL, shared alias/Graph-Lite behavior where enabled, Web/archive behavior, Elasticsearch degradation and container restart);
+3. execute the acceptance matrix for the deployment/tier being released (API/provider, SunaQ/Login Flow, live ACL, selected vector/graph/resolver capabilities, Web/archive behavior where enabled, Elasticsearch degradation and service/container restart);
 4. regenerate `MANIFEST.sha256` for distributable tarballs;
 5. scan the final tree for runtime databases, API keys, passwords, private keys and local environment files;
 6. perform a security-invariant review against `THREAT-MODEL.md`: protected documents never reach verifier/answer evidence, shared alias knowledge does not expose protected source provenance, Finding evidence is ACL-safe for any user-facing view, and diagnostic ACL-off state is visible.

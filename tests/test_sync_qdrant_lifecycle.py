@@ -38,6 +38,7 @@ def _config(tmp_path, **sync_overrides):
         "qdrant": {"url": "http://qdrant", "collection": "test"},
         "sync": {
             "state_db": str(tmp_path / "state.sqlite"),
+            "status_file": str(tmp_path / "sync-status.json"),
             "chunk_size": 5,
             "chunk_overlap": 0,
             "embedding_batch_size": 2,
@@ -91,6 +92,13 @@ def test_new_document_upserts_without_delete(monkeypatch, tmp_path):
     assert [event[0] for event in events].count("upsert") == 1
     assert not any(event[0] == "delete" for event in events)
 
+    status = __import__("json").loads((tmp_path / "sync-status.json").read_text(encoding="utf-8"))
+    assert status["complete_full_scan"] is True
+    assert status["scan"]["scanned"] == 1
+    assert status["scan"]["eligible_seen"] == 1
+    assert status["state"]["vectorized_documents"] == 1
+    assert status["state"]["chunks"] == 2
+
 
 def test_shrinking_document_upserts_first_then_deletes_only_tail(monkeypatch, tmp_path):
     cfg_path = _config(tmp_path)
@@ -140,3 +148,89 @@ def test_stale_document_deletes_committed_ids(monkeypatch, tmp_path):
     state = sync.StateDB(str(tmp_path / "state.sqlite"))
     assert state.get("files:9") is None
     state.close()
+
+
+
+def test_runtime_pause_stops_at_batch_boundary_without_stale_cleanup(monkeypatch, tmp_path):
+    cfg_path = _config(tmp_path)
+    state = sync.StateDB(str(tmp_path / "state.sqlite"))
+    for number in range(1, 61):
+        state.put(
+            f"files:{number}",
+            "hash-abcdefghij",
+            2,
+            f"Docs/test-{number}.txt",
+            "sig",
+        )
+    state.put("files:999", "stale-hash", 1, "Docs/stale.txt", "sig")
+    state.close()
+
+    hits = [
+        _hit(doc_id=f"files:{number}", title=f"Docs/test-{number}.txt", content="abcdefghij")
+        for number in range(1, 61)
+    ]
+    deleted = []
+
+    monkeypatch.setattr(sync, "es_scroll", lambda *a, **k: iter(hits))
+    monkeypatch.setattr(sync, "build_embedding_backend_from_config", lambda cfg: DummyEmbeddingBackend())
+    monkeypatch.setattr(sync, "build_index_signature", lambda **kwargs: "sig")
+    monkeypatch.setattr(sync, "maybe_register_path_origin", lambda *a, **k: "internal")
+    monkeypatch.setattr(sync, "runtime_worker_enabled", lambda *a, **k: False)
+    monkeypatch.setattr(
+        sync,
+        "qdrant_delete_chunk_range",
+        lambda _url, _collection, doc, start, end, **kwargs: deleted.append((doc, start, end)),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sync",
+            "--config",
+            str(cfg_path),
+            "--max-documents",
+            "0",
+            "--runtime-control-worker",
+            "sync_worker",
+            "--pause-check-documents",
+            "25",
+        ],
+    )
+
+    assert sync.main() == 0
+    assert deleted == []
+
+    status = __import__("json").loads((tmp_path / "sync-status.json").read_text(encoding="utf-8"))
+    assert status["runtime_paused"] is True
+    assert status["complete_full_scan"] is False
+    assert status["scan"]["scanned"] == 25
+
+    state = sync.StateDB(str(tmp_path / "state.sqlite"))
+    assert state.get("files:999") is not None
+    state.close()
+
+
+
+def test_legacy_dockerized_top_level_state_db_uses_runtime_mount():
+    cfg = {
+        "deployment": {"mode": "dockerized"},
+        "state_db": "state.sqlite",
+    }
+    assert sync.resolve_sync_state_path(cfg) == "runtime/state.sqlite"
+
+
+def test_standard_legacy_top_level_state_db_remains_compatible():
+    cfg = {
+        "deployment": {"mode": "native"},
+        "state_db": "state.sqlite",
+    }
+    assert sync.resolve_sync_state_path(cfg) == "state.sqlite"
+
+
+def test_canonical_sync_state_db_wins_over_legacy_value():
+    cfg = {
+        "deployment": {"mode": "dockerized"},
+        "state_db": "state.sqlite",
+        "sync": {"state_db": "runtime/custom-state.sqlite"},
+    }
+    assert sync.resolve_sync_state_path(cfg) == "runtime/custom-state.sqlite"

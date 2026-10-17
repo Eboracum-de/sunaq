@@ -37,7 +37,7 @@ async def test_research_finding_scope_guard_accepts_selected_mailarchive(monkeyp
     result = provider.SearchResult(
         index=1,
         title="message.html",
-        text="Ariane Seeger",
+        text="Alice Example",
         raw={
             "document_id": "files:1",
             "source_origin": "mail_archive",
@@ -51,7 +51,7 @@ async def test_research_finding_scope_guard_accepts_selected_mailarchive(monkeyp
         query_id="q1",
         query_frame={
             "intent": "find person",
-            "entities": [{"id": "e1", "text": "Ariane Seeger", "role": "person"}],
+            "entities": [{"id": "e1", "text": "Alice Example", "role": "person"}],
             "relations": [],
             "constraints": [],
             "concepts": [],
@@ -73,7 +73,7 @@ async def test_research_finding_scope_guard_rejects_unselected_chatarchive(monke
     result = provider.SearchResult(
         index=1,
         title="old-chat.md",
-        text="Ariane Seeger",
+        text="Alice Example",
         raw={
             "document_id": "files:2",
             "source_origin": "chat_archive",
@@ -87,7 +87,7 @@ async def test_research_finding_scope_guard_rejects_unselected_chatarchive(monke
         query_id="q2",
         query_frame={
             "intent": "find person",
-            "entities": [{"id": "e1", "text": "Ariane Seeger", "role": "person"}],
+            "entities": [{"id": "e1", "text": "Alice Example", "role": "person"}],
             "relations": [],
             "constraints": [],
             "concepts": [],
@@ -122,3 +122,15 @@ async def test_graph_evidence_hook_does_not_depend_on_undefined_source_scopes(mo
 
     assert _Client.payload is not None
     assert _Client.payload["documents"][0]["document_id"] == "files:42"
+
+def test_research_finding_logs_use_sunaq_branding():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parent.parent / "rag" / "openai_provider.py"
+    ).read_text(encoding="utf-8")
+    assert "SunaQ research findings persisted" in source
+    assert "SunaQ research finding persistence failed" in source
+    assert "AKI research findings persisted" not in source
+    assert "AKI research finding persistence failed" not in source
+

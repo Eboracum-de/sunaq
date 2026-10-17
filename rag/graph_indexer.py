@@ -536,7 +536,7 @@ Wichtige Beispiele:
 - „Herrn Dr. Gregor Brauer“ -> Person, Person, actor falls er am Vorgang beteiligt ist; canonical_name „Gregor Brauer“.
 - „MSH Projekt UG“ -> Organization, Company.
 - „Amtsgericht Frankfurt am Main“ in „Amtsgericht Frankfurt am Main / Handelsregister HRB ...“ eines Firmenfooters -> Organization, Court, identity_metadata.
-- „Alexander Eichner“ in „Vorsitzender des Aufsichtsrats: Alexander Eichner“ eines Firmenfooters -> Person, identity_metadata (die spaetere Relationsextraktion darf die explizite Organrelation pruefen).
+- „Bob Example“ in „Vorsitzender des Aufsichtsrats: Bob Example“ eines Firmenfooters -> Person, identity_metadata (die spaetere Relationsextraktion darf die explizite Organrelation pruefen).
 - „Kurfürstendamm 62“ -> keine Entity.
 - „Beklagte zu 1.“ -> keine Entity.
 - „Alexander der Große“ in historischem Beispiel/Zitat -> quoted oder weglassen.

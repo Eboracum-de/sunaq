@@ -1,51 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")"
-source "$(pwd)/install/load-service-env.sh" "$(pwd)"
+BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$BASE_DIR"
+source "$BASE_DIR/install/load-service-env.sh" "$BASE_DIR"
 
-read_worker_config() {
-  ./.venv/bin/python - <<'PY'
-import yaml
-try:
-    with open('config.yaml', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f) or {}
-    worker = cfg.get('sync_worker') or {}
-    qdrant = cfg.get('qdrant') or {}
-    enabled = bool(worker.get('enabled', True)) and bool(qdrant.get('enabled', True))
-    interval = max(60, int(worker.get('poll_interval_seconds') or 300))
-    max_documents = max(0, int(worker.get('max_documents') or 0))
-    enqueue_graph = bool(worker.get('enqueue_graph', False))
-    print('1' if enabled else '0')
-    print(interval)
-    print(max_documents)
-    print('1' if enqueue_graph else '0')
-except Exception:
-    print('0')
-    print(300)
-    print(0)
-    print('0')
-PY
-}
+if [[ -n "${RAG_PYTHON:-}" ]]; then
+  PYTHON_BIN="$RAG_PYTHON"
+elif [[ -x "$BASE_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$BASE_DIR/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+else
+  echo "No Python interpreter found (set RAG_PYTHON or install python3)." >&2
+  exit 127
+fi
 
-while true; do
-  mapfile -t values < <(read_worker_config)
-  enabled="${values[0]:-0}"
-  interval="${values[1]:-300}"
-  max_documents="${values[2]:-0}"
-  enqueue_graph="${values[3]:-0}"
-
-  if [[ "$enabled" == "1" ]]; then
-    args=(--config config.yaml --max-documents "$max_documents")
-    if [[ "$enqueue_graph" == "1" ]]; then
-      args+=(--enqueue-graph)
-    else
-      args+=(--no-enqueue-graph)
-    fi
-    if ! ./.venv/bin/python -m rag.sync "${args[@]}"; then
-      echo "$(date -Is) ES->Qdrant sync run failed; retrying after interval" >&2
-    fi
-  else
-    echo "$(date -Is) sync_worker/qdrant disabled; no ES->Qdrant sync run" >&2
-  fi
-  sleep "$interval"
-done
+exec "$PYTHON_BIN" -m rag.sync_worker --config "${RAG_CONFIG:-$BASE_DIR/config.yaml}"

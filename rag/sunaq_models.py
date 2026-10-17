@@ -24,6 +24,8 @@ from typing import Any, Iterable
 
 import yaml
 
+from rag.architecture_policy import architecture_tier, normalize_architecture_tier
+
 
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 
@@ -41,6 +43,9 @@ PROFILE_CONFIG_SECTIONS = frozenset(
         "context_enrichment",
         "answer_context",
         "entity_resolution",
+        "resolver_research",
+        "capabilities",
+        "research",
     }
 )
 
@@ -55,6 +60,21 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
         else:
             result[key] = deepcopy(value)
     return result
+
+
+def _truthy(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _component_enabled(cfg: dict[str, Any], section: str, *, default: bool = False) -> bool:
+    value = cfg.get(section) or {}
+    if not isinstance(value, dict):
+        return default
+    return _truthy(value.get("enabled"), default)
 
 
 def _clean_model_id(value: Any, *, field: str = "id") -> str:
@@ -186,7 +206,7 @@ class ModelRegistry:
 
 def _legacy_model(base_config: dict[str, Any]) -> RuntimeModel:
     model_id = _clean_model_id(
-        os.getenv("PROVIDER_MODEL_ID", "nextcloud-hybrid-rag"),
+        os.getenv("PROVIDER_MODEL_ID", "sunaq"),
         field="legacy id",
     )
     return RuntimeModel(
@@ -232,6 +252,29 @@ def load_model_registry(
                 continue
 
             model_id = _clean_model_id(raw.get("id") or model_dir.name)
+
+            tiers_raw = raw.get("architecture_tiers") or []
+            if isinstance(tiers_raw, str):
+                tiers_raw = [tiers_raw]
+            if not isinstance(tiers_raw, list):
+                raise RuntimeError(f"architecture_tiers must be a list in {profile_path}")
+            allowed_tiers = {
+                normalize_architecture_tier(value)
+                for value in tiers_raw
+                if str(value or "").strip()
+            }
+            current_tier = architecture_tier(base_config)
+            if allowed_tiers and current_tier not in allowed_tiers:
+                continue
+
+            resolver_requirement = raw.get("resolver_research") or {}
+            if (
+                isinstance(resolver_requirement, dict)
+                and _truthy(resolver_requirement.get("enabled"), False)
+                and not _component_enabled(base_config, "resolver")
+            ):
+                continue
+
             name = str(raw.get("name") or raw.get("label") or model_id).strip() or model_id
             description = str(raw.get("description") or "").strip()
             aliases_raw = raw.get("aliases") or []
@@ -258,6 +301,24 @@ def load_model_registry(
                     raise RuntimeError(f"{section} must be a mapping in {profile_path}")
                 model_config[section] = deepcopy(override)
 
+            # Validate model-local capability and backend choices at startup.
+            # Provider-side capability checks still intersect these with global
+            # configuration and per-user entitlements on every request.
+            caps = model_config.get("capabilities") or {}
+            research = model_config.get("research") or {}
+            allowed_caps = {"documents", "mailarchive", "chatarchive", "web"}
+            if set(caps) - allowed_caps or any(not isinstance(v, bool) for v in caps.values()):
+                raise RuntimeError(f"Invalid capabilities in {profile_path}")
+            if set(research) - {"web_backend"}:
+                raise RuntimeError(f"Unknown research fields in {profile_path}")
+            selected_backend = research.get("web_backend")
+            if selected_backend is not None and (
+                not isinstance(selected_backend, str) or
+                (not selected_backend.strip()) or
+                len(selected_backend) > 64
+            ):
+                raise RuntimeError(f"Invalid research.web_backend in {profile_path}")
+
             # Upgrade bridge: the shipped default profile may explicitly opt in
             # to old inline config.yaml sections. This preserves an existing
             # 0.8.5 installation's tuned Standard behaviour without letting
@@ -281,11 +342,17 @@ def load_model_registry(
                 raise RuntimeError(
                     f"deployment_overrides must be a mapping in {profile_path}"
                 )
-            selected_override = (
-                deployment_overrides.get(deployment_profile) or {}
-                if deployment_profile
-                else {}
-            )
+            selected_override: dict[str, Any] = {}
+            if deployment_profile:
+                selected_override = deployment_overrides.get(deployment_profile) or {}
+                # Narrow packaging-rename bridge. Installer reruns migrate
+                # site-owned model profiles from super-light -> dockerized, but
+                # failed/rolled-back upgrades must remain runnable while config
+                # and model files momentarily carry opposite names.
+                if not selected_override and deployment_profile == "dockerized":
+                    selected_override = deployment_overrides.get("super-light") or {}
+                elif not selected_override and deployment_profile == "super-light":
+                    selected_override = deployment_overrides.get("dockerized") or {}
             if not isinstance(selected_override, dict):
                 raise RuntimeError(
                     f"deployment override {deployment_profile!r} must be a mapping in {profile_path}"
@@ -304,6 +371,7 @@ def load_model_registry(
                 if not isinstance(current, dict):
                     current = {}
                 model_config[section_name] = _deep_merge(dict(current), override)
+
 
             roles_raw = raw.get("roles") or {}
             if not isinstance(roles_raw, dict):

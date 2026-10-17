@@ -7,6 +7,6 @@ def _requirements(name: str) -> set[str]:
 
 
 def test_admin_ui_template_dependency_is_explicit_in_all_runtime_profiles():
-    for filename in ("requirements.txt", "requirements-super-light.txt"):
+    for filename in ("requirements.txt", "requirements-dockerized.txt"):
         requirements = _requirements(filename)
         assert any(item.startswith("jinja2") for item in requirements), filename

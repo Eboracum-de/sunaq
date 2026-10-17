@@ -45,7 +45,7 @@ python -m pytest
 
 See `docs/DEVELOPMENT.md` for repository layout, supported deployment mappings and release checks.
 
-For changes affecting Super-Light, also check installer/Compose/configuration behavior because deployment regression tests inspect these files directly.
+For changes affecting Dockerized deployments, including legacy Super-Light compatibility paths, also check installer/Compose/configuration behavior because deployment regression tests inspect these files directly.
 
 ## Design invariants
 

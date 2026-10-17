@@ -37,7 +37,7 @@ print("ok")
 def test_both_install_profiles_default_strict_mode_off_and_allow_opt_in():
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent
-    for rel in ("install/profiles/install-standard.sh", "install/profiles/install-super-light.sh"):
+    for rel in ("install/profiles/install-standard.sh", "install/profiles/install-dockerized.sh"):
         text = (root / rel).read_text(encoding="utf-8")
         assert "X509_STRICT=0" in text
         assert "--x509-strict" in text

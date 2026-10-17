@@ -2,6 +2,7 @@
 namespace OCA\Sunaq\Service;
 
 use OCP\Http\Client\IClientService;
+use OCP\ICertificateManager;
 use OCP\IConfig;
 use OCP\IGroupManager;
 use OCP\IUserSession;
@@ -18,6 +19,9 @@ class RagProxy {
     /** @var IConfig */
     private $config;
 
+    /** @var ICertificateManager */
+    private $certificateManager;
+
     /** @var ICrypto */
     private $crypto;
 
@@ -29,12 +33,14 @@ class RagProxy {
 
     public function __construct(
         IClientService $clientService,
+        ICertificateManager $certificateManager,
         IConfig $config,
         ICrypto $crypto,
         IUserSession $userSession,
         IGroupManager $groupManager
     ) {
         $this->clientService = $clientService;
+        $this->certificateManager = $certificateManager;
         $this->config = $config;
         $this->crypto = $crypto;
         $this->userSession = $userSession;
@@ -99,7 +105,7 @@ class RagProxy {
         );
     }
 
-    public function chat(array $messages, array $sourceScopes = [], $modelId = '', $requestId = '') {
+    public function chat(array $messages, array $sourceScopes = [], $conversationId = '', $modelId = '', $requestId = '') {
         $baseUrl = rtrim($this->appConfigValue('middleware_url', ''), '/');
         $encryptedKey = $this->appConfigValue('api_key_encrypted', '');
         if ($baseUrl === '' || $encryptedKey === '') {
@@ -153,6 +159,11 @@ class RagProxy {
             'X-RAG-User-Groups' => json_encode($groupIds),
             'X-RAG-Web-Allowed' => 'true',
         ];
+        $conversationId = trim((string)$conversationId);
+        if ($conversationId !== '' && preg_match('/^[A-Za-z0-9._:-]{1,128}$/', $conversationId)) {
+            $headers['X-RAG-Conversation-ID'] = $conversationId;
+        }
+
         $requestId = trim((string)$requestId);
         if ($requestId !== '' && preg_match('/^[A-Za-z0-9._-]{8,128}$/', $requestId)) {
             $headers['X-RAG-Request-ID'] = $requestId;
@@ -222,6 +233,270 @@ class RagProxy {
             'model' => isset($decoded['model']) ? (string)$decoded['model'] : $modelId,
             'source_scopes' => $effectiveSourceScopes,
         ];
+    }
+
+
+    /**
+     * Proxy an OpenAI-compatible SSE completion without buffering it in
+     * Nextcloud's AppFramework.  Nextcloud 23's IClient stream option is only
+     * honored for GET requests, so POST streaming uses cURL directly while
+     * preserving Nextcloud's trusted CA bundle and configured forward proxy.
+     */
+    public function streamChat(
+        array $messages,
+        array $sourceScopes = [],
+        $conversationId = '',
+        $modelId = '',
+        $requestId = '',
+        $emit = null
+    ) {
+        if ($emit === null) {
+            throw new \InvalidArgumentException('Streaming-Ausgabe fehlt.');
+        }
+        if (!function_exists('curl_init')) {
+            throw new \RuntimeException('PHP-cURL ist für Streaming nicht verfügbar.');
+        }
+
+        $baseUrl = rtrim($this->appConfigValue('middleware_url', ''), '/');
+        $encryptedKey = $this->appConfigValue('api_key_encrypted', '');
+        if ($baseUrl === '' || $encryptedKey === '') {
+            throw new \RuntimeException('SunaQ Recherche ist noch nicht konfiguriert.');
+        }
+        $this->assertCredentialTransport($baseUrl);
+
+        try {
+            $apiKey = $this->crypto->decrypt($encryptedKey);
+        } catch (\Exception $e) {
+            throw new \RuntimeException('Der gespeicherte Middleware-API-Key kann nicht gelesen werden.');
+        }
+
+        $user = $this->userSession->getUser();
+        if ($user === null) {
+            throw new \RuntimeException('Keine angemeldete Nextcloud-Sitzung gefunden.');
+        }
+        $uid = $user->getUID();
+        $groupIds = [];
+        foreach ($this->groupManager->getUserGroups($user) as $group) {
+            $gid = trim((string)$group->getGID());
+            if ($gid !== '') {
+                $groupIds[] = $gid;
+            }
+        }
+        $groupIds = array_values(array_unique($groupIds));
+
+        $cleanMessages = $this->sanitizeMessages($messages);
+        if (count($cleanMessages) === 0) {
+            throw new \InvalidArgumentException('Keine Anfrage übergeben.');
+        }
+        $effectiveSourceScopes = $this->applySourceScopes($cleanMessages, $sourceScopes);
+
+        $payload = [
+            'messages' => $cleanMessages,
+            'stream' => true,
+            'user' => $uid,
+        ];
+        $modelId = trim((string)$modelId);
+        if ($modelId !== '') {
+            $payload['model'] = $modelId;
+        }
+
+        $headers = [
+            'Accept: text/event-stream',
+            'User-Agent: ' . $this->userAgent(),
+            'Content-Type: application/json',
+            'Authorization: Bearer ' . $apiKey,
+            'X-RAG-User-ID: ' . $uid,
+            'X-RAG-User-Groups: ' . json_encode($groupIds),
+            'X-RAG-Web-Allowed: true',
+        ];
+        $conversationId = trim((string)$conversationId);
+        if ($conversationId !== '' && preg_match('/^[A-Za-z0-9._:-]{1,128}$/', $conversationId)) {
+            $headers[] = 'X-RAG-Conversation-ID: ' . $conversationId;
+        }
+        $requestId = trim((string)$requestId);
+        if ($requestId !== '' && preg_match('/^[A-Za-z0-9._-]{8,128}$/', $requestId)) {
+            $headers[] = 'X-RAG-Request-ID: ' . $requestId;
+        }
+
+        $rawBody = '';
+        $upstreamStatus = 0;
+        $contentType = '';
+        $url = $baseUrl . '/v1/chat/completions';
+        $ch = curl_init($url);
+        if ($ch === false) {
+            throw new \RuntimeException('Streaming-Verbindung konnte nicht initialisiert werden.');
+        }
+
+        $options = [
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_POSTFIELDS => json_encode($payload),
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_CONNECTTIMEOUT => 15,
+            CURLOPT_TIMEOUT => 240,
+            CURLOPT_ENCODING => '',
+            CURLOPT_HEADERFUNCTION => function ($handle, $line) use (&$upstreamStatus, &$contentType) {
+                $trimmed = trim((string)$line);
+                if (preg_match('#^HTTP/\\S+\\s+(\\d{3})#i', $trimmed, $match)) {
+                    $upstreamStatus = (int)$match[1];
+                    $contentType = '';
+                } elseif (stripos($trimmed, 'Content-Type:') === 0) {
+                    $contentType = trim(substr($trimmed, strlen('Content-Type:')));
+                }
+                return strlen($line);
+            },
+            CURLOPT_WRITEFUNCTION => function ($handle, $chunk) use (&$rawBody, &$upstreamStatus, &$contentType, $emit) {
+                $rawBody .= $chunk;
+                if (
+                    $upstreamStatus >= 200
+                    && $upstreamStatus < 300
+                    && stripos($contentType, 'text/event-stream') !== false
+                ) {
+                    call_user_func($emit, $chunk);
+                }
+                return strlen($chunk);
+            },
+        ];
+
+        if (strtolower((string)parse_url($url, PHP_URL_SCHEME)) === 'https') {
+            $options[CURLOPT_SSL_VERIFYPEER] = true;
+            $options[CURLOPT_SSL_VERIFYHOST] = 2;
+            try {
+                $caBundle = $this->certificateManager->getAbsoluteBundlePath();
+                if (is_string($caBundle) && $caBundle !== '') {
+                    $options[CURLOPT_CAINFO] = $caBundle;
+                }
+            } catch (\Exception $e) {
+                // cURL falls back to the PHP/system trust store if Nextcloud's
+                // generated bundle is temporarily unavailable.
+            }
+        }
+
+        $proxy = trim((string)$this->config->getSystemValue('proxy', ''));
+        if ($proxy !== '') {
+            $options[CURLOPT_PROXY] = $proxy;
+            $proxyUserPwd = trim((string)$this->config->getSystemValue('proxyuserpwd', ''));
+            if ($proxyUserPwd !== '') {
+                $options[CURLOPT_PROXYUSERPWD] = $proxyUserPwd;
+            }
+            $proxyExclude = $this->config->getSystemValue('proxyexclude', []);
+            if (is_array($proxyExclude) && count($proxyExclude) > 0) {
+                $options[CURLOPT_NOPROXY] = implode(',', array_map('strval', $proxyExclude));
+            }
+        }
+
+        curl_setopt_array($ch, $options);
+        $ok = curl_exec($ch);
+        $curlError = curl_error($ch);
+        $curlStatus = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($ok === false) {
+            throw new \RuntimeException(
+                'Middleware-Streaming fehlgeschlagen: ' . $this->safeError($curlError)
+            );
+        }
+
+        $status = $upstreamStatus > 0 ? $upstreamStatus : $curlStatus;
+        if ($status < 200 || $status >= 300) {
+            $decodedError = json_decode($rawBody, true);
+            $detail = is_array($decodedError) && isset($decodedError['detail'])
+                ? (string)$decodedError['detail']
+                : 'HTTP ' . $status;
+            throw new \RuntimeException('Middleware-Fehler: ' . $this->safeError($detail));
+        }
+
+        if (stripos($contentType, 'text/event-stream') === false) {
+            $decoded = json_decode($rawBody, true);
+            if (!is_array($decoded) || !isset($decoded['choices'][0]['message']['content'])) {
+                throw new \RuntimeException('Middleware hat keinen lesbaren Stream geliefert.');
+            }
+            $fallbackContent = (string)$decoded['choices'][0]['message']['content'];
+            $synthetic = [
+                'id' => isset($decoded['id']) ? (string)$decoded['id'] : '',
+                'object' => 'chat.completion.chunk',
+                'model' => isset($decoded['model']) ? (string)$decoded['model'] : $modelId,
+                'choices' => [[
+                    'index' => 0,
+                    'delta' => ['content' => $fallbackContent],
+                    'finish_reason' => null,
+                ]],
+            ];
+            call_user_func($emit, 'data: ' . json_encode($synthetic) . "\n\n");
+            call_user_func($emit, "data: [DONE]\n\n");
+            $rawBody = 'data: ' . json_encode($synthetic) . "\n\n";
+        }
+
+        $parsed = $this->parseStreamedCompletion($rawBody);
+        $rawContent = (string)($parsed['content'] ?? '');
+        $sources = $this->extractSourceMarkers($rawContent);
+        $cleanContent = preg_replace('/<!--rag-source:\\d+:[^>]+-->/', '', $rawContent);
+        $cleanContent = trim(preg_replace('/[ \\t]+\\n/', "\n", (string)$cleanContent));
+
+        $suggestions = [];
+        if ($requestId !== '') {
+            try {
+                $statusPayload = $this->status($requestId);
+                if (isset($statusPayload['suggestions']) && is_array($statusPayload['suggestions'])) {
+                    $suggestions = array_slice($statusPayload['suggestions'], 0, 4);
+                }
+            } catch (\Exception $e) {
+                // Suggestions are optional UI metadata and must never delay or
+                // invalidate an otherwise successful streamed answer.
+            }
+        }
+
+        return [
+            'content' => $cleanContent,
+            'sources' => $sources,
+            'suggestions' => $suggestions,
+            'id' => (string)($parsed['id'] ?? ''),
+            'model' => (string)($parsed['model'] ?? $modelId),
+            'source_scopes' => $effectiveSourceScopes,
+        ];
+    }
+
+    private function parseStreamedCompletion($raw) {
+        $content = '';
+        $id = '';
+        $model = '';
+        $events = preg_split('/\\r?\\n\\r?\\n/', (string)$raw);
+        foreach ($events as $event) {
+            $dataLines = [];
+            foreach (preg_split('/\\r?\\n/', (string)$event) as $line) {
+                if (strpos($line, 'data:') === 0) {
+                    $dataLines[] = ltrim(substr($line, 5));
+                }
+            }
+            if (!$dataLines) {
+                continue;
+            }
+            $data = implode("\n", $dataLines);
+            if ($data === '[DONE]') {
+                continue;
+            }
+            $payload = json_decode($data, true);
+            if (!is_array($payload)) {
+                continue;
+            }
+            if ($id === '' && !empty($payload['id'])) {
+                $id = (string)$payload['id'];
+            }
+            if ($model === '' && !empty($payload['model'])) {
+                $model = (string)$payload['model'];
+            }
+            $choice = $payload['choices'][0] ?? null;
+            if (!is_array($choice)) {
+                continue;
+            }
+            $delta = $choice['delta'] ?? [];
+            if (is_array($delta) && isset($delta['content'])) {
+                $content .= (string)$delta['content'];
+            } elseif (isset($choice['message']['content'])) {
+                $content .= (string)$choice['message']['content'];
+            }
+        }
+        return ['content' => $content, 'id' => $id, 'model' => $model];
     }
 
     public function models() {

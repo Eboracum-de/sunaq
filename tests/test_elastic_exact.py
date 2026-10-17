@@ -114,3 +114,14 @@ def test_rag_files_explicit_phrase_is_strict_not_nextcloud_or():
     multi = search.phrase_clause('38 M 8076/17')['multi_match']
     assert multi['type'] == 'phrase'
     assert multi['slop'] == 0
+
+def test_required_company_phrase_and_required_role_are_both_must():
+    tokens = nextcloud_query_tokens(
+        '+"Example Real Estate GmbH" +Geschaeftsfuehrer'
+    )
+    assert [item["occur"] for item in tokens] == ["must", "must"]
+    assert [item["text"] for item in tokens] == [
+        "Example Real Estate GmbH",
+        "Geschaeftsfuehrer",
+    ]
+

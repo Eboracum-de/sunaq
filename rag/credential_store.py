@@ -1436,13 +1436,28 @@ class CredentialStore:
 
     def set_web_settings(
         self, canonical_user_id: str, *, enabled: bool = True,
-        archive_enabled: bool = True, target_path: str = "",
+        archive_enabled: bool | None = None, target_path: str | None = None,
     ) -> UserWebSettings:
+        """Store the per-user live-Web gate.
+
+        archive_enabled/target_path are retained only for compatibility with
+        pre-rc2 Webarchiv data. New Web Evidence is persisted inside the
+        user's chat research dossier and no longer has a separate target.
+        """
         if self.get_canonical_user(canonical_user_id) is None:
             raise ValueError("unknown canonical user")
-        target = str(target_path or "").strip(" /")
-        if archive_enabled and not target:
-            raise ValueError("web archive target_path is required when archive is enabled")
+        existing = self.get_web_settings(canonical_user_id)
+        legacy_archive_enabled = (
+            bool(existing.archive_enabled) if archive_enabled is None and existing is not None
+            else bool(archive_enabled)
+        )
+        target = (
+            str(existing.target_path or "").strip(" /")
+            if target_path is None and existing is not None
+            else str(target_path or "").strip(" /")
+        )
+        if archive_enabled is not None and legacy_archive_enabled and not target:
+            raise ValueError("legacy web archive target_path is required when archive is enabled")
         now = time.time()
         with self._connect() as con:
             con.execute(
@@ -1453,10 +1468,10 @@ class CredentialStore:
                     enabled=excluded.enabled, archive_enabled=excluded.archive_enabled,
                     target_path=excluded.target_path, updated_at=excluded.updated_at
                 """,
-                (str(canonical_user_id).strip(), int(bool(enabled)), int(bool(archive_enabled)), target, now, now),
+                (str(canonical_user_id).strip(), int(bool(enabled)), int(legacy_archive_enabled), target, now, now),
             )
-            if archive_enabled and target:
-                # Preserve every archive root ever used. If an admin later moves
+            if legacy_archive_enabled and target:
+                # Preserve every legacy archive root ever used. If an admin later moves
                 # a user's Web archive, old snapshots must not silently re-enter
                 # ordinary internal retrieval.
                 con.execute(

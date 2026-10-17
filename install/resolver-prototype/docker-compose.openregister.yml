@@ -1,0 +1,7 @@
+services:
+  resolver:
+    environment:
+      RESOLVER_OPENREGISTER_ENABLED: "true"
+      RESOLVER_OPENREGISTER_API_KEY_FILE: "/run/sunaq-secrets/OPENREGISTER_API_KEY"
+    volumes:
+      - ../../runtime/service-secrets/OPENREGISTER_API_KEY:/run/sunaq-secrets/OPENREGISTER_API_KEY:ro

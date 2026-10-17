@@ -17,17 +17,20 @@ import logging
 import os
 import secrets
 import threading
+from time import perf_counter
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from starlette.templating import Jinja2Templates
 
 from rag.curator import GraphCurator
 from rag.graph import cfg_get
+from rag.elasticsearch_client import httpx_options as elastic_httpx_options
 from rag.research_findings import evidence_frame_view
 from rag.graph_queue import GraphQueue
 from rag.credential_store import CredentialStore, canonical_credential_owner
@@ -35,6 +38,11 @@ from rag.carddav_sync import CardDAVClient, CardDAVSettings, sync_for_canonical_
 from rag.mail_sync import probe_mailboxes
 from rag.acl import NextcloudLiveAcl
 from rag.sunaq_models import load_model_registry
+from rag.architecture_policy import architecture_tier as effective_architecture_tier
+from rag.runtime_control import (
+    set_worker_enabled as set_runtime_worker_enabled,
+    snapshot as runtime_worker_snapshot,
+)
 
 
 POLICIES = ("exclusive", "contextual", "search_only", "document_only")
@@ -144,6 +152,28 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
         str(cfg_get(cfg, "auth.credential_store", default=cfg_get(cfg, "acl.credential_store", default="runtime/users.sqlite")) or "runtime/users.sqlite")
     )
     model_registry = load_model_registry(cfg)
+    architecture_tier = effective_architecture_tier(cfg)
+    src_mode = architecture_tier == "src"
+
+    # Architecture capability boundary: SRC exposes the secure document/ACL
+    # core only. ERG-only surfaces must not appear merely because their storage
+    # tables or route implementations exist in the installed code.
+    chat_archive_available = not src_mode
+    mail_available = architecture_tier == "erg_full"
+    web_research_available = architecture_tier == "erg_full"
+    graph_enabled = (not src_mode) and bool(cfg_get(cfg, "neo4j.enabled", default=False))
+    findings_available = graph_enabled and bool(cfg_get(cfg, "research_findings.enabled", default=False))
+    contacts_available = graph_enabled
+    vector_enabled = (not src_mode) and bool(cfg_get(cfg, "qdrant.enabled", default=False))
+    runtime_config_path = Path(
+        os.getenv("RAG_CONFIG", os.getenv("RAG_CONFIG_FILE", "config.yaml"))
+    ).resolve()
+
+    web_engine_enabled = web_research_available and bool((web_cfg or {}).get("enabled", False))
+    web_snapshot_engine_enabled = bool(
+        web_engine_enabled
+        and ((web_cfg or {}).get("archive") or {}).get("enabled", False)
+    )
     curation_acl = NextcloudLiveAcl(cfg)
     admin_user_context_enabled = bool(cfg_get(cfg, "research_findings.curation.admin_user_context", default=True))
     user_self_service_enabled = bool(cfg_get(cfg, "research_findings.curation.user_self_service", default=False))
@@ -274,9 +304,35 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
         except Exception as exc:
             return [], f"{type(exc).__name__}: {exc}"
 
+    def _require_admin_path_capability(request: Request) -> None:
+        path = request.url.path
+        graph_prefixes = (
+            "/rag-admin/entities", "/rag-admin/entity/", "/rag-admin/candidates",
+            "/rag-admin/observations", "/rag-admin/observation/", "/rag-admin/relations",
+            "/rag-admin/findings", "/rag-admin/finding/", "/rag-admin/contacts",
+            "/rag-admin/contact/", "/rag-admin/queue",
+        )
+        if (not graph_enabled) and any(path.startswith(prefix) for prefix in graph_prefixes):
+            raise HTTPException(status_code=404, detail="Graph capability is not available")
+        if (not vector_enabled) and path.startswith("/rag-admin/vector"):
+            raise HTTPException(status_code=404, detail="Vector capability is not available")
+        if not path.startswith("/rag-admin/users/"):
+            return
+        if (not chat_archive_available) and "/chat-archive" in path:
+            raise HTTPException(status_code=404, detail="Chat archive capability is not available")
+        if (not findings_available) and "/findings-curation" in path:
+            raise HTTPException(status_code=404, detail="Research Findings capability is not available")
+        if (not contacts_available) and "/contacts" in path:
+            raise HTTPException(status_code=404, detail="Contact seed capability is not available")
+        if (not web_research_available) and path.endswith("/web"):
+            raise HTTPException(status_code=404, detail="Web Research capability is not available")
+        if (not mail_available) and "/mail" in path:
+            raise HTTPException(status_code=404, detail="Mail capability is not available")
+
     async def require_admin(request: Request) -> None:
         if not enabled:
             raise HTTPException(status_code=404, detail="Admin UI ist deaktiviert")
+        _require_admin_path_capability(request)
         if allow_unauthenticated:
             return
         if not username or not password:
@@ -309,6 +365,19 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
             "priorities": PRIORITIES,
             "unauthenticated_warning": bool(allow_unauthenticated),
             "acl_disabled_warning": not bool(curation_acl.enabled),
+            "architecture_tier": architecture_tier,
+            "src_mode": src_mode,
+            "graph_enabled": graph_enabled,
+            "vector_enabled": vector_enabled,
+            "chat_archive_available": chat_archive_available,
+            "findings_available": findings_available,
+            "contacts_available": contacts_available,
+            "web_research_available": web_research_available,
+            "mail_available": mail_available,
+            "worker_controls": runtime_worker_snapshot(
+                config_path=runtime_config_path,
+                defaults={"sync_worker": False, "mail_worker": False},
+            ),
             **extra,
         }
 
@@ -456,6 +525,81 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
             return shown
         return value
 
+    async def _probe_json(
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout_seconds: float = 2.5,
+    ) -> dict[str, Any]:
+        started = perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=max(0.5, float(timeout_seconds))) as client:
+                response = await client.get(url, headers=headers or {})
+            elapsed = int((perf_counter() - started) * 1000)
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except ValueError:
+                data = {"text": response.text[:1000]}
+            return {"ok": True, "latency_ms": elapsed, "data": data, "error": ""}
+        except Exception as exc:
+            elapsed = int((perf_counter() - started) * 1000)
+            return {
+                "ok": False,
+                "latency_ms": elapsed,
+                "data": {},
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    def _sync_status_snapshot() -> dict[str, Any]:
+        raw = str(
+            cfg_get(cfg, "sync.status_file", default="runtime/sync-status.json")
+            or "runtime/sync-status.json"
+        ).strip()
+        path = Path(raw)
+        if not path.is_absolute():
+            path = runtime_config_path.parent / path
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    async def _elasticsearch_document_count() -> dict[str, Any]:
+        if not bool(cfg_get(cfg, "elasticsearch.enabled", default=True)):
+            return {"ok": False, "count": None, "latency_ms": 0, "error": "deaktiviert"}
+        base_url = str(
+            cfg_get(cfg, "elasticsearch.url", default="http://127.0.0.1:9200")
+            or "http://127.0.0.1:9200"
+        ).rstrip("/")
+        index_name = str(cfg_get(cfg, "elasticsearch.index", default="") or "").strip()
+        if not index_name:
+            return {"ok": False, "count": None, "latency_ms": 0, "error": "Index nicht konfiguriert"}
+        started = perf_counter()
+        try:
+            options = elastic_httpx_options(cfg)
+            async with httpx.AsyncClient(timeout=2.5, **options) as client:
+                response = await client.get(
+                    f"{base_url}/{quote(index_name, safe=',*_-')}/_count"
+                )
+            elapsed = int((perf_counter() - started) * 1000)
+            response.raise_for_status()
+            payload = response.json()
+            return {
+                "ok": True,
+                "count": int(payload.get("count") or 0),
+                "latency_ms": elapsed,
+                "error": "",
+            }
+        except Exception as exc:
+            elapsed = int((perf_counter() - started) * 1000)
+            return {
+                "ok": False,
+                "count": None,
+                "latency_ms": elapsed,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
     def preview_response(
         request: Request,
         *,
@@ -524,9 +668,9 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
     async def admin_users(request: Request):
         rows: list[dict[str, Any]] = []
         for user in user_store.list_canonical_users():
-            mail_accounts = user_store.list_mail_accounts(user.canonical_user_id)
-            web_settings = user_store.get_web_settings(user.canonical_user_id)
-            contact_settings = user_store.get_contact_sync_settings(user.canonical_user_id)
+            mail_accounts = user_store.list_mail_accounts(user.canonical_user_id) if mail_available else []
+            web_settings = user_store.get_web_settings(user.canonical_user_id) if web_research_available else None
+            contact_settings = user_store.get_contact_sync_settings(user.canonical_user_id) if contacts_available else None
             rows.append({
                 "user": user,
                 "bindings": user_store.list_bindings(user.canonical_user_id),
@@ -542,17 +686,17 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
         user = user_store.get_canonical_user(canonical_user_id)
         if user is None:
             raise HTTPException(status_code=404, detail="Unbekannter kanonischer Benutzer")
-        mail_accounts = user_store.list_mail_accounts(canonical_user_id)
+        mail_accounts = user_store.list_mail_accounts(canonical_user_id) if mail_available else []
         mail_account = mail_accounts[0] if mail_accounts else None
         mailboxes: list[dict[str, Any]] = []
         mailbox_error = ""
-        mailbox_discovery_requested = request.query_params.get("discover_mailboxes", "") == "1"
+        mailbox_discovery_requested = mail_available and request.query_params.get("discover_mailboxes", "") == "1"
         if mailbox_discovery_requested:
             mailboxes, mailbox_error = _discover_mail_account_mailboxes(mail_account)
-        contact_settings = user_store.get_contact_sync_settings(canonical_user_id)
+        contact_settings = user_store.get_contact_sync_settings(canonical_user_id) if contacts_available else None
         addressbooks: list[dict[str, Any]] = []
         addressbook_error = ""
-        addressbook_discovery_requested = request.query_params.get("discover_addressbooks", "") == "1"
+        addressbook_discovery_requested = contacts_available and request.query_params.get("discover_addressbooks", "") == "1"
         if addressbook_discovery_requested:
             addressbooks, addressbook_error = _discover_contact_addressbooks(user)
         contact_last_sync = "nie"
@@ -569,8 +713,8 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
             mailboxes=mailboxes,
             mailbox_error=mailbox_error,
             mailbox_discovery_requested=mailbox_discovery_requested,
-            web_settings=user_store.get_web_settings(canonical_user_id),
-            chat_settings=user_store.get_chat_settings(canonical_user_id),
+            web_settings=(user_store.get_web_settings(canonical_user_id) if web_research_available else None),
+            chat_settings=(user_store.get_chat_settings(canonical_user_id) if chat_archive_available else None),
             contact_settings=contact_settings,
             contact_last_sync=contact_last_sync,
             contact_sync_job=_contact_active_job(canonical_user_id),
@@ -579,7 +723,8 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
             contact_addressbook_discovery_requested=addressbook_discovery_requested,
             has_nextcloud_credential=user_store.get_nextcloud_credential_for_canonical_user(canonical_user_id) is not None,
             mail_engine_enabled=bool(cfg_get(cfg, "mail.enabled", default=False)),
-            web_engine_enabled=bool((web_cfg or {}).get("enabled", False)),
+            web_engine_enabled=web_engine_enabled,
+            web_snapshot_engine_enabled=web_snapshot_engine_enabled,
             chat_engine_enabled=bool(cfg_get(cfg, "chat_archive.enabled", default=False)),
             sunaq_models=sunaq_models,
             sunaq_default_model=sunaq_default_model,
@@ -672,19 +817,17 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
     async def admin_user_web(request: Request, canonical_user_id: str):
         data = await form_data(request)
         try:
-            archive_enabled = data.get("archive_enabled") == "on"
-            target_path = data.get("target_path", "").strip()
-            if archive_enabled and not target_path:
-                target_path = "RAG/Webarchiv"
             settings = user_store.set_web_settings(
                 canonical_user_id,
                 enabled=data.get("enabled") == "on",
-                archive_enabled=archive_enabled,
-                target_path=target_path,
             )
             return redirect(
                 str(request.app.url_path_for("admin_user_detail", canonical_user_id=canonical_user_id)),
-                f"Web-Konfiguration gespeichert (Ziel: {settings.target_path or 'kein Archiv'})",
+                (
+                    "Web-Recherche für Benutzer aktiviert"
+                    if settings.enabled
+                    else "Web-Recherche für Benutzer deaktiviert"
+                ),
             )
         except Exception as exc:
             return error_page(request, exc, status_code=400)
@@ -845,9 +988,29 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
     @router.get("/", response_class=HTMLResponse, name="admin_overview", dependencies=auth)
     async def admin_overview(request: Request):
         try:
-            with GraphCurator.from_config(cfg) as curator:
-                stats = curator.graph.stats()
-                sources = curator.list_contact_sources()
+            if graph_enabled:
+                with GraphCurator.from_config(cfg) as curator:
+                    stats = curator.graph.stats()
+                    sources = curator.list_contact_sources()
+            else:
+                stats = {
+                    "persons": 0,
+                    "organizations": 0,
+                    "merge_candidates": 0,
+                    "documents": 0,
+                    "document_mentions": 0,
+                    "entity_observations": 0,
+                    "unresolved_entity_observations": 0,
+                    "relation_observations": 0,
+                    "research_findings": 0,
+                    "contact_records": 0,
+                    "confirmed_entities": 0,
+                    "provisional_entities": 0,
+                    "orphaned_entities": 0,
+                    "merged_entities": 0,
+                    "not_same_as_decisions": 0,
+                }
+                sources = []
             queue = graph_queue.stats()
             users = user_store.list_canonical_users()
             mail_accounts = user_store.list_mail_accounts()
@@ -868,15 +1031,157 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
                 security_ok=security_ok,
                 services={
                     "sync_worker": bool(cfg_get(cfg, "sync_worker.enabled", default=False)),
+                    "sync_worker_runtime": runtime_worker_snapshot(
+                        config_path=runtime_config_path,
+                        defaults={"sync_worker": False},
+                    )["sync_worker"],
                     "mail_feature": bool(cfg_get(cfg, "mail.enabled", default=False)),
                     "mail_worker": bool(cfg_get(cfg, "mail.worker.enabled", default=False)),
+                    "mail_worker_runtime": runtime_worker_snapshot(
+                        config_path=runtime_config_path,
+                        defaults={"mail_worker": False},
+                    )["mail_worker"],
                     "graph_worker": bool(cfg_get(cfg, "graph_queue.worker.enabled", default=False)),
                     "graph_auto_enqueue": bool(cfg_get(cfg, "graph_queue.auto_enqueue_cited_documents", default=False)),
-                    "web": bool((web_cfg or {}).get("enabled", False)),
+                    "web": web_engine_enabled,
                 },
             )
         except Exception as exc:
             return error_page(request, exc)
+
+    @router.post("/operations/workers/{worker_name}", name="admin_worker_control", dependencies=auth)
+    async def admin_worker_control(request: Request, worker_name: str):
+        try:
+            data = await form_data(request)
+            enabled_value = str(data.get("enabled") or "").strip().casefold()
+            enabled = enabled_value in {"1", "true", "yes", "on"}
+            if worker_name == "sync_worker":
+                if not vector_enabled or not bool(cfg_get(cfg, "sync_worker.enabled", default=False)):
+                    raise HTTPException(status_code=404, detail="Sync worker capability is not configured")
+                target = str(request.app.url_path_for("admin_vector"))
+                label = "Sync-Worker"
+            elif worker_name == "mail_worker":
+                if (
+                    not mail_available
+                    or not bool(cfg_get(cfg, "mail.enabled", default=False))
+                    or not bool(cfg_get(cfg, "mail.worker.enabled", default=False))
+                ):
+                    raise HTTPException(status_code=404, detail="Mail worker capability is not configured")
+                target = str(request.app.url_path_for("admin_overview"))
+                label = "Mail-Worker"
+            else:
+                raise HTTPException(status_code=404, detail="Unknown worker")
+            set_runtime_worker_enabled(
+                worker_name,
+                enabled,
+                config_path=runtime_config_path,
+            )
+            return redirect(target, f"{label} {'freigegeben' if enabled else 'pausiert'}")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            return error_page(request, exc, status_code=500)
+
+    @router.get("/system", response_class=HTMLResponse, name="admin_system", dependencies=auth)
+    async def admin_system(request: Request):
+        api_port = str(os.getenv("RAG_API_PORT", "8765") or "8765").strip()
+        provider_port = str(os.getenv("PROVIDER_PORT", "8766") or "8766").strip()
+        internal_key = secret_env("RAG_INTERNAL_API_KEY", "").strip()
+        api_headers = {"X-AKI-Internal-Key": internal_key} if internal_key else {}
+        detail_timeout = max(
+            5.5,
+            float(cfg_get(cfg, "health.timeout_seconds", default=4) or 4) + 1.5,
+        )
+        api_probe, provider_live_probe, provider_probe = await asyncio.gather(
+            _probe_json(f"http://127.0.0.1:{api_port}/health", headers=api_headers),
+            _probe_json(f"http://127.0.0.1:{provider_port}/live"),
+            _probe_json(
+                f"http://127.0.0.1:{provider_port}/health",
+                timeout_seconds=detail_timeout,
+            ),
+        )
+        api_data = api_probe.get("data") if isinstance(api_probe.get("data"), dict) else {}
+        provider_data = (
+            provider_probe.get("data") if isinstance(provider_probe.get("data"), dict) else {}
+        )
+        llm = provider_data.get("llm") if isinstance(provider_data.get("llm"), dict) else {}
+        return render(
+            request,
+            "system.html",
+            api_probe=api_probe,
+            provider_live_probe=provider_live_probe,
+            provider_probe=provider_probe,
+            retrieval_arms=api_data.get("retrieval_arms") if isinstance(api_data.get("retrieval_arms"), dict) else {},
+            llm_roles=llm.get("roles") if isinstance(llm.get("roles"), dict) else {},
+            maintenance_active=bool(
+                provider_data.get("maintenance")
+                or str(provider_data.get("status") or "").casefold() == "maintenance"
+            ),
+        )
+
+    @router.get("/vector", response_class=HTMLResponse, name="admin_vector", dependencies=auth)
+    async def admin_vector(request: Request):
+        qdrant_url = str(cfg_get(cfg, "qdrant.url", default="http://127.0.0.1:6333") or "").rstrip("/")
+        collection = str(cfg_get(cfg, "qdrant.collection", default="nextcloud_rag") or "nextcloud_rag").strip()
+        probe, es_count = await asyncio.gather(
+            _probe_json(f"{qdrant_url}/collections/{quote(collection, safe='')}"),
+            _elasticsearch_document_count(),
+        )
+        sync_status = _sync_status_snapshot()
+        sync_state = sync_status.get("state") if isinstance(sync_status.get("state"), dict) else {}
+        sync_scan = sync_status.get("scan") if isinstance(sync_status.get("scan"), dict) else {}
+        payload = probe.get("data") if isinstance(probe.get("data"), dict) else {}
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        config = result.get("config") if isinstance(result.get("config"), dict) else {}
+        params = config.get("params") if isinstance(config.get("params"), dict) else {}
+        optimizer = result.get("optimizer_status")
+        if isinstance(optimizer, dict):
+            optimizer = optimizer.get("status") or json.dumps(optimizer, ensure_ascii=False)
+        controls = runtime_worker_snapshot(
+            config_path=runtime_config_path,
+            defaults={"sync_worker": False},
+        )
+        return render(
+            request,
+            "vector.html",
+            qdrant={
+                "url": qdrant_url,
+                "collection": collection,
+                "status": str(result.get("status") or ("ok" if probe.get("ok") else "nicht erreichbar")),
+                "latency_ms": probe.get("latency_ms", 0),
+                "error": probe.get("error", ""),
+                "points_count": result.get("points_count"),
+                "indexed_vectors_count": result.get("indexed_vectors_count"),
+                "optimizer_status": optimizer,
+                "vectors": params.get("vectors") or {},
+                "raw": payload,
+            },
+            corpus={
+                "es_documents": es_count.get("count"),
+                "es_count_ok": bool(es_count.get("ok")),
+                "es_count_latency_ms": es_count.get("latency_ms", 0),
+                "es_count_error": es_count.get("error", ""),
+                "vectorized_documents": sync_state.get("vectorized_documents"),
+                "state_documents": sync_state.get("documents"),
+                "empty_documents": sync_state.get("empty_documents"),
+                "chunks": sync_state.get("chunks"),
+                "last_sync_at": sync_status.get("completed_at"),
+                "complete_full_scan": bool(sync_status.get("complete_full_scan")),
+                "scanned": sync_scan.get("scanned"),
+                "eligible_seen": sync_scan.get("eligible_seen"),
+                "excluded_semantic": sync_scan.get("excluded_semantic"),
+                "out_of_scope": sync_scan.get("out_of_scope"),
+                "embedding_deferred": sync_scan.get("embedding_deferred"),
+            },
+            worker={
+                "configured": bool(cfg_get(cfg, "sync_worker.enabled", default=False)),
+                "runtime_enabled": controls["sync_worker"],
+                "poll_interval_seconds": int(cfg_get(cfg, "sync_worker.poll_interval_seconds", default=300) or 300),
+                "pause_check_documents": max(1, int(cfg_get(cfg, "sync_worker.pause_check_documents", default=25) or 25)),
+                "max_documents": int(cfg_get(cfg, "sync_worker.max_documents", default=0) or 0),
+                "enqueue_graph": bool(cfg_get(cfg, "sync_worker.enqueue_graph", default=False)),
+            },
+        )
 
     def _acl_filter_findings_for_canonical_user(
         canonical_user_id: str,

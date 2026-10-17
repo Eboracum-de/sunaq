@@ -1,5 +1,7 @@
 # SunaQ capability preset: core
-# Overlay for Secure RAG Core (SRC). No secrets belong in preset files.
+# Secure RAG Core (SRC): runtime use of the authoritative Nextcloud/FTS
+# information space without SunaQ-owned persistent derived knowledge state or
+# external information acquisition. No secrets belong in preset files.
 architecture:
   tier: src
 acl:
@@ -12,6 +14,10 @@ retrieval_policy:
   optional_default: include
   web: disabled
 qdrant:
+  enabled: false
+neo4j:
+  enabled: false
+resolver:
   enabled: false
 sync_worker:
   enabled: false

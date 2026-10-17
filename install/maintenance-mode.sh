@@ -52,7 +52,7 @@ sync_container_secrets() {
 
 compose() {
   (
-    cd "$BASE_DIR/install/super-light"
+    cd "$BASE_DIR/install/dockerized"
     if docker compose version >/dev/null 2>&1; then
       docker compose "$@"
     elif command -v docker-compose >/dev/null 2>&1; then
@@ -62,6 +62,29 @@ compose() {
       exit 1
     fi
   )
+}
+
+native_compose() {
+  (
+    cd "$BASE_DIR/install"
+    if docker compose version >/dev/null 2>&1; then
+      docker compose -f docker-compose.yml --env-file .env "$@"
+    elif command -v docker-compose >/dev/null 2>&1; then
+      docker-compose -f docker-compose.yml --env-file .env "$@"
+    else
+      echo "Docker Compose not found." >&2
+      exit 1
+    fi
+  )
+}
+
+refresh_native_secret_consumers() {
+  # sync-container-secrets replaces service-secrets atomically. Containers that
+  # bind-mount that directory must be recreated, not merely restarted, or their
+  # mount remains attached to the old directory inode.
+  if state_enabled LOCAL_RESOLVER; then
+    native_compose --profile resolver up -d --no-deps --force-recreate erg-resolver
+  fi
 }
 
 native_systemd_available() {
@@ -78,11 +101,12 @@ native_require_root() {
 enable_native() {
   native_require_root
   sync_container_secrets
+  refresh_native_secret_consumers
   if native_systemd_available; then
     systemctl stop rag-api rag-graph-worker rag-sync-worker rag-mail-worker 2>/dev/null || true
     systemctl restart rag-provider
   else
-    "$BASE_DIR/stop-all.sh" || true
+    "$BASE_DIR/stop-all.sh" --native-only || true
     "$BASE_DIR/start-all.sh"
   fi
 }
@@ -90,6 +114,7 @@ enable_native() {
 disable_native() {
   native_require_root
   sync_container_secrets
+  refresh_native_secret_consumers
   if native_systemd_available; then
     systemctl start rag-api
     systemctl restart rag-provider
@@ -101,7 +126,7 @@ disable_native() {
       systemctl start rag-graph-worker
     fi
   else
-    "$BASE_DIR/stop-all.sh" || true
+    "$BASE_DIR/stop-all.sh" --native-only || true
     "$BASE_DIR/start-all.sh"
   fi
 }
@@ -110,6 +135,10 @@ state_enabled() {
   local key="$1"
   [[ -f "$STATE_FILE" ]] || return 1
   [[ "$(sed -n "s/^${key}=//p" "$STATE_FILE" | tail -1)" == "1" ]]
+}
+
+docker_service_defined() {
+  compose config --services 2>/dev/null | grep -qx "$1"
 }
 
 mail_worker_enabled() {
@@ -136,54 +165,47 @@ mail_worker_enabled() {
   ' "$BASE_DIR/config.yaml"
 }
 
-enable_dockerized() {
-  sync_container_secrets
+stop_dockerized_normal_services() {
+  # Maintenance mode owns the runtime/service boundary, not the long-lived
+  # frontend/proxy boundary. Stop every normal runtime service that can be
+  # defined for this installation; missing/stopped services are harmless.
   local services=(api)
-  if mail_worker_enabled; then
-    services+=(mail-worker)
-  fi
-  if state_enabled LOCAL_PLAYWRIGHT; then
-    services+=(playwright-renderer)
-  fi
+  state_enabled LOCAL_QDRANT && services+=(qdrant)
+  state_enabled LOCAL_RESOLVER && services+=(erg-resolver)
+  state_enabled LOCAL_NEO4J && services+=(neo4j)
+  state_enabled LOCAL_PLAYWRIGHT && services+=(playwright-renderer)
+  docker_service_defined graph-worker && services+=(graph-worker)
+  docker_service_defined sync-worker && services+=(sync-worker)
+  docker_service_defined mail-worker && services+=(mail-worker)
   compose stop "${services[@]}" >/dev/null 2>&1 || true
-  compose up -d --no-deps --force-recreate provider
+}
+
+enable_dockerized() {
+  stop_dockerized_normal_services
+  # Materialize the just-updated runtime.env before start-all.sh sources
+  # runtime.service.env and decides which desired state to start.
+  sync_container_secrets
+  # start-all.sh is the single desired-state dispatcher. With
+  # RAG_MAINTENANCE_MODE=true it converges even a completely stopped stack to
+  # the maintenance state, including retained proxy/OpenWebUI frontends.
+  "$BASE_DIR/start-all.sh"
 }
 
 disable_dockerized() {
+  # Materialize RAG_MAINTENANCE_MODE=false before start-all.sh reads
+  # runtime.service.env.
   sync_container_secrets
-  local services=(neo4j api)
-  if state_enabled LOCAL_PLAYWRIGHT; then
-    services=(neo4j playwright-renderer api)
-  fi
-  if mail_worker_enabled; then
-    services+=(mail-worker)
-  fi
-  compose up -d "${services[@]}"
-
-  local schema_ready=0
-  local attempt
-  for attempt in $(seq 1 90); do
-    if compose exec -T api python -m rag.graph --config /app/config.yaml init >/dev/null 2>&1; then
-      schema_ready=1
-      break
-    fi
-    if [[ $attempt -eq 1 || $((attempt % 10)) -eq 0 ]]; then
-      printf 'Neo4j/schema: waiting (attempt %d/90)\n' "$attempt"
-    fi
-    sleep 2
-  done
-  if [[ $schema_ready -ne 1 ]]; then
-    echo "Neo4j did not become ready or the AKI schema upgrade failed; returning to maintenance mode." >&2
-    compose exec -T api python -m rag.graph --config /app/config.yaml init >&2 || true
-    return 1
-  fi
-  printf 'Neo4j/schema: ready\n'
-  compose up -d --no-deps --force-recreate provider
+  # Likewise, leaving maintenance must converge from any prior state
+  # (maintenance, partially running, or fully stopped) to normal operation.
+  # start-all.sh knows the complete configured Dockerized service set.
+  "$BASE_DIR/start-all.sh"
 }
 
 case "${1:-}" in
   status)
-    echo "maintenance=$(current_mode) deployment=$deployment_mode"
+    public_deployment="$deployment_mode"
+    [[ "$public_deployment" == "native" ]] && public_deployment="standard"
+    echo "maintenance=$(current_mode) deployment=$public_deployment"
     ;;
   on)
     set_mode true

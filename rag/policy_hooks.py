@@ -1,18 +1,20 @@
 """Stable policy/inspection hook contract.
 
-0.8.6-rc1.1 wires these stages into the relevant data-flow boundaries but ships
-no configured policy evaluator. With no evaluator installed every hook is a
-no-op ALLOW decision, preserving the pre-hook runtime behaviour.
+These stages are the stable inspection points for SunaQ data-flow boundaries.
+RC2 adds a built-in class-aware egress policy before the optional site-specific
+evaluator. Research queries can therefore be guarded while model-processing and
+embedding payloads remain non-destructive by default.
 
-A later configuration layer can install one evaluator that delegates to malware,
-URL-policy, ICAP/YARA/DLP/redaction or site-specific adapters without changing
-the calling data paths again.
+An optional process-local evaluator can still delegate to malware, URL-policy,
+ICAP/YARA/DLP or site-specific adapters without changing calling data paths.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
+
+from rag.egress_policy import EMBEDDING, MODEL_PROCESSING, RESEARCH_QUERY, evaluate_egress
 
 
 ALLOW = "ALLOW"
@@ -93,23 +95,64 @@ def evaluate_policy_hook(
 ) -> PolicyHookDecision:
     """Evaluate one hook stage.
 
-    No evaluator is configured in rc1.1, so the default is deliberately ALLOW.
-    Exceptions raised by a configured evaluator are not swallowed: a required
-    inspection service can therefore fail closed simply by failing the operation.
+    The built-in egress policy runs first for outbound stages. Exceptions raised
+    by an optional configured evaluator are not swallowed: a required inspection
+    service can therefore fail closed simply by failing the operation.
     """
 
     stage = str(stage or "").strip()
     if stage not in HOOK_STAGES:
         raise ValueError(f"unknown policy hook stage: {stage!r}")
 
+    metadata_dict = dict(metadata or {})
+    egress_class = str(metadata_dict.get("egress_class") or "").strip().casefold()
+    if not egress_class:
+        if stage == OUTBOUND_QUERY:
+            egress_class = RESEARCH_QUERY
+        elif stage == PRE_MODEL_EGRESS:
+            kind = str(metadata_dict.get("kind") or "").strip().casefold()
+            if kind == "embedding":
+                egress_class = EMBEDDING
+            elif kind == "delegated_research":
+                egress_class = RESEARCH_QUERY
+            else:
+                egress_class = MODEL_PROCESSING
+
+    builtin = None
+    effective_content = content
+    if egress_class:
+        builtin = evaluate_egress(
+            content,
+            egress_class=egress_class,
+            metadata=metadata_dict,
+        )
+        if builtin.action == BLOCK:
+            return PolicyHookDecision(
+                action=BLOCK,
+                content=content,
+                reason=builtin.reason,
+                metadata={"egress_class": egress_class, "mode": builtin.mode},
+            )
+        effective_content = builtin.content
+
     request = PolicyHookRequest(
         stage=stage,
-        content=content,
-        metadata=dict(metadata or {}),
+        content=effective_content,
+        metadata=metadata_dict,
     )
     evaluator = _evaluator
     if evaluator is None:
-        return PolicyHookDecision(action=ALLOW, content=content)
+        if builtin is not None and builtin.action == MODIFY:
+            return PolicyHookDecision(
+                action=MODIFY,
+                content=builtin.content,
+                metadata={
+                    "egress_class": egress_class,
+                    "mode": builtin.mode,
+                    "redactions": builtin.redactions,
+                },
+            )
+        return PolicyHookDecision(action=ALLOW, content=effective_content)
 
     decision = evaluator(request)
     if not isinstance(decision, PolicyHookDecision):
@@ -119,9 +162,14 @@ def evaluate_policy_hook(
     if action not in HOOK_ACTIONS:
         raise ValueError(f"unknown policy hook action: {decision.action!r}")
 
+    if action == ALLOW and builtin is not None and builtin.action == MODIFY:
+        action = MODIFY
+        decision_content = builtin.content
+    else:
+        decision_content = decision.content
     return PolicyHookDecision(
         action=action,
-        content=decision.content,
+        content=decision_content,
         reason=str(decision.reason or ""),
         metadata=dict(decision.metadata or {}),
     )

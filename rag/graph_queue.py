@@ -115,7 +115,7 @@ def _es_scoped_documents(
 class GraphQueue:
     def __init__(self, cfg: dict[str, Any]):
         self.cfg = cfg
-        self.enabled = bool(cfg_get(cfg, "graph_queue.enabled", default=True))
+        self.enabled = bool(cfg_get(cfg, "graph_queue.enabled", default=False))
         raw_path = str(cfg_get(cfg, "graph_queue.database", default="graph_queue.sqlite") or "graph_queue.sqlite")
         path = Path(raw_path)
         if not path.is_absolute():

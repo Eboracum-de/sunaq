@@ -1,0 +1,303 @@
+# Dockerized legacy-friendly baseline. The packaged default is SRC, but the
+# architecture tier is selected independently by --preset core|workgroup|full.
+architecture:
+  tier: src
+
+# Dockerized identifies the containerized runtime footprint only; the
+# architecture tier remains selected independently by core/workgroup/full.
+health:
+  timeout_seconds: 4
+security:
+  allow_insecure_nextcloud: false
+
+# Normal TLS verification remains enabled. VERIFY_X509_STRICT is disabled by
+# default for compatibility with long-lived private PKIs; enable it explicitly
+# only when the complete PKI is known to satisfy the stricter RFC-5280 checks.
+tls:
+  x509_strict: false
+elasticsearch:
+  enabled: true
+  url: http://127.0.0.1:9200
+  index: my_index
+  timeout: 60
+  username: ''
+  password_env: ELASTICSEARCH_PASSWORD
+  verify_tls: true
+  page_size: 50
+  ca_file: ''
+qdrant:
+  enabled: false
+  url: http://127.0.0.1:6333
+  collection: nextcloud_rag
+embedding:
+  backend: ollama
+  url: http://127.0.0.1:11434
+  model: qwen3-embedding:4b
+  profile: custom
+  document_prefix: ''
+  query_prefix: 'Instruct: Given a user query, retrieve relevant passages from a private
+    document archive that answer or relate to the query
+
+    Query: '
+  dimensions: 1024
+  api_key_env: EMBEDDING_API_KEY
+  verify_tls: true
+  timeout: 300
+# Research and egress policy is architecture-level configuration, not a
+# deployment-mode feature. ERG Full may enable these capabilities; SRC/ERG
+# Internal keep acquisition disabled through their presets/policy.
+delegated_research:
+  enabled: false
+  provider: openai
+  delegate_web_only: true
+  openai:
+    base_url: https://api.openai.com/v1
+    model: gpt-5.5
+    api_key_env: LLM_API_KEY
+    verify_tls: true
+    ca_file: ''
+    timeout: 180
+    reasoning_effort: ''
+
+research_backends:
+  brave-search:
+    kind: web_retrieval
+    adapter: brave_search
+    enabled: true
+  openai-research:
+    kind: delegated_research
+    adapter: openai
+    enabled: false
+    model: gpt-5.5
+    base_url: https://api.openai.com/v1
+    api_key_env: LLM_API_KEY
+    verify_tls: true
+    timeout: 180
+
+egress:
+  enabled: true
+  research_query:
+    mode: guard
+  model_processing:
+    mode: audit
+  embedding:
+    mode: allow
+  guard:
+    redact_credentials: true
+    replacement: '[REDACTED]'
+    internal_identifiers: []
+
+# Request-local retrieval/planner/verifier/reranker/context settings are owned
+# by models/<model>/profile.yaml. Those model packages contain explicit
+# deployment_overrides for Dockerized (notably no document Graph arm and no
+# cross-encoder reranker).
+
+# Capability policy is separate from hardware/deployment. SRC has no secondary
+# vector/graph/resolver state.
+retrieval_policy:
+  internal:
+    files: required
+    vector: disabled
+    graph: disabled
+  optional_default: include
+  web: disabled  # SRC invariant
+
+sync_worker:
+  enabled: false
+  poll_interval_seconds: 300
+  # Cooperative pause granularity for an already running full sync.
+  pause_check_documents: 25
+  max_documents: 0
+  enqueue_graph: false
+sync:
+  chunk_size: 3000
+  chunk_overlap: 400
+  embedding_batch_size: 8
+  embedding_include_basename: true
+  max_documents: 0
+  state_db: runtime/state.sqlite
+  embedding_deferred_file: runtime/embedding-deferred.jsonl
+  status_file: runtime/sync-status.json
+  document_filter:
+    enabled: true
+    include_extensions: []
+    exclude_extensions:
+    - eml
+    - msg
+    - mbox
+    - zip
+    - 7z
+    - rar
+    - gz
+    - bz2
+    - xz
+    - tar
+    - tgz
+    exclude_mime_prefixes: []
+    exclude_mime_types:
+    - message/rfc822
+    - application/zip
+    - application/x-7z-compressed
+    - application/x-rar-compressed
+    - application/gzip
+    - application/x-gzip
+    - application/x-tar
+    min_text_chars: 0
+  include_paths: []
+  exclude_paths: []
+  graph_queue:
+    enabled: false
+    priority: background
+neo4j:
+  enabled: false
+  uri: bolt://127.0.0.1:7687
+  username: neo4j
+  password_env: NEO4J_PASSWORD
+  database: neo4j
+carddav:
+  username_env: NEXTCLOUD_USERNAME
+  password_env: NEXTCLOUD_APP_PASSWORD
+  timeout: 120
+  include_addressbooks: []
+  exclude_addressbooks: []
+acl:
+  enabled: true
+  identity_mode: credential_store
+  credential_store: runtime/users.sqlite
+  username_env: NEXTCLOUD_USERNAME
+  password_env: NEXTCLOUD_APP_PASSWORD
+  webdav_url: ''
+  timeout: 15
+  batch_size: 100
+  prefilter:
+    enabled: false
+    # rc5 v1: owner/direct-user/group only; Circles are not evaluated yet.
+graph:
+  entity_admission:
+    use_default_blocked_generic_names: true
+    blocked_generic_names: []
+graph_queue:
+  enabled: false
+  auto_enqueue_cited_documents: false
+  database: runtime/graph_queue.sqlite
+  priority: 100
+  priorities:
+    high: 50
+    normal: 100
+    background: 200
+  auto_limits:
+    max_text_chars: 200000
+    max_chunks: 60
+    max_file_bytes: 10000000
+  worker:
+    enabled: false
+    idle_seconds: 120
+    poll_seconds: 10
+    retry_seconds: 60
+    max_attempts: 3
+    stale_running_seconds: 3600
+    heartbeat_seconds: 15
+    heartbeat_stale_seconds: 90
+    quiet_hours:
+      enabled: false
+      start: '22:00'
+      end: 07:00
+# RC10: persist only positive planner/verifier findings. This reuses semantic
+# work already performed for the user query; it never starts a graph-extraction
+# LLM pass and never stores rejected/uncertain document-query pairs.
+research_findings:
+  # Optional knowledge/curation layer; disabled in the Secure Nextcloud RAG baseline.
+  enabled: false
+  timeout: 5
+  max_documents_per_request: 30
+  curation:
+    admin_user_context: true
+    user_self_service: false
+    session_max_seconds: 7200
+
+graph_indexer:
+  enabled: false
+  fuzzy: true
+  fuzzy_threshold: 92.0
+  fuzzy_max_candidates: 5
+  max_documents_per_call: 8
+  max_content_chars: 500000
+graph_entity_discovery:
+  enabled: false
+  verify_tls: true
+  timeout: 300
+  chunk_chars: 12000
+  overlap_chars: 600
+  max_chunks: 0
+  min_confidence: 0.7
+  max_entities_per_chunk: 40
+  num_ctx: 16384
+  num_predict: 1400
+  adaptive_split_min_chars: 3000
+  adaptive_split_max_depth: 2
+  think: false
+  prompt_file: prompts/graph_entity_discovery.txt
+  require_relevant_actor: true
+  organization_auto_create_confidence: 0.88
+  person_auto_create_confidence: 0.93
+  person_require_context_cue: true
+  context_max_chars: 500
+graph_relation_discovery:
+  enabled: false
+  verify_tls: true
+  model: ''
+  timeout: 300
+  chunk_chars: 12000
+  overlap_chars: 600
+  max_chunks: 0
+  min_confidence: 0.72
+  max_relations_per_chunk: 24
+  evidence_max_chars: 900
+  num_ctx: 16384
+  num_predict: 1200
+  adaptive_split_min_chars: 3000
+  adaptive_split_max_depth: 2
+  think: false
+  prompt_file: prompts/graph_relation_discovery.txt
+admin_ui:
+  enabled: true
+  username_env: RAG_ADMIN_USER
+  password_env: RAG_ADMIN_PASSWORD
+  allow_unauthenticated: false
+auth:
+  nextcloud_login_flow_enabled: true
+  credential_store: runtime/users.sqlite
+  login_flow_ttl_seconds: 1200
+nextcloud:
+  base_url: https://nextcloud.example.invalid/
+  cloud_id: nextcloud
+  verify_tls: true
+  ca_file: ''
+dedup:
+  enabled: true
+  near_text_ratio: 0.96
+  min_text_chars: 500
+  min_length_ratio: 0.8
+chat_archive:
+  # Chat history may exist in Nextcloud, but using it as retrieval evidence is
+  # an explicit administrator decision.
+  enabled: false
+  root: SunaQ-Chats
+
+resolver:
+  enabled: false
+  url: http://127.0.0.1:8770
+  timeout: 8
+
+mail_metadata:
+  enabled: false
+  timeout: 10
+mail:
+  enabled: false
+  state_file: runtime/mail_state.sqlite
+  poll_interval_seconds: 300
+  worker:
+    enabled: false
+deployment:
+  profile: dockerized
+  mode: dockerized

@@ -4,8 +4,12 @@ set -euo pipefail
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 RUNTIME_ENV="$BASE_DIR/runtime.env"
 STATE_FILE="$BASE_DIR/install/install-state.env"
-MARKER_FILE="$BASE_DIR/.aki-rag-installation"
+MARKER_FILE="$BASE_DIR/.sunaq-installation"
+LEGACY_MARKER_FILE="$BASE_DIR/.aki-rag-installation"
 FORMAT="aki-rag-backup-v1"
+if [[ ! -f "$MARKER_FILE" && -f "$LEGACY_MARKER_FILE" ]]; then
+  MARKER_FILE="$LEGACY_MARKER_FILE"
+fi
 
 usage() {
   cat >&2 <<'USAGE'
@@ -15,12 +19,14 @@ Usage:
   backup-restore.sh restore BACKUP --yes
 
 TARGET is a destination directory. create writes a timestamped recovery set below
-it. create/restore require root and AKI maintenance mode. verify is read-only.
+it. create/restore require root and SunaQ maintenance mode. verify is read-only.
 
 Scope:
-  included: AKI config/runtime secrets, credential master key, AKI SQLite state,
+  included: SunaQ config/runtime secrets, administrator-owned model profiles,
+            credential master key, non-Qdrant SunaQ SQLite state,
             private CA/TLS/operator state, bundled Neo4j when selected
-  excluded: Nextcloud, Elasticsearch, Qdrant, external Neo4j, OpenWebUI/Playwright state, model caches
+  excluded: Nextcloud, Elasticsearch, Qdrant and its rebuildable sync state,
+            external Neo4j, OpenWebUI/Playwright state, model caches
 USAGE
   exit 2
 }
@@ -53,7 +59,7 @@ require_maintenance() {
   local value
   value="$(env_value "$RUNTIME_ENV" RAG_MAINTENANCE_MODE)"
   if ! is_true "$value"; then
-    echo "AKI maintenance mode is required." >&2
+    echo "SunaQ maintenance mode is required." >&2
     echo "Run: sudo $BASE_DIR/install/maintenance-mode.sh on" >&2
     exit 1
   fi
@@ -85,7 +91,9 @@ if [[ -f "$MARKER_FILE" ]]; then
   value="$(env_value "$MARKER_FILE" DEPLOYMENT_MODE)"
   [[ -n "$value" ]] && deployment_mode="$value"
 fi
-[[ "$deployment_profile" == "super-light" ]] && local_neo4j="1"
+if [[ "$deployment_mode" != "dockerized" && "$deployment_profile" == "super-light" ]]; then
+  deployment_mode="dockerized"
+fi
 
 compose_bin=()
 compose_detect() {
@@ -104,9 +112,9 @@ compose_detect() {
 
 compose_neo4j() {
   compose_detect
-  if [[ "$deployment_profile" == "super-light" ]]; then
+  if [[ "$deployment_mode" == "dockerized" ]]; then
     (
-      cd "$BASE_DIR/install/super-light"
+      cd "$BASE_DIR/install/dockerized"
       "${compose_bin[@]}" "$@"
     )
   else
@@ -121,11 +129,11 @@ provider_image_id() {
   compose_detect
   local container_id image_id
   container_id="$(
-    cd "$BASE_DIR/install/super-light"
+    cd "$BASE_DIR/install/dockerized"
     "${compose_bin[@]}" ps -q provider | head -1
   )"
   [[ -n "$container_id" ]] || {
-    echo "Provider container not found; enter AKI maintenance mode before backup/restore." >&2
+    echo "Provider container not found; enter SunaQ maintenance mode before backup/restore." >&2
     return 1
   }
   image_id="$(docker inspect --format '{{.Image}}' "$container_id" 2>/dev/null || true)"
@@ -149,11 +157,11 @@ dockerized_backup_helper() {
   docker run --rm --network none --user 0:0 \
     --env-file "$BASE_DIR/provider.env" \
     --env-file "$BASE_DIR/runtime.env" \
-    -v "$BASE_DIR/config.yaml:/app/config.yaml:ro" \
-    -v "$BASE_DIR/web.yaml:/app/web.yaml:ro" \
-    -v "$BASE_DIR/runtime:/app/runtime:rw" \
-    -v "$BASE_DIR/rag:/app/rag:ro" \
-    -v "$mount_source:$mount_target:rw" \
+    -v "$BASE_DIR/config.yaml:/app/config.yaml:ro,z" \
+    -v "$BASE_DIR/web.yaml:/app/web.yaml:ro,z" \
+    -v "$BASE_DIR/runtime:/app/runtime:rw,z" \
+    -v "$BASE_DIR/rag:/app/rag:ro,z" \
+    -v "$mount_source:$mount_target:rw,z" \
     "$image_id" "$@"
 }
 
@@ -165,7 +173,7 @@ helper_root() {
       python -m rag.backup_admin "$command" --root /host-root "${extra[@]}"
   else
     [[ -x "$BASE_DIR/.venv/bin/python" ]] || {
-      echo "AKI virtualenv Python missing: $BASE_DIR/.venv/bin/python" >&2
+      echo "SunaQ virtualenv Python missing: $BASE_DIR/.venv/bin/python" >&2
       exit 1
     }
     (
@@ -287,6 +295,58 @@ snapshot_neo4j() {
   return 0
 }
 
+normalize_restored_ownership() {
+  local uid="$1" gid="$2"
+  [[ "$deployment_mode" != "dockerized" ]] || return 0
+  [[ -n "$uid" && -n "$gid" ]] || return 0
+
+  local path
+  for path in config.yaml web.yaml provider.env runtime.env .sunaq-installation .aki-rag-installation; do
+    [[ -e "$BASE_DIR/$path" ]] && chown "$uid:$gid" "$BASE_DIR/$path"
+  done
+  [[ -d "$BASE_DIR/models" ]] && chown -R "$uid:$gid" "$BASE_DIR/models"
+  [[ -d "$BASE_DIR/runtime" ]] && chown -R "$uid:$gid" "$BASE_DIR/runtime"
+  [[ -f "$BASE_DIR/install/.env" ]] && chown "$uid:$gid" "$BASE_DIR/install/.env"
+  [[ -f "$BASE_DIR/install/install-state.env" ]] && chown "$uid:$gid" "$BASE_DIR/install/install-state.env"
+
+  while IFS= read -r path; do
+    chown "$uid:$gid" "$path"
+  done < <(find "$BASE_DIR" -maxdepth 1 -type f \( -name '*.sqlite' -o -name '*.sqlite-wal' -o -name '*.sqlite-shm' \) -print)
+
+  local key
+  key="$(env_value "$RUNTIME_ENV" RAG_CREDENTIAL_MASTER_KEY_FILE)"
+  [[ -n "$key" ]] || key="runtime/credential-master.key"
+  [[ "$key" == /* ]] || key="$BASE_DIR/$key"
+  case "$(realpath -m "$key")" in
+    "$BASE_DIR"/*)
+      if [[ -f "$key" ]]; then
+        chown "root:$gid" "$key"
+        chmod 0640 "$key"
+      fi
+      ;;
+  esac
+}
+
+drop_qdrant_sync_state() {
+  command -v jq >/dev/null 2>&1 || {
+    echo "jq is required to normalize Qdrant restore state." >&2
+    return 1
+  }
+  local inventory_json relative
+  inventory_json="$(helper_root inventory)"
+  relative="$(jq -r '.qdrant_sync_state.relative // empty' <<<"$inventory_json")"
+
+  local candidates=("state.sqlite" "runtime/state.sqlite")
+  [[ -n "$relative" ]] && candidates+=("$relative")
+  local item
+  for item in "${candidates[@]}"; do
+    case "$item" in
+      ""|/*|../*|*/../*|*/..) continue ;;
+    esac
+    rm -f "$BASE_DIR/$item" "$BASE_DIR/$item-wal" "$BASE_DIR/$item-shm"
+  done
+}
+
 restore_neo4j() {
   local source="$1"
   local was_running=0
@@ -325,7 +385,7 @@ create_backup() {
   base_abs="$(realpath -m "$BASE_DIR")"
   case "$target_abs" in
     "$base_abs"|"$base_abs"/*)
-      echo "Backup target must be outside the AKI installation prefix: $BASE_DIR" >&2
+      echo "Backup target must be outside the SunaQ installation prefix: $BASE_DIR" >&2
       exit 1 ;;
   esac
   mkdir -p "$target_abs"
@@ -340,13 +400,13 @@ create_backup() {
     exit 1
   fi
   if [[ "$(jq '.external_paths | length' <<<"$inventory_json")" -ne 0 ]]; then
-    echo "[WARN] AKI-referenced paths outside the installation prefix are not included:" >&2
+    echo "[WARN] SunaQ-referenced paths outside the installation prefix are not included:" >&2
     jq -r '.external_paths[] | "  \(.kind): \(.path)"' <<<"$inventory_json" >&2
   fi
 
   local timestamp name partial final
   timestamp="$(date -u +%Y%m%d-%H%M%SZ)"
-  name="aki-rag-backup-$timestamp"
+  name="sunaq-backup-$timestamp"
   partial="$target_abs/.${name}.partial"
   final="$target_abs/$name"
   rm -rf "$partial"
@@ -375,12 +435,14 @@ create_backup() {
   cat > "$partial/METADATA.txt" <<EOF
 FORMAT=$FORMAT
 CREATED_AT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+SUNAQ_VERSION=$(current_version)
 AKI_VERSION=$(current_version)
 SOURCE_PREFIX=$BASE_DIR
 DEPLOYMENT_PROFILE=$deployment_profile
 DEPLOYMENT_MODE=$deployment_mode
 NEO4J_INCLUDED=$neo4j_included
 QDRANT_INCLUDED=0
+QDRANT_SYNC_STATE_INCLUDED=0
 NEXTCLOUD_INCLUDED=0
 ELASTICSEARCH_INCLUDED=0
 EOF
@@ -418,7 +480,9 @@ restore_backup() {
   backup="$(realpath -m "$backup")"
   verify_backup "$backup"
 
-  local backup_profile backup_mode backup_prefix
+  local backup_profile backup_mode backup_prefix target_runtime_uid target_runtime_gid
+  target_runtime_uid="$(stat -c '%u' "$BASE_DIR/runtime" 2>/dev/null || true)"
+  target_runtime_gid="$(stat -c '%g' "$BASE_DIR/runtime" 2>/dev/null || true)"
   backup_profile="$(metadata_value "$backup" DEPLOYMENT_PROFILE)"
   backup_mode="$(metadata_value "$backup" DEPLOYMENT_MODE)"
   backup_prefix="$(metadata_value "$backup" SOURCE_PREFIX)"
@@ -437,7 +501,8 @@ restore_backup() {
   fi
 
   local source_version now_version
-  source_version="$(metadata_value "$backup" AKI_VERSION)"
+  source_version="$(metadata_value "$backup" SUNAQ_VERSION)"
+  [[ -n "$source_version" ]] || source_version="$(metadata_value "$backup" AKI_VERSION)"
   now_version="$(current_version)"
   if [[ -n "$source_version" && -n "$now_version" && "$source_version" != "$now_version" ]]; then
     echo "[WARN] Backup version $source_version differs from installed code $now_version." >&2
@@ -455,6 +520,14 @@ restore_backup() {
 
   tar -xpf "$backup/files.tar" -C "$BASE_DIR"
   set_runtime_maintenance_true
+  normalize_restored_ownership "$target_runtime_uid" "$target_runtime_gid"
+
+  if ! is_true "$(metadata_value "$backup" QDRANT_INCLUDED)"; then
+    # Qdrant vectors are derived and not part of the recovery set. Drop any
+    # restored legacy sync database so the next rebuild cannot falsely classify
+    # documents as unchanged against a missing/different vector collection.
+    drop_qdrant_sync_state
+  fi
 
   if is_true "$(metadata_value "$backup" NEO4J_INCLUDED)"; then
     [[ -f "$backup/volumes/neo4j-data.tar" ]] || {
@@ -474,7 +547,11 @@ restore_backup() {
   "$BASE_DIR/install/maintenance-mode.sh" on >/dev/null
 
   echo "Restore completed and local recovery checks passed."
-  echo "AKI remains in maintenance mode."
+  echo "SunaQ remains in maintenance mode."
+  if ! is_true "$(metadata_value "$backup" QDRANT_INCLUDED)"; then
+    echo "Qdrant is not part of this recovery set; its sync state was reset."
+    echo "Restore/reset the Qdrant collection as appropriate and run a full ES -> Qdrant sync before leaving maintenance."
+  fi
   echo "Run deployment smoke/ACL checks, then: sudo $BASE_DIR/install/maintenance-mode.sh off"
 }
 

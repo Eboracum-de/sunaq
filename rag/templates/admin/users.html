@@ -8,7 +8,7 @@
 <section><p>Noch keine verifizierten Nextcloud-Benutzer. Ein Benutzer erscheint nach erfolgreichem Login Flow.</p></section>
 {% else %}
 <table>
-<thead><tr><th>Nextcloud User</th><th>Status</th><th>Bindings</th><th>Nextcloud Credential</th><th>Mail</th><th>Web</th><th>Kontakt-DB</th></tr></thead>
+<thead><tr><th>Nextcloud User</th><th>Status</th><th>Bindings</th><th>Nextcloud Credential</th>{% if mail_available %}<th>Mail</th>{% endif %}{% if web_research_available %}<th>Web</th>{% endif %}{% if contacts_available %}<th>Kontakt-DB</th>{% endif %}</tr></thead>
 <tbody>
 {% for row in rows %}
 <tr>
@@ -16,9 +16,9 @@
 <td><span class="status {{ 'ok' if row.user.enabled else 'down' }}">{{ 'enabled' if row.user.enabled else 'disabled' }}</span></td>
 <td>{{ row.bindings|length }}</td>
 <td>{{ 'vorhanden' if row.has_nextcloud_credential else 'fehlt' }}</td>
-<td>{% if row.mail_accounts %}{{ row.mail_accounts|length }} · {{ 'aktiv' if row.mail_accounts[0].enabled else 'aus' }}{% else %}nicht konfiguriert{% endif %}</td>
-<td>{% if row.web_settings %}{{ 'aktiv' if row.web_settings.enabled else 'aus' }}{% else %}nicht konfiguriert{% endif %}</td>
-<td>{% if row.contact_settings %}{{ 'aktiv' if row.contact_settings.enabled else 'aus' }} · {{ row.contact_settings.contacts_written }}{% else %}bereit{% endif %}</td>
+{% if mail_available %}<td>{% if row.mail_accounts %}{{ row.mail_accounts|length }} · {{ 'aktiv' if row.mail_accounts[0].enabled else 'aus' }}{% else %}nicht konfiguriert{% endif %}</td>{% endif %}
+{% if web_research_available %}<td>{% if row.web_settings %}{{ 'aktiv' if row.web_settings.enabled else 'aus' }}{% else %}nicht konfiguriert{% endif %}</td>{% endif %}
+{% if contacts_available %}<td>{% if row.contact_settings %}{{ 'aktiv' if row.contact_settings.enabled else 'aus' }} · {{ row.contact_settings.contacts_written }}{% else %}bereit{% endif %}</td>{% endif %}
 </tr>
 {% endfor %}
 </tbody></table>

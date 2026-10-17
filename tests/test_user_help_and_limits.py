@@ -27,7 +27,7 @@ def test_info_rewrite_logging_does_not_emit_query_content():
     source = provider.__file__
     text = __import__("pathlib").Path(source).read_text(encoding="utf-8")
     assert "query rewrite round 1: elastic=%r" not in text
-    assert "query rewrite round 1: elastic_present=%s" in text
+    assert "query intent round 1: semantic_present=%s entities=%d concepts=%d concept_groups=%d" in text
     assert "retrieval round %d rewrite: elastic=%r" not in text
 
 
@@ -175,7 +175,7 @@ def test_stronger_model_suggestion_respects_current_and_allowed_models(monkeypat
     # Regression: when Thorough is already active and Deep is not allowed,
     # never offer Thorough again as a supposedly stronger model.
     assert provider._stronger_model_suggestion(
-        "Vogelsang 280",
+        "Musterweg 280",
         "client:user",
         current_model_id="sunaq-thorough",
     ) is None
@@ -189,7 +189,7 @@ def test_stronger_model_suggestion_respects_current_and_allowed_models(monkeypat
         ),
     )
     suggestion = provider._stronger_model_suggestion(
-        "Vogelsang 280",
+        "Musterweg 280",
         "client:user",
         current_model_id="sunaq-thorough",
     )

@@ -22,11 +22,12 @@ import time
 import yaml
 
 from rag.logging_utils import get_logger
+from rag.runtime_control import worker_enabled as runtime_worker_enabled
 
 
 log = get_logger("mail-worker")
 DEFAULT_POLL_SECONDS = 300
-DEFAULT_IDLE_POLL_SECONDS = 60
+DEFAULT_IDLE_POLL_SECONDS = 15
 MIN_POLL_SECONDS = 60
 
 
@@ -73,7 +74,9 @@ def run_worker(
 
     while True:
         try:
-            enabled, poll_seconds = _load_mail_worker_config(config_path)
+            configured, poll_seconds = _load_mail_worker_config(config_path)
+            runtime_allowed = runtime_worker_enabled("mail_worker", config_path=config_path, default=False)
+            enabled = configured and runtime_allowed
         except Exception as exc:
             log.error("mail worker config konnte nicht gelesen werden (%s): %s", config_path, exc)
             if once:
@@ -83,8 +86,10 @@ def run_worker(
 
         if not enabled:
             if last_state is not False:
+                reason = "runtime execution paused by administrator" if configured and not runtime_allowed else "mail feature/worker disabled"
                 log.info(
-                    "mail feature/worker disabled; Prozess bleibt aktiv und prüft Konfiguration alle %ss",
+                    "%s; Prozess bleibt aktiv und prüft Status alle %ss",
+                    reason,
                     idle_poll_seconds,
                 )
             last_state = False
@@ -116,7 +121,7 @@ def main() -> int:
         "--idle-poll-seconds",
         type=int,
         default=DEFAULT_IDLE_POLL_SECONDS,
-        help="Prüfintervall bei deaktiviertem Worker oder unlesbarer Konfiguration (Default: 60)",
+        help="Prüfintervall bei deaktiviertem Worker oder unlesbarer Konfiguration (Default: 15)",
     )
     args = parser.parse_args()
 

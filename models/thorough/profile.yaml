@@ -91,21 +91,26 @@ answer_context:
   max_total_chars: 100000
 
 deployment_overrides:
-  super-light:
+  dockerized:
     retrieval_planner:
       # Budget-only experiment: preserve the 30-document Thorough window.
       verification_candidate_limit: 30
       bounded_verification_candidate_limit: 30
       exhaustive_verification_candidate_limit: 30
-    graph_retrieval:
-      enabled: false
-    reranker:
-      backend: "none"
 
+resolver_research:
+  enabled: false
+  direct_answer: false
+  sources: []
+  enrich_resolved: false
+  include_holdings: false
+  archive_supplied_documents: false
+  persist_external_graph: false
 
 roles: {}
 
 prompts:
+  query_rewriter: query_rewriter.txt
   planner: retrieval_planner.txt
   verifier: candidate_verifier.txt
   evidence: evidence_decision.txt

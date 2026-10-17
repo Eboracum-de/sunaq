@@ -1,12 +1,13 @@
-"""Backup/restore support helpers for the console-first AKI recovery workflow.
+"""Backup/restore support helpers for the console-first SunaQ recovery workflow.
 
 The host-facing orchestration lives in ``install/backup-restore.sh`` so the
-Super-Light profile does not acquire a host-Python dependency.  This module is
-run either by the native virtualenv or inside the existing provider image.
+Dockerized deployment does not acquire a host-Python dependency. This module is
+run either by the Standard virtualenv or inside the existing provider image.
 
-It deliberately owns only AKI file/SQLite state.  Docker volume snapshots are
+It deliberately owns SunaQ file/SQLite state. Docker volume snapshots are
 orchestrated by the shell helper because the provider container has no Docker
-socket access.
+socket access. Qdrant vector data and its rebuildable sync state are deliberately
+outside the recovery set.
 """
 from __future__ import annotations
 
@@ -88,12 +89,12 @@ def _resolve_ca_reference(
     *,
     source_prefix: Path | None = None,
 ) -> tuple[Path, str | None]:
-    """Resolve configured CA files, including the Super-Light /app mount alias.
+    """Resolve configured CA files, including the Dockerized /app mount alias.
 
-    Dockerized Super-Light stores container-visible CA paths such as
+    Dockerized stores container-visible CA paths such as
     /app/runtime/ca/nextcloud-ca-bundle.pem in config.yaml while backup
     inventory runs against the host installation prefix. Treat only existing
-    files below that known runtime/ca alias as AKI-owned; genuinely external
+    files below that known runtime/ca alias as SunaQ-owned; genuinely external
     absolute CA paths remain external.
     """
     path, relative = _resolve(root, raw, source_prefix=source_prefix)
@@ -128,7 +129,7 @@ def inventory(
     *,
     source_prefix: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Return the AKI-owned file/SQLite state relevant to a recovery set."""
+    """Return the SunaQ-owned file/SQLite state relevant to a recovery set."""
 
     root_path = Path(root).resolve()
     source_path = Path(source_prefix).resolve() if source_prefix else root_path
@@ -145,16 +146,36 @@ def inventory(
         runtime_env.get("RAG_CREDENTIAL_MASTER_KEY_FILE")
         or "runtime/credential-master.key"
     )
+    sync_state_raw = str(
+        _cfg_get(cfg, "sync", "state_db", default="")
+        or _cfg_get(cfg, "state_db", default="")
+        or "runtime/state.sqlite"
+    )
+    sync_state_path, sync_state_relative = _resolve(
+        root_path, sync_state_raw, source_prefix=source_path
+    )
+    # Qdrant itself is deliberately not part of the recovery set. Do not archive
+    # the associated incremental state either: restoring it without the matching
+    # collection can make a rebuild incorrectly classify documents as unchanged.
+    qdrant_state_paths = {
+        str(sync_state_path),
+        str((root_path / "state.sqlite").resolve(strict=False)),
+        str((root_path / "runtime" / "state.sqlite").resolve(strict=False)),
+    }
 
-    sqlite_raw: list[str] = [
-        credential_raw,
-        str(_cfg_get(cfg, "source_registry", "path", default="") or "runtime/source_registry.sqlite"),
-        str(_cfg_get(cfg, "graph_queue", "database", default="") or "runtime/graph_queue.sqlite"),
+    critical_sqlite_raw: list[tuple[str, str]] = [
+        ("source_registry", str(_cfg_get(cfg, "source_registry", "path", default="") or "runtime/source_registry.sqlite")),
+        ("graph_queue", str(_cfg_get(cfg, "graph_queue", "database", default="") or "runtime/graph_queue.sqlite")),
+        ("mail_state", str(_cfg_get(cfg, "mail", "state_file", default="") or "runtime/mail_state.sqlite")),
+        ("dossier_writer", str(_cfg_get(cfg, "dossier_writer", "database", default="") or "runtime/dossier_queue.sqlite")),
     ]
     research_log_enabled = str(provider_env.get("RESEARCH_LOG_ENABLED", "true")).strip().lower()
     if research_log_enabled not in {"0", "false", "no", "off"}:
-        sqlite_raw.append(provider_env.get("RESEARCH_LOG_DB") or "research.sqlite")
+        critical_sqlite_raw.append(
+            ("research_log", str(provider_env.get("RESEARCH_LOG_DB") or "research.sqlite"))
+        )
 
+    sqlite_raw: list[str] = [credential_raw] + [raw for _, raw in critical_sqlite_raw]
     for candidate in sorted(root_path.glob("*.sqlite")):
         sqlite_raw.append(str(candidate))
     runtime_dir = root_path / "runtime"
@@ -168,7 +189,7 @@ def inventory(
     for raw in sqlite_raw:
         path, relative = _resolve(root_path, raw, source_prefix=source_path)
         key = str(path)
-        if key in seen:
+        if key in seen or key in qdrant_state_paths:
             continue
         seen.add(key)
         if relative is None:
@@ -189,10 +210,14 @@ def inventory(
         blocking_external_paths.append(
             {"kind": "credential_master_key", "path": str(master_key_path)}
         )
+    for kind, raw in critical_sqlite_raw:
+        path, relative = _resolve(root_path, raw, source_prefix=source_path)
+        if relative is None:
+            blocking_external_paths.append({"kind": kind, "path": str(path)})
 
-    # Preserve explicitly configured private CA files when they live below the
-    # AKI prefix. References to administrator-managed CA files outside the
-    # prefix are reported so the operator can back them up separately.
+    # Preserve explicitly configured private CA files and operational/audit
+    # paths when they live below the SunaQ prefix. Administrator-managed paths
+    # outside the prefix are reported so the operator can back them up separately.
     referenced_files_relative: list[str] = []
     ca_raw: list[str] = []
 
@@ -226,21 +251,47 @@ def inventory(
         elif path.is_file():
             referenced_files_relative.append(relative)
 
+    worker_control_raw = str(
+        runtime_env.get("RAG_WORKER_CONTROL_FILE")
+        or provider_env.get("RAG_WORKER_CONTROL_FILE")
+        or "runtime/worker-control.json"
+    )
+    retrieval_records_raw = str(
+        _cfg_get(cfg, "retrieval_record", "directory", default="")
+        or "runtime/retrieval-records"
+    )
+    for kind, raw in (
+        ("worker_control", worker_control_raw),
+        ("retrieval_records", retrieval_records_raw),
+    ):
+        path, relative = _resolve(root_path, raw, source_prefix=source_path)
+        if relative is None:
+            external_paths.append({"kind": kind, "path": str(path)})
+        elif path.exists():
+            referenced_files_relative.append(relative)
+
     archive_candidates = [
+        ".sunaq-installation",
         ".aki-rag-installation",
         "config.yaml",
         "web.yaml",
         "provider.env",
         "runtime.env",
         "versions.lock.yaml",
+        "models",
         "install/.env",
+        "install/dockerized/.env",
+        "install/dockerized/docker-compose.override.yml",
         "install/super-light/.env",
         "install/super-light/docker-compose.override.yml",
         "install/install-state.env",
         "install/last-install-command.sh",
         "install/nginx/htpasswd",
+        "install/nginx/internal-auth.conf",
         "install/nginx/generated.conf",
         "runtime/ca",
+        "runtime/worker-control.json",
+        "runtime/retrieval-records",
         "install/nginx/tls",
     ]
     archive_paths: list[str] = []
@@ -261,7 +312,8 @@ def inventory(
                 archive_paths.append(relative + suffix)
 
     return {
-        "format": "aki-rag-inventory-v1",
+        "format": "sunaq-inventory-v2",
+        "sunaq_version": VERSION,
         "aki_version": VERSION,
         "root": str(root_path),
         "source_prefix": str(source_path),
@@ -274,6 +326,12 @@ def inventory(
             "path": str(master_key_path),
             "relative": master_key_relative,
             "exists": master_key_path.is_file(),
+        },
+        "qdrant_sync_state": {
+            "path": str(sync_state_path),
+            "relative": sync_state_relative,
+            "exists": sync_state_path.is_file(),
+            "included": False,
         },
         "sqlite": sorted(sqlite_relative),
         "archive_paths": archive_paths,
@@ -305,7 +363,7 @@ def checkpoint_root(
     *,
     source_prefix: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Checkpoint and integrity-check all discovered AKI SQLite databases."""
+    """Checkpoint and integrity-check all discovered SunaQ SQLite databases."""
 
     root_path = Path(root).resolve()
     state = inventory(root_path, source_prefix=source_prefix)
@@ -387,7 +445,7 @@ def verify_root(
 
 
 def _main() -> int:
-    parser = argparse.ArgumentParser(description="AKI backup/restore helper")
+    parser = argparse.ArgumentParser(description="SunaQ backup/restore helper")
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("inventory", "checkpoint-root", "verify-root"):
         command = sub.add_parser(name)

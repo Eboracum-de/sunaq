@@ -217,6 +217,30 @@
     margin-right: 6px;
 }
 
+.sunaq-retrieval-strategy {
+    box-sizing: border-box;
+    width: min(100%, 880px);
+    margin: 0 auto 8px;
+    padding: 6px 10px;
+    border: 1px solid var(--color-border, #d0d0d0);
+    border-radius: 10px;
+    background: var(--color-main-background, #fff);
+    font-size: 0.84em;
+}
+
+.sunaq-retrieval-strategy summary {
+    cursor: pointer;
+    font-weight: 600;
+}
+
+.sunaq-retrieval-strategy pre {
+    margin: 8px 0 2px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font: inherit;
+    line-height: 1.45;
+}
+
 .sunaq-composer {
     box-sizing: border-box;
     flex: 0 0 auto;
@@ -482,6 +506,7 @@
 
 .sunaq-table {
     width: 100%;
+    table-layout: fixed;
     border-collapse: collapse;
     font-variant-numeric: tabular-nums;
 }
@@ -491,6 +516,18 @@
     border: 1px solid var(--color-border, #d0d0d0);
     padding: 7px 9px;
     vertical-align: top;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: normal;
+    hyphens: auto;
+}
+
+.sunaq-table th a,
+.sunaq-table td a,
+.sunaq-table th code,
+.sunaq-table td code {
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .sunaq-table th {

@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def _summary(entity_id: str):
     return {
         "entity_id": entity_id,
-        "display_name": "Robert Wilke" if entity_id == "A" else "Robert Alexander Wilke",
+        "display_name": "John Doe" if entity_id == "A" else "John Alexander Doe",
         "labels": ["Entity", "Person"],
         "identity_status": "seeded",
         "contact_records": 1,
@@ -83,13 +83,13 @@ class _SameAsGraph:
         return [
             {
                 "entity_id": "A", "labels": ["Entity", "Person"],
-                "display_name": "Robert Wilke", "value": "Robert Wilke",
-                "normalized": "robert wilke", "form_type": "name", "weight": 1.0,
+                "display_name": "John Doe", "value": "John Doe",
+                "normalized": "john doe", "form_type": "name", "weight": 1.0,
             },
             {
                 "entity_id": "B", "labels": ["Entity", "Person"],
-                "display_name": "Robert Alexander Wilke", "value": "Robert Wilke",
-                "normalized": "robert wilke", "form_type": "alias", "weight": 0.96,
+                "display_name": "John Alexander Doe", "value": "John Doe",
+                "normalized": "john doe", "form_type": "alias", "weight": 0.96,
             },
         ]
 
@@ -98,8 +98,8 @@ class _SameAsGraph:
 
     def entity_search_forms(self, entity_id):
         return [
-            {"value": "Robert Wilke", "normalized": "robert wilke", "weight": 1.0, "kind": "name", "active": True, "source": "name"},
-            {"value": "Robert Alexander Wilke", "normalized": "robert alexander wilke", "weight": 0.98, "kind": "same_as_name", "active": True, "source": "name"},
+            {"value": "John Doe", "normalized": "john doe", "weight": 1.0, "kind": "name", "active": True, "source": "name"},
+            {"value": "John Alexander Doe", "normalized": "john alexander doe", "weight": 0.98, "kind": "same_as_name", "active": True, "source": "name"},
         ]
 
     def candidate_context_links(self, candidate_ids, resolved_ids):
@@ -107,14 +107,14 @@ class _SameAsGraph:
 
 
 def test_query_exact_match_across_same_as_group_is_not_ambiguous():
-    result = detect_known_entities("Was weißt Du über Robert Wilke?", _SameAsGraph(), fuzzy=False)
+    result = detect_known_entities("Was weißt Du über John Doe?", _SameAsGraph(), fuzzy=False)
     assert len(result.entities) == 1
     entity = result.entities[0]
     assert entity.status == "resolved"
     assert entity.resolution_method == "same_as_equivalent_form"
     assert {c.entity_id for c in entity.candidates} == {"A", "B"}
     assert {f["normalized"] for f in entity.search_forms} == {
-        "robert wilke", "robert alexander wilke"
+        "john doe", "john alexander doe"
     }
 
 
@@ -125,25 +125,25 @@ def test_candidate_queue_collapses_same_as_components_and_exposes_user_provenanc
         if "type(r)='POSSIBLE_SAME_AS'" in query:
             return [
                 {
-                    "left_entity_id": "A", "left_name": "Robert Wilke", "left_labels": ["Entity", "Person"],
-                    "right_entity_id": "B", "right_name": "Robert Wilke", "right_labels": ["Entity", "Person"],
+                    "left_entity_id": "A", "left_name": "John Doe", "left_labels": ["Entity", "Person"],
+                    "right_entity_id": "B", "right_name": "John Doe", "right_labels": ["Entity", "Person"],
                     "score": 1.0, "reason": "exact_shared_form", "status": "candidate",
-                    "suggested_by": "identity_similarity_v1", "matched_left_form": "Robert Wilke",
-                    "matched_right_form": "Robert Wilke", "carried_from_merge_entity_id": None,
+                    "suggested_by": "identity_similarity_v1", "matched_left_form": "John Doe",
+                    "matched_right_form": "John Doe", "carried_from_merge_entity_id": None,
                 },
                 {
-                    "left_entity_id": "A", "left_name": "Robert Wilke", "left_labels": ["Entity", "Person"],
-                    "right_entity_id": "C", "right_name": "Robert Wilke", "right_labels": ["Entity", "Person"],
+                    "left_entity_id": "A", "left_name": "John Doe", "left_labels": ["Entity", "Person"],
+                    "right_entity_id": "C", "right_name": "John Doe", "right_labels": ["Entity", "Person"],
                     "score": 1.0, "reason": "exact_shared_form", "status": "candidate",
-                    "suggested_by": "identity_similarity_v1", "matched_left_form": "Robert Wilke",
-                    "matched_right_form": "Robert Wilke", "carried_from_merge_entity_id": None,
+                    "suggested_by": "identity_similarity_v1", "matched_left_form": "John Doe",
+                    "matched_right_form": "John Doe", "carried_from_merge_entity_id": None,
                 },
                 {
-                    "left_entity_id": "B", "left_name": "Robert Wilke", "left_labels": ["Entity", "Person"],
-                    "right_entity_id": "C", "right_name": "Robert Wilke", "right_labels": ["Entity", "Person"],
+                    "left_entity_id": "B", "left_name": "John Doe", "left_labels": ["Entity", "Person"],
+                    "right_entity_id": "C", "right_name": "John Doe", "right_labels": ["Entity", "Person"],
                     "score": 1.0, "reason": "exact_shared_form", "status": "candidate",
-                    "suggested_by": "identity_similarity_v1", "matched_left_form": "Robert Wilke",
-                    "matched_right_form": "Robert Wilke", "carried_from_merge_entity_id": None,
+                    "suggested_by": "identity_similarity_v1", "matched_left_form": "John Doe",
+                    "matched_right_form": "John Doe", "carried_from_merge_entity_id": None,
                 },
             ]
         if "type(r) IN ['SAME_AS','NOT_SAME_AS']" in query:
@@ -151,15 +151,15 @@ def test_candidate_queue_collapses_same_as_components_and_exposes_user_provenanc
         if "OPTIONAL MATCH (c:ContactRecord)-[cr]->(e)" in query and "type(cr)='DESCRIBES'" in query:
             return [
                 {
-                    "entity_id": "A", "display_name": "Robert Wilke", "labels": ["Entity", "Person"],
+                    "entity_id": "A", "display_name": "John Doe", "labels": ["Entity", "Person"],
                     "sources": [{"contact_id": "ca", "cloud_id": "nextcloud", "source_user_id": "user-a", "addressbook_name": "Kontakte", "addressbook_slug": "kontakte"}],
                 },
                 {
-                    "entity_id": "B", "display_name": "Robert Wilke", "labels": ["Entity", "Person"],
+                    "entity_id": "B", "display_name": "John Doe", "labels": ["Entity", "Person"],
                     "sources": [{"contact_id": "cb", "cloud_id": "nextcloud", "source_user_id": "user-b", "addressbook_name": "Kontakte", "addressbook_slug": "kontakte"}],
                 },
                 {
-                    "entity_id": "C", "display_name": "Robert Wilke", "labels": ["Entity", "Person"],
+                    "entity_id": "C", "display_name": "John Doe", "labels": ["Entity", "Person"],
                     "sources": [{"contact_id": "cc", "cloud_id": "nextcloud", "source_user_id": "user-a", "addressbook_name": "Geschäftlich", "addressbook_slug": "geschaeftlich"}],
                 },
             ]
@@ -184,18 +184,18 @@ def test_component_level_not_same_hides_redundant_cross_candidate():
         if "type(r)='POSSIBLE_SAME_AS'" in query:
             return [
                 {
-                    "left_entity_id": "A", "left_name": "Robert Wilke", "left_labels": ["Entity", "Person"],
-                    "right_entity_id": "B", "right_name": "Robert Wilke", "right_labels": ["Entity", "Person"],
+                    "left_entity_id": "A", "left_name": "John Doe", "left_labels": ["Entity", "Person"],
+                    "right_entity_id": "B", "right_name": "John Doe", "right_labels": ["Entity", "Person"],
                     "score": 1.0, "reason": "exact_shared_form", "status": "candidate",
-                    "suggested_by": "identity_similarity_v1", "matched_left_form": "Robert Wilke",
-                    "matched_right_form": "Robert Wilke", "carried_from_merge_entity_id": None,
+                    "suggested_by": "identity_similarity_v1", "matched_left_form": "John Doe",
+                    "matched_right_form": "John Doe", "carried_from_merge_entity_id": None,
                 },
                 {
-                    "left_entity_id": "C", "left_name": "Robert Wilke", "left_labels": ["Entity", "Person"],
-                    "right_entity_id": "B", "right_name": "Robert Wilke", "right_labels": ["Entity", "Person"],
+                    "left_entity_id": "C", "left_name": "John Doe", "left_labels": ["Entity", "Person"],
+                    "right_entity_id": "B", "right_name": "John Doe", "right_labels": ["Entity", "Person"],
                     "score": 1.0, "reason": "exact_shared_form", "status": "candidate",
-                    "suggested_by": "identity_similarity_v1", "matched_left_form": "Robert Wilke",
-                    "matched_right_form": "Robert Wilke", "carried_from_merge_entity_id": None,
+                    "suggested_by": "identity_similarity_v1", "matched_left_form": "John Doe",
+                    "matched_right_form": "John Doe", "carried_from_merge_entity_id": None,
                 },
             ]
         if "type(r) IN ['SAME_AS','NOT_SAME_AS']" in query:
@@ -205,9 +205,9 @@ def test_component_level_not_same_hides_redundant_cross_candidate():
             ]
         if "OPTIONAL MATCH (c:ContactRecord)-[cr]->(e)" in query:
             return [
-                {"entity_id": "A", "display_name": "Robert Wilke", "labels": ["Entity", "Person"], "sources": []},
-                {"entity_id": "B", "display_name": "Robert Wilke", "labels": ["Entity", "Person"], "sources": []},
-                {"entity_id": "C", "display_name": "Robert Wilke", "labels": ["Entity", "Person"], "sources": []},
+                {"entity_id": "A", "display_name": "John Doe", "labels": ["Entity", "Person"], "sources": []},
+                {"entity_id": "B", "display_name": "John Doe", "labels": ["Entity", "Person"], "sources": []},
+                {"entity_id": "C", "display_name": "John Doe", "labels": ["Entity", "Person"], "sources": []},
             ]
         return []
 

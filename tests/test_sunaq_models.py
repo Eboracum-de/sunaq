@@ -60,6 +60,8 @@ def test_sunaq_models_load_once_with_config_and_prompt_overrides(tmp_path):
     assert chef.config["graph_queue"]["worker"]["enabled"] is False
 
 
+
+
 def test_sunaq_model_prompt_cannot_escape_model_directory(tmp_path):
     models = tmp_path / "models"
     model = models / "bad"
@@ -286,7 +288,7 @@ def test_shipped_sunaq_profiles_own_request_local_settings_and_core_prompts():
     assert thorough["context_enrichment"]["max_chars"] > standard["context_enrichment"]["max_chars"]
     assert deep["context_enrichment"]["max_chars"] > thorough["context_enrichment"]["max_chars"]
 
-    core_slots = {"planner", "verifier", "evidence", "answer"}
+    core_slots = {"query_rewriter", "planner", "verifier", "evidence", "answer"}
     assert core_slots.issubset(standard["prompts"])
     assert core_slots.issubset(thorough["prompts"])
     assert core_slots.issubset(deep["prompts"])
@@ -542,3 +544,119 @@ def test_identical_reranker_config_reuses_warmed_global_instance():
         reranker_module._reranker_for_config(dict(reranker_module.reranker_config))
         is reranker_module.reranker
     )
+
+
+def test_only_supported_user_models_are_shipped():
+    root = Path(__file__).resolve().parent.parent
+    shipped = {
+        item.name
+        for item in (root / "models").iterdir()
+        if item.is_dir() and (item / "profile.yaml").is_file()
+    }
+    assert shipped == {"standard", "thorough", "deep"}
+
+    base = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+    base.setdefault("architecture", {})["tier"] = "erg_full"
+    base.setdefault("resolver", {})["enabled"] = True
+    registry = load_model_registry(base)
+    assert {model.model_id for model in registry.list()} == {
+        "sunaq-standard",
+        "sunaq-thorough",
+        "sunaq-deep",
+    }
+
+
+
+def test_normal_models_own_query_rewriter_and_core_research_prompts():
+    root = Path(__file__).resolve().parent.parent
+    base = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+    registry = load_model_registry(base)
+    for model_id in ("sunaq-standard", "sunaq-thorough", "sunaq-deep"):
+        model = registry.get(model_id)
+        for prompt_name in ("query_rewriter", "planner", "verifier", "evidence", "answer"):
+            assert model.prompts[prompt_name].strip()
+
+
+def test_internal_document_model_semantics_are_tier_invariant():
+    root = Path(__file__).resolve().parent.parent
+    base = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+    sections = (
+        "search",
+        "retrieval_planner",
+        "evidence_control",
+        "retrieval_signal",
+        "entity_resolution",
+        "graph_retrieval",
+        "reranker",
+        "context_enrichment",
+        "answer_context",
+        "resolver_research",
+    )
+
+    registries = {}
+    for tier in ("erg_internal", "erg_full"):
+        cfg = yaml.safe_load(yaml.safe_dump(base))
+        cfg.setdefault("architecture", {})["tier"] = tier
+        registries[tier] = load_model_registry(cfg)
+
+    for model_id in ("sunaq-standard", "sunaq-thorough", "sunaq-deep"):
+        internal = registries["erg_internal"].get(model_id)
+        full = registries["erg_full"].get(model_id)
+        assert internal.prompts == full.prompts
+        for section in sections:
+            assert internal.section(section) == full.section(section)
+
+
+def test_provider_keeps_generic_resolver_research_path_without_register_model_package():
+    root = Path(__file__).resolve().parent.parent
+    provider = (root / "rag" / "openai_provider.py").read_text(encoding="utf-8")
+    assert "resolver_research_enabled" in provider
+    assert "resolver_direct_answer" in provider
+    assert "_resolver_answer_messages" in provider
+    assert "require_entity_hints=resolver_research_enabled" in provider
+
+
+def test_dockerized_and_super_light_model_override_keys_are_migration_aliases(tmp_path):
+    models_dir = tmp_path / "models"
+    model_dir = models_dir / "standard"
+    prompts = model_dir / "prompts"
+    prompts.mkdir(parents=True)
+    (prompts / "answer.txt").write_text("answer")
+    (model_dir / "profile.yaml").write_text(
+        """
+id: sunaq-standard
+name: Standard
+default: true
+architecture_tiers: [src]
+search: {}
+retrieval_planner: {}
+evidence_control: {}
+retrieval_signal: {}
+graph_retrieval:
+  enabled: true
+reranker:
+  backend: none
+context_enrichment: {}
+answer_context: {}
+entity_resolution: {}
+roles: {}
+prompts:
+  answer: answer.txt
+deployment_overrides:
+  super-light:
+    graph_retrieval:
+      enabled: false
+"""
+    )
+
+    cfg = {"architecture": {"tier": "src"}, "deployment": {"profile": "dockerized"}}
+    model = load_model_registry(cfg, models_dir=models_dir).get()
+    assert model.section("graph_retrieval")["enabled"] is False
+
+    profile = (model_dir / "profile.yaml").read_text().replace(
+        "  super-light:\n", "  dockerized:\n"
+    )
+    (model_dir / "profile.yaml").write_text(profile)
+    cfg["deployment"]["profile"] = "super-light"
+    model = load_model_registry(cfg, models_dir=models_dir).get()
+    assert model.section("graph_retrieval")["enabled"] is False

@@ -1,43 +1,45 @@
 # Beta operations runbook
 
-**Reference:** `0.8.6-rc1`  
+**Reference:** `0.8.7-rc1`  
 **Target:** controlled beta deployment behind an administrator-managed network boundary
 
 This document is the short operational path for the current beta candidate. For
 full configuration details see `TECHNICAL-REFERENCE.md`; for identity/credential
 administration see `ADMINISTRATION.md`.
 
-## 1. Supported deployment matrix
+## 1. Supported deployment and architecture axes
 
-0.8.6 keeps functional profile and deployment mechanism separate, but only two
-combinations are regression-tested and accepted for the beta:
+0.8.7-rc1 separates deployment packaging from the information/data boundary.
+Both supported deployment mechanisms use the same middleware contracts:
 
-| Functional profile | Deployment | Status |
+| Axis | Values | Meaning |
 | --- | --- | --- |
-| `standard` | `native` | supported/tested |
-| `super-light` | `dockerized` | supported/tested |
-| `standard` | `dockerized` | not a 0.8.6-rc1 supported mapping |
-| `super-light` | `native` | not a 0.8.6-rc1 supported mapping |
+| Deployment | `standard` / `dockerized` | native packaging vs. containerized packaging |
+| Architecture tier | `src` / `erg-internal` / `erg-full` | enforced information/data envelope |
+| Shipped preset | `core` / `workgroup` / `full` | recommended capability bundle for SRC / ERG Internal / ERG Full |
 
-Super-Light is one configuration of the same middleware, not a fork. Nextcloud,
-its FullTextSearch Elasticsearch and the LLM endpoint are administrator-managed
-dependencies outside the SunaQ stack; they may be on separate systems or, where
-ports/resources permit, on the same host. Locally the minimal SunaQ stack runs API, provider and Neo4j seed/alias support;
-bundled nginx is optional. Qdrant, the local reranker, Web Research, Research
-Findings, the mail worker and Playwright are disabled by default. Install the
-renderer only when required with `--with-playwright`.
+A deployment mechanism does not imply an architecture tier. The release
+acceptance includes a fresh Dockerized installation and an in-place Standard
+upgrade; capability/preset selection remains orthogonal and is validated by the
+same startup/configuration boundary checks.
 
-## 2. Super-Light installation
+Nextcloud and its FullTextSearch Elasticsearch are administrator-managed
+dependencies outside the SunaQ stack. A minimal Dockerized/core installation
+runs the SunaQ API/provider without requiring Qdrant, Neo4j, resolver, Mail,
+Web Research or Playwright. Optional local components are selected explicitly or
+through the workgroup/full presets. Playwright remains opt-in with
+`--with-playwright`.
 
-Inspect the plan first. For rc1.2 acceptance, keep the architecture choice
-explicit in the recorded command even where Super-Light would select the same
-packaged defaults: `--profile super-light --deployment dockerized --preset core`
-means the Dockerized Super-Light deployment of the formal SRC contract.
+> Lab-only HTTP exception: if the test Nextcloud is intentionally served over `http://`, add `--allow-insecure-nextcloud` to the installer command. This is separate from `--no-x509-strict` and must not be used for normal deployments.
+
+## 2. Dockerized installation
+
+Inspect the plan first. For rc1 acceptance, keep the architecture boundary explicit in the recorded command even where the Core preset selects the same tier: `--deployment dockerized --architecture-tier src --preset core` means the Dockerized deployment of the formal SRC contract using the Core capability bundle.
 
 ```bash
 sudo ./install/install.sh \
-  --profile super-light \
   --deployment dockerized \
+  --architecture-tier src \
   --preset core \
   --nextcloud-url https://cloud.example/nextcloud \
   --elasticsearch-url http://10.0.0.20:9200 \
@@ -57,8 +59,8 @@ RFC-5280 checks require an Authority Key Identifier, additionally use
 
 ```bash
 sudo ./install/install.sh \
-  --profile super-light \
   --deployment dockerized \
+  --architecture-tier src \
   --preset core \
   --nextcloud-url https://cloud.example/nextcloud \
   --elasticsearch-url http://10.0.0.20:9200 \
@@ -79,12 +81,12 @@ host-shell `curl` is not sufficient evidence for Nextcloud's HTTP client.
 
 ### Same host as Nextcloud/Apache
 
-When Super-Light runs on the same host as Nextcloud and Apache already owns 80/443, keep Apache public and move the bundled SunaQ nginx to internal ports such as 81/444:
+When Dockerized SunaQ runs on the same host as Nextcloud and Apache already owns 80/443, keep Apache public and move the bundled SunaQ nginx to internal ports such as 81/444:
 
 ```bash
 sudo ./install/install.sh \
-  --profile super-light \
   --deployment dockerized \
+  --architecture-tier src \
   --preset core \
   --nextcloud-url https://cloud.example/nextcloud \
   --elasticsearch-url http://127.0.0.1:9200 \
@@ -104,20 +106,22 @@ The installer also refuses a non-empty `--prefix` that is not recognized as an S
 
 
 After installation, keep `/opt/sunaq/install/last-install-command.sh` with the
-host's operational records. Prefer retaining the explicit `--profile`,
-`--deployment` and `--preset` switches even when they match defaults; the
-recorded command then documents both deployment topology and architecture tier. The installer writes the exact shell-escaped wrapper command
+host's operational records. Prefer retaining explicit `--deployment`, `--architecture-tier` and `--preset` switches when they are part of the intended configuration; keep `--profile` only for legacy compatibility. The recorded command then documents deployment topology, the normative architecture boundary and any selected capability bundle separately. The installer writes the exact shell-escaped wrapper command
 used on the last run so later maintenance does not depend on reconstructing profile,
 URLs, CA files or optional component switches from memory.
 
 Before a rerun, review the stored command and run the equivalent command with `--plan`
-first. The Super-Light installer performs an early preflight for required source paths,
+first. The Dockerized installer performs an early preflight for required source paths,
 the installation prefix, CA files and Docker availability. If an existing stack is detected, the preflight inspects its Compose services. **Any
 running SunaQ service is a hard preflight error** and no installation changes are made;
-stop the complete Super-Light Compose stack before a rerun. A recognized installation
+stop the complete Dockerized Compose stack before a rerun. A recognized installation
 whose stack is fully stopped is allowed through the repair/rerun path. Missing input
 files or an unreachable installed Docker daemon also fail before the source tree is
 replaced.
+
+Sync- and Mail-worker **runtime execution defaults to paused** even if the corresponding capability is configured. This prevents an immediate Qdrant full scan or IMAP import when maintenance mode is disabled. Release each worker from the Admin overview only after its backend/account settings have been checked. The control is stored under `runtime/worker-control.json`; a missing or unreadable file is fail-closed and means paused. Installer runs seed a missing file with both workers paused, including upgrades.
+
+Negative component switches such as `--no-qdrant` are rerun/removal operations only. On a fresh installation, omission means off. If a named preset contains a component you do not want, omit the preset and select the architecture tier plus the desired positive `--with-*` components.
 
 A rerun preserves the site's existing `config.yaml`; it does **not** merge newly introduced optional configuration keys into that file automatically. After updating to a newer RC, compare the shipped reference configuration/changelog and add desired new options manually. For RC5 this includes, for example, `acl.prefilter.enabled` (off by default when absent/preserved).
 
@@ -136,11 +140,11 @@ sudo /opt/sunaq/install/maintenance-mode.sh off
 
 Use `maintenance-mode.sh on` again before key rotation, restore work or comparable maintenance.
 
-Useful Super-Light commands:
+Useful Dockerized commands:
 
 ```bash
-cd /opt/sunaq/install/super-light
-./status-super-light.sh
+cd /opt/sunaq/install/dockerized
+./status-dockerized.sh
 docker-compose ps
 docker-compose logs --tail=100 api provider
 docker-compose restart api provider
@@ -152,14 +156,14 @@ Admin UI or supplied CLIs.
 
 ### 3.1 Backup and restore
 
-RC5 provides the console-first recovery tool `install/backup-restore.sh`. Create and restore operations require SunaQ maintenance mode; `verify` is read-only. Use a backup target **outside** the installation prefix:
+The console-first recovery tool is `install/backup-restore.sh`. Create and restore operations require SunaQ maintenance mode; `verify` is read-only. Use a backup target **outside** the installation prefix:
 
 ```bash
 sudo /opt/sunaq/install/maintenance-mode.sh on
-sudo /opt/sunaq/install/backup-restore.sh create /srv/aki-backups
+sudo /opt/sunaq/install/backup-restore.sh create /srv/sunaq-backups
 ```
 
-`create` writes a timestamped directory such as `aki-rag-backup-20260922-123702Z` and verifies it before publishing it. The recovery set contains SunaQ-owned configuration/runtime state, SQLite state including `runtime/users.sqlite`, the matching credential master key, private CA/TLS/operator state below the installation prefix and bundled Neo4j when selected. It deliberately does not back up Nextcloud, Elasticsearch, rebuildable Qdrant, external Neo4j, OpenWebUI/Playwright state or model caches.
+`create` writes a timestamped directory such as `sunaq-backup-20261016-123702Z` and verifies it before publishing it. The recovery set contains SunaQ-owned configuration/runtime state, administrator-owned `models/`, non-Qdrant SQLite state including `runtime/users.sqlite`, the matching credential master key, worker-control state, current Dockerized site state, private CA/TLS/operator state below the installation prefix and bundled Neo4j when selected. It deliberately does not back up Nextcloud, Elasticsearch, rebuildable Qdrant or its sync database, external Neo4j, OpenWebUI/Playwright state or model caches.
 
 Treat the recovery directory as a secret: it contains service credentials and the credential master key. Store it with restrictive permissions and, where appropriate, encrypted/off-host.
 
@@ -167,7 +171,7 @@ Verify an existing recovery set independently with:
 
 ```bash
 sudo /opt/sunaq/install/backup-restore.sh verify \
-  /srv/aki-backups/aki-rag-backup-YYYYMMDD-HHMMSSZ
+  /srv/sunaq-backups/sunaq-backup-YYYYMMDD-HHMMSSZ
 ```
 
 Restore only after verifying the selected set and while maintenance mode is active:
@@ -175,22 +179,20 @@ Restore only after verifying the selected set and while maintenance mode is acti
 ```bash
 sudo /opt/sunaq/install/maintenance-mode.sh on
 sudo /opt/sunaq/install/backup-restore.sh restore \
-  /srv/aki-backups/aki-rag-backup-YYYYMMDD-HHMMSSZ --yes
+  /srv/sunaq-backups/sunaq-backup-YYYYMMDD-HHMMSSZ --yes
 ```
 
-Restore is intentionally conservative: the supported deployment profile/mode and installation prefix must match the recovery set. Existing SQLite main/WAL/SHM state covered by the set is replaced coherently; bundled Neo4j is restored when included. A successful restore **leaves SunaQ in maintenance mode**. Run smoke/health/live-ACL checks and at least one authenticated document query before returning to normal service:
+Restore is intentionally conservative: the supported deployment profile/mode and installation prefix must match the recovery set. Existing non-Qdrant SQLite main/WAL/SHM state covered by the set is replaced coherently; bundled Neo4j is restored when included. Because Qdrant itself is not included, any restored legacy vector-sync database is removed. Restore or reset any surviving Qdrant collection as appropriate and run a full ES -> Qdrant sync before returning to service. A successful restore **leaves SunaQ in maintenance mode**. Run smoke/health/live-ACL checks and at least one authenticated document query before returning to normal service:
 
 ```bash
 sudo /opt/sunaq/install/maintenance-mode.sh off
 ```
 
-The RC5 Super-Light acceptance test exercised a real `users.sqlite` loss: the provider failed closed with an invalid-client 401, then the verified restore recovered the registered provider-client/user credential state and normal authenticated requests. The same recovery set included the bundled Neo4j snapshot/restore step.
-
-On Super-Light, a warning that `/app/runtime/ca/...` is an external `ca_file` can currently be path-normalization noise: `runtime/ca/` is explicitly included in the recovery set. Confirm the expected CA file is present in `files.tar`; genuinely external CA paths remain operator-owned dependencies.
+Earlier recovery acceptance exercised a real `users.sqlite` loss: the provider failed closed with an invalid-client 401, then the verified restore recovered the registered provider-client/user credential state and normal authenticated requests. The same recovery path exercised the bundled Neo4j snapshot/restore step. Dockerized `/app/runtime/ca/...` aliases are mapped back to the host `runtime/ca/` recovery path; genuinely external CA paths remain operator-owned dependencies.
 
 For cross-system recovery order, key/master-key pairing and deletion/lifecycle scope, see `DATA-LIFECYCLE.md`.
 
-## 4. SunaQ Recherche 0.3.2
+## 4. SunaQ Recherche 0.3.16
 
 SunaQ Recherche is the preferred slim Nextcloud UI for this beta. It targets Nextcloud 23+.
 Install the `sunaq` app in Nextcloud, enable it, then configure **SunaQ URL**
@@ -261,7 +263,7 @@ internal join key.
 CLI equivalent:
 
 ```bash
-cd /opt/sunaq/install/super-light
+cd /opt/sunaq/install/dockerized
 ./contacts.sh list
 ./contacts.sh status --user alice
 ./contacts.sh books --user alice
@@ -273,14 +275,13 @@ Missing credential, disabled seed source and empty address book are clean no-ops
 
 The Admin UI starts the contact import as a background job and shows a progress bar with processed/total, written, repaired, removed and error counts. **Adressbücher ermitteln** lists the CardDAV display name and technical slug accepted by include/exclude filters. A full successful scan also removes ContactRecords whose CardDAV href disappeared; parse failures are still counted as seen and are not mistaken for deletions.
 
-## 6. Retrieval behavior in Super-Light
+## 6. Retrieval behavior in Dockerized core/SRC
 
-Super-Light uses Elasticsearch as the required document arm and Neo4j for
-entity/alias expansion and lightweight research findings. Qdrant and the local
-reranker are disabled.
+Dockerized core/SRC uses Elasticsearch as the required document arm; ERG presets may additionally use Neo4j for
+entity/alias expansion and lightweight research findings. Workgroup/Full also provision Qdrant/vector retrieval; its sync worker is runtime-paused until explicit Admin release. The local reranker remains disabled.
 
 Every normal request first produces one small SearchSpec. In
-Super-Light its lexical fields are compiled to Elasticsearch; `semantic_query`
+Dockerized core/SRC its lexical fields are compiled to Elasticsearch; `semantic_query`
 is retained for portability but is not executed because Qdrant is disabled.
 Neo4j may add known seed/alias forms before the Elasticsearch request. Normal INFO logging records only bounded control/count metadata for this path;
 query text and Elasticsearch request bodies are not emitted at INFO. The shipped rc1 profiles deliberately use one retrieval round. Additional rounds
@@ -289,7 +290,7 @@ are deferred until the budget-only profile comparison has been accepted.
 The absence of a reranker does **not** disable deduplication. Near-identical text
 and common PDF/ODT/copy variants are collapsed before the final candidate path.
 The normal verification/answer budget now comes from the selected SunaQ profile:
-Schnell 10, Gründlich 30 and Tief 50 candidates/documents, subject to deployment
+Standard/Schnell 10, Thorough/Gründlich 30 and Deep/Tief 50 candidates/documents, subject to deployment
 capabilities and administrator hard ceilings.
 
 Live Nextcloud ACL remains mandatory. Unauthorized results are removed and do not
@@ -325,14 +326,14 @@ bundle every subresource.
 Use at least one real account with ordinary documents and one second account with
 different ACLs.
 
-1. `status-super-light.sh` reports API/provider/Neo4j ready. If Playwright was explicitly installed with `--with-playwright`, verify the renderer is ready as well.
+1. `status-dockerized.sh` reports API/provider/Neo4j ready. On a fresh ERG installation, Neo4j may still be initializing when the first check runs; if its container remains active, rerun the unchanged status/smoke check after Neo4j becomes ready. A second clean run is acceptable first-start behavior, while a persistent Neo4j failure is not. If Playwright was explicitly installed with `--with-playwright`, verify the renderer is ready as well.
 2. SunaQ appears in Nextcloud navigation and opens without manual URL entry.
 3. User 1 completes Login Flow and can query an authorized document.
 4. User 2 cannot receive evidence for a document they cannot access.
 5. Kontakt-DB sync succeeds for one user; Neo4j shows ContactRecords/provenance.
 6. Review one identity candidate: **Identisch** must create non-destructive `SAME_AS` with both Entities still active; **Verschieden** must create `NOT_SAME_AS`. Use technical merge separately only for a true redundant SunaQ Entity.
 7. With two files that have the same valid extracted-content hash, verify they consume one duplicate group while live ACL still checks both file IDs and can promote the authorized copy if the ranked representative is denied.
-8. A normal document question works with the Super-Light 10-candidate verifier window.
+8. A normal document question works with the Dockerized core/SRC verifier window.
 9. **If Web Research/Web archive is enabled** (and Playwright is installed when rendered PDFs are required), run one Web Research request and verify the selected source archive/metadata; with Playwright enabled, also verify the desktop/Landscape PDF.
 10. Stop Elasticsearch temporarily and verify the friendly unavailable response.
 11. Restore Elasticsearch and verify retrieval recovers without state repair.
@@ -345,7 +346,7 @@ The rc4.3 blank-VM pass completed for both supported mappings. That historical S
 
 ## 9. Resource reference
 
-Observed on the Super-Light acceptance VM:
+Observed on the historical Super-Light (now Dockerized SRC) acceptance VM:
 
 ```text
 assigned RAM:      ~3.9 GiB
@@ -361,7 +362,7 @@ will be used. Nextcloud, Elasticsearch and the LLM are external in this figure.
 
 ## 10. Beta freeze
 
-0.8.6-rc1 is the current deployment/operations release-candidate baseline.
+0.8.7-rc1 is the current deployment/operations release-candidate baseline.
 Expected follow-up work before broader feature expansion is security/curation
 hardening, documentation consistency and adversarial code-vs-docs tests (ACL,
 aliases, Findings, archive boundaries and untrusted content). A change that alters
@@ -372,12 +373,12 @@ a retrieval-quality patch.
 
 ## Source-origin mirror and reconcile
 
-Archive scopes (`/mailarchive`, `/webarchive`, `/chatarchive`) filter on mirrored `source_origin` values before the Elasticsearch/Qdrant candidate windows. The middleware registry keyed by Nextcloud `files:<id>` is the durable source of truth for special archive origins. Normal retrieval performs a lightweight id-based mirror repair whenever the registry changes; this avoids a full index scan in Super-Light.
+Archive scopes (`/mailarchive`, `/webarchive`, `/chatarchive`) filter on mirrored `source_origin` values before the Elasticsearch/Qdrant candidate windows. The middleware registry keyed by Nextcloud `files:<id>` is the durable source of truth for special archive origins. Normal retrieval performs a lightweight id-based mirror repair whenever the registry changes; this avoids a full index scan in Dockerized deployments.
 
 A full Elasticsearch reset/reindex is explicit administrator work. Afterwards run:
 
 ```bash
-cd /opt/sunaq/install/super-light
+cd /opt/sunaq/install/dockerized
 docker-compose exec api python -m rag.source_registry reconcile
 ```
 

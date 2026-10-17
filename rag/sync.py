@@ -39,6 +39,7 @@ import yaml
 from rag.embeddings import EmbeddingContextLengthError, build_embedding_backend_from_config
 from rag.elasticsearch_client import requests_options as elastic_requests_options
 from rag.logging_utils import get_logger
+from rag.runtime_control import worker_enabled as runtime_worker_enabled
 from rag.source_origin import classify_source_origin, is_machine_sidecar_path, maybe_register_path_origin
 from rag.source_registry import SPECIAL_ORIGINS, mirror_updates_to_elasticsearch
 
@@ -164,6 +165,31 @@ def cfg_get(cfg: dict[str, Any], *paths: str, default=None):
         if ok:
             return cur
     return default
+
+
+def resolve_sync_state_path(cfg: dict[str, Any]) -> str:
+    """Resolve the persistent sync state path, protecting Dockerized upgrades.
+
+    Older configs may still carry a top-level state_db: state.sqlite.
+    In Dockerized mode that historical default points into the ephemeral
+    container filesystem, so treat it as the old default and use the current
+    persistent runtime mount instead.
+    """
+    canonical = cfg_get(cfg, "sync.state_db", default=None)
+    if canonical not in (None, ""):
+        return str(canonical)
+
+    legacy = cfg_get(cfg, "state_db", default=None)
+    if legacy not in (None, ""):
+        value = str(legacy)
+        deployment_mode = str(
+            cfg_get(cfg, "deployment.mode", default="native") or "native"
+        ).strip().lower()
+        if deployment_mode == "dockerized" and value.strip() == "state.sqlite":
+            return "runtime/state.sqlite"
+        return value
+
+    return "runtime/state.sqlite"
 
 
 def utc_now() -> str:
@@ -442,9 +468,24 @@ def config_path_list(cfg: dict[str, Any], path: str) -> list[str]:
     return [str(x) for x in value if str(x or "").strip()]
 
 
+def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
+    target = Path(path)
+    if target.parent and str(target.parent) not in {"", "."}:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.tmp-{__import__('os').getpid()}")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+
+
 class StateDB:
     def __init__(self, path: str):
-        self.conn = sqlite3.connect(path)
+        db_path = Path(path)
+        if db_path.parent and str(db_path.parent) not in {"", "."}:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS documents (
@@ -496,6 +537,24 @@ class StateDB:
 
     def ids(self) -> set[str]:
         return {row[0] for row in self.conn.execute("SELECT document_id FROM documents")}
+
+    def stats(self) -> dict[str, int]:
+        row = self.conn.execute(
+            """
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN chunk_count > 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN chunk_count = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(chunk_count), 0)
+            FROM documents
+            """
+        ).fetchone()
+        return {
+            "documents": int((row or (0, 0, 0, 0))[0] or 0),
+            "vectorized_documents": int((row or (0, 0, 0, 0))[1] or 0),
+            "empty_documents": int((row or (0, 0, 0, 0))[2] or 0),
+            "chunks": int((row or (0, 0, 0, 0))[3] or 0),
+        }
 
     def delete(self, document_id: str):
         self.conn.execute("DELETE FROM documents WHERE document_id=?", (document_id,))
@@ -679,12 +738,25 @@ def main() -> int:
         help="One-run override for embedding.url (useful for a GPU-assisted initial sync)",
     )
     ap.add_argument("--log-level", default=None, help="override SYNC_LOG_LEVEL/LOG_LEVEL")
+    ap.add_argument(
+        "--runtime-control-worker",
+        default="",
+        help="Internal worker name for cooperative pause checks; empty disables runtime-control checks",
+    )
+    ap.add_argument(
+        "--pause-check-documents",
+        type=int,
+        default=0,
+        help="Check runtime worker control after each N scanned documents; 0 disables",
+    )
     graph_group = ap.add_mutually_exclusive_group()
     graph_group.add_argument("--enqueue-graph", action="store_true", help="Queue new/changed synced documents for background graph discovery")
     graph_group.add_argument("--no-enqueue-graph", action="store_true", help="Disable graph enqueue for this run")
     args = ap.parse_args()
     if args.log_level:
         log.setLevel(getattr(logging, str(args.log_level).upper(), log.level))
+    runtime_control_worker = str(args.runtime_control_worker or "").strip()
+    pause_check_documents = max(0, int(args.pause_check_documents or 0))
     cfg = load_config(args.config)
     if args.embedding_url:
         embedding_cfg = cfg.setdefault("embedding", {})
@@ -714,10 +786,23 @@ def main() -> int:
     max_documents = int(cfg_get(cfg, "sync.max_documents", "max_documents", default=500))
     if args.max_documents is not None:
         max_documents = max(0, int(args.max_documents))
-    state_path = str(cfg_get(cfg, "sync.state_db", "state_db", default="state.sqlite"))
+    state_path = resolve_sync_state_path(cfg)
+    if (
+        cfg_get(cfg, "sync.state_db", default=None) in (None, "")
+        and str(cfg_get(cfg, "state_db", default="") or "").strip() == "state.sqlite"
+        and str(cfg_get(cfg, "deployment.mode", default="native") or "native").strip().lower() == "dockerized"
+    ):
+        log.warning(
+            "Ignoring legacy dockerized state_db=state.sqlite because it would be ephemeral; "
+            "using runtime/state.sqlite"
+        )
     embedding_deferred_file = str(
-        cfg_get(cfg, "sync.embedding_deferred_file", default="embedding-deferred.jsonl")
-        or "embedding-deferred.jsonl"
+        cfg_get(cfg, "sync.embedding_deferred_file", default="runtime/embedding-deferred.jsonl")
+        or "runtime/embedding-deferred.jsonl"
+    )
+    status_file = str(
+        cfg_get(cfg, "sync.status_file", default="runtime/sync-status.json")
+        or "runtime/sync-status.json"
     )
     index_signature = build_index_signature(
         embedding_backend=embedding_backend,
@@ -757,9 +842,37 @@ def main() -> int:
     graph_queued = graph_coalesced = 0
     source_origin_mirror_updates: list[tuple[str, str]] = []
     source_origin_mirrored = 0
+    runtime_paused = False
+
+    def pause_requested() -> bool:
+        return bool(
+            runtime_control_worker
+            and pause_check_documents > 0
+            and not runtime_worker_enabled(
+                runtime_control_worker,
+                config_path=args.config,
+                default=False,
+            )
+        )
 
     try:
         for hit in es_scroll(es_url, es_index, es_page_size, es_scroll_ttl, es_request_options):
+            if (
+                runtime_control_worker
+                and pause_check_documents > 0
+                and scanned > 0
+                and scanned % pause_check_documents == 0
+                and pause_requested()
+            ):
+                runtime_paused = True
+                log.info(
+                    "Runtime pause observed worker=%s after scanned=%d batch_size=%d; "
+                    "stopping before next document",
+                    runtime_control_worker,
+                    scanned,
+                    pause_check_documents,
+                )
+                break
             document_id = str(hit.get("_id") or "")
             if not document_id:
                 continue
@@ -969,9 +1082,25 @@ def main() -> int:
             )
             source_origin_mirror_updates.clear()
 
+        # Re-check once after traversal so an operator pause can also suppress a
+        # potentially long stale-delete phase. A cooperatively paused run is not
+        # complete and must never infer that unseen documents vanished.
+        if (
+            not runtime_paused
+            and runtime_control_worker
+            and pause_check_documents > 0
+            and pause_requested()
+        ):
+            runtime_paused = True
+            log.info(
+                "Runtime pause observed worker=%s after traversal; stale cleanup skipped",
+                runtime_control_worker,
+            )
+
         # Only a genuinely complete, unscoped ES traversal can safely identify deletions.
-        # A path-scoped run must never infer that out-of-scope documents vanished.
-        if max_documents == 0 and not scoped_run and not args.dry_run:
+        # A path-scoped, bounded or cooperatively paused run must never infer that
+        # unseen documents vanished.
+        if max_documents == 0 and not scoped_run and not args.dry_run and not runtime_paused:
             stale = state.ids() - seen
             for document_id in sorted(stale):
                 old = state.get(document_id)
@@ -986,6 +1115,42 @@ def main() -> int:
                     )
                 state.delete(document_id)
 
+        if not args.dry_run:
+            state_stats = state.stats()
+            _atomic_write_json(
+                status_file,
+                {
+                    "schema": "sunaq.sync_status.v1",
+                    "completed_at": utc_now(),
+                    "complete_full_scan": bool(max_documents == 0 and not scoped_run and not runtime_paused),
+                    "runtime_paused": bool(runtime_paused),
+                    "scan": {
+                        "scanned": scanned,
+                        "in_scope": in_scope,
+                        "eligible_seen": len(seen),
+                        "excluded_semantic": excluded_semantic,
+                        "out_of_scope": out_of_scope,
+                        "embedding_deferred": embedding_deferred,
+                        "new": new,
+                        "updated": updated,
+                        "unchanged": unchanged,
+                        "empty": empty,
+                    },
+                    "state": state_stats,
+                    "scope": {
+                        "include_paths": include_paths,
+                        "exclude_paths": exclude_paths,
+                        "max_documents": max_documents,
+                    },
+                    "embedding": {
+                        "backend": embedding_backend,
+                        "model": embedding_model,
+                        "dimensions": embedding_dimensions,
+                        "index_signature": index_signature,
+                    },
+                },
+            )
+
         log.info(
             "Done: scanned=%d in_scope=%d new=%d updated=%d unchanged=%d empty=%d embedding_deferred=%d excluded_semantic=%d out_of_scope=%d graph_queued=%d graph_coalesced=%d source_origin_mirrored=%d",
             scanned, in_scope, new, updated, unchanged, empty, embedding_deferred, excluded_semantic, out_of_scope, graph_queued, graph_coalesced, source_origin_mirrored,
@@ -994,6 +1159,8 @@ def main() -> int:
             log.info("Scope: include=%s exclude=%s; deletion cleanup outside scope disabled", include_paths or ["<all>"], exclude_paths or [])
         elif max_documents != 0:
             log.info("max_documents != 0; deletion cleanup not run")
+        elif runtime_paused:
+            log.info("Runtime pause: traversal/cleanup incomplete; stale deletion cleanup not run")
         if args.dry_run:
             log.info("Dry-run: would_change=%d; no Qdrant/state/GraphQueue mutation", would_change)
         return 0

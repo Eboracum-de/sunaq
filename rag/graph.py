@@ -495,7 +495,7 @@ class GraphStore:
             return [record.data() for record in result]
 
     def ensure_schema(self) -> None:
-        """Create and non-destructively upgrade the complete AKI Neo4j schema.
+        """Create and non-destructively upgrade the complete SunaQ Neo4j schema.
 
         Constraints and indexes use IF NOT EXISTS, so this is safe for fresh,
         complete, and partially initialized databases. Optional properties are
@@ -4920,6 +4920,7 @@ class GraphStore:
                 verifier_model=str(verifier_model or "")[:300],
             )
 
+        # Legacy label AKIResearchFinding is retained for compatibility with existing graph data.
         self._run(
             """
             UNWIND $rows AS row

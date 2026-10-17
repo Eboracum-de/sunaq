@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Systemdiagnose · RAG Admin{% endblock %}
+{% block content %}
+<div class="heading-row">
+  <div>
+    <h1>Systemdiagnose</h1>
+    <p class="muted">Kompakte Laufzeitdiagnose. Die Seite führt nur lesende Health-Abfragen aus und verändert keine Dienste.</p>
+  </div>
+  <a class="button secondary" href="{{ request.app.url_path_for('admin_system') }}">Neu prüfen</a>
+</div>
+
+<div class="cards">
+  <div class="card"><span>Architecture Tier</span><strong class="metric-small">{{ architecture_tier }}</strong></div>
+  <div class="card"><span>API</span><strong class="metric-small">{{ 'ok' if api_probe.ok else 'Fehler' }}</strong><small>{{ api_probe.latency_ms }} ms{% if api_probe.error %} · {{ api_probe.error }}{% endif %}</small></div>
+  <div class="card"><span>Provider</span><strong class="metric-small">{{ 'ok' if provider_live_probe.ok else 'Fehler' }}</strong><small>/live {{ provider_live_probe.latency_ms }} ms{% if provider_live_probe.error %} · {{ provider_live_probe.error }}{% elif not provider_probe.ok %} · Detaildiagnose: {{ provider_probe.error or 'nicht verfügbar' }}{% endif %}</small></div>
+  <div class="card"><span>Maintenance</span><strong class="metric-small">{{ 'aktiv' if maintenance_active else 'aus' }}</strong><small>Umschaltung bleibt bewusst ein Host-Operator-Schritt.</small></div>
+</div>
+
+<section>
+<h2>Retrieval-Arme</h2>
+{% if retrieval_arms %}
+<table class="compact"><thead><tr><th>Arm</th><th>Status</th><th>Details</th></tr></thead><tbody>
+{% for name, item in retrieval_arms.items() %}
+<tr>
+  <td>{{ name }}</td>
+  <td><span class="status {{ 'ok' if item.status == 'ok' else 'degraded' }}">{{ item.status or 'unknown' }}</span></td>
+  <td class="smalltext mono">{{ item | tojson }}</td>
+</tr>
+{% endfor %}
+</tbody></table>
+{% else %}
+<p class="muted">Keine Retrieval-Arm-Diagnose verfügbar.</p>
+{% endif %}
+</section>
+
+<section>
+<h2>LLM-Rollen</h2>
+{% if llm_roles %}
+<table class="compact"><thead><tr><th>Rolle</th><th>Status</th><th>Backend</th><th>Modell</th><th>Fehler</th></tr></thead><tbody>
+{% for name, item in llm_roles.items() %}
+<tr>
+  <td>{{ name }}</td>
+  <td><span class="status {{ 'ok' if item.status == 'ok' else 'degraded' }}">{{ item.status or 'unknown' }}</span></td>
+  <td>{{ item.backend or '—' }}</td>
+  <td>{{ item.model or '—' }}</td>
+  <td class="smalltext">{{ item.error or '—' }}</td>
+</tr>
+{% endfor %}
+</tbody></table>
+{% else %}
+<p class="muted">Keine LLM-Rollendiagnose verfügbar{% if maintenance_active %}; im Maintenance-Modus ist das erwartbar{% endif %}.</p>
+{% endif %}
+</section>
+
+<section class="subtle-section">
+<h2>Rohstatus</h2>
+<details><summary>API /health</summary><pre class="preview">{{ api_probe.data | tojson(indent=2) }}</pre></details>
+<details class="topgap"><summary>Provider /live</summary><pre class="preview">{{ provider_live_probe.data | tojson(indent=2) }}</pre></details>
+<details class="topgap"><summary>Provider /health{% if not provider_probe.ok %} (Detaildiagnose nicht verfügbar){% endif %}</summary><pre class="preview">{{ provider_probe.data | tojson(indent=2) }}</pre>{% if provider_probe.error %}<p class="smalltext">{{ provider_probe.error }}</p>{% endif %}</details>
+</section>
+{% endblock %}

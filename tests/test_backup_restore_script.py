@@ -20,9 +20,14 @@ def test_backup_restore_contract_is_conservative() -> None:
     assert "require_maintenance" in text
     assert "restore BACKUP --yes" in text
     assert "QDRANT_INCLUDED=0" in text
+    assert "QDRANT_SYNC_STATE_INCLUDED=0" in text
+    assert "drop_qdrant_sync_state" in text
+    assert "normalize_restored_ownership" in text
     assert "neo4j-data.tar" in text
     assert "NEXTCLOUD_INCLUDED=0" in text
     assert "ELASTICSEARCH_INCLUDED=0" in text
+    assert ".sunaq-installation" in text
+    assert "sunaq-backup-$timestamp" in text
     assert "maintenance-mode.sh\" on" in text
 
 
@@ -32,3 +37,18 @@ def test_dockerized_backup_helper_avoids_compose_run_host_network_bug() -> None:
     assert "dockerized_backup_helper" in helper
     assert "docker run --rm --network none --user 0:0" in helper
     assert "run --rm -T --no-deps" not in helper
+
+
+def test_backup_inventory_contract_covers_current_site_state() -> None:
+    text = Path("rag/backup_admin.py").read_text(encoding="utf-8")
+    for marker in (
+        '"models"',
+        '"install/dockerized/.env"',
+        '"install/dockerized/docker-compose.override.yml"',
+        '"install/nginx/internal-auth.conf"',
+        '"runtime/worker-control.json"',
+        '"runtime/retrieval-records"',
+        '"mail_state"',
+        '"qdrant_sync_state"',
+    ):
+        assert marker in text

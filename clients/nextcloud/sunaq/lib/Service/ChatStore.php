@@ -9,6 +9,9 @@ class ChatMetadataCorruptionException extends \RuntimeException {}
 
 class ChatStore {
     const FOLDER = 'SunaQ-Chats';
+    const LEGACY_DOSSIER_CHAT_FILE = 'chat.md';
+    const DOSSIER_META_FILE = '.conversation.json';
+    const DOSSIER_RUNS_FOLDER = 'runs';
     const MAX_MESSAGES = 80;
 
     /** @var IRootFolder */
@@ -95,12 +98,127 @@ class ChatStore {
         return $folder;
     }
 
+    private function dossierFolder($archiveFolder, $id, $create = true) {
+        $name = $this->cleanId($id);
+        if ($archiveFolder->nodeExists($name)) {
+            $node = $archiveFolder->get($name);
+            if (!method_exists($node, 'getDirectoryListing')) {
+                throw new \RuntimeException('Chat-Dossier kollidiert mit einer Datei.');
+            }
+            return $node;
+        }
+        if (!$create) {
+            return null;
+        }
+        return $archiveFolder->newFolder($name);
+    }
+
+    private function ensureRunsFolder($dossier) {
+        if ($dossier->nodeExists(self::DOSSIER_RUNS_FOLDER)) {
+            $node = $dossier->get(self::DOSSIER_RUNS_FOLDER);
+            if (!method_exists($node, 'getDirectoryListing')) {
+                throw new \RuntimeException('Research-Run-Pfad kollidiert mit einer Datei.');
+            }
+            return $node;
+        }
+        return $dossier->newFolder(self::DOSSIER_RUNS_FOLDER);
+    }
+
+    private function recoverDossierMarkdownName($dossier, $id) {
+        $matches = [];
+        foreach ($dossier->getDirectoryListing() as $node) {
+            $name = (string)$node->getName();
+            if (substr($name, -3) !== '.md' || !method_exists($node, 'getContent')) {
+                continue;
+            }
+            try {
+                $content = (string)$node->getContent();
+            } catch (\Exception $e) {
+                continue;
+            }
+            if (strpos($content, "\n- Chat-ID: " . $id . "\n") === false) {
+                continue;
+            }
+            $matches[] = $name;
+            if (count($matches) > 1) {
+                return '';
+            }
+        }
+        return count($matches) === 1 ? $matches[0] : '';
+    }
+
+    private function loadDossierRecord($archiveFolder, $id) {
+        $dossier = $this->dossierFolder($archiveFolder, $id, false);
+        if ($dossier === null) {
+            return null;
+        }
+        if (!$dossier->nodeExists(self::DOSSIER_META_FILE)) {
+            // A server-side research run may intentionally create runs/ before
+            // the Nextcloud client receives the answer and writes the readable
+            // chat Markdown. Preserve that pre-created dossier so the first
+            // client save does not erase resolver/document provenance.
+            if (
+                $this->recoverDossierMarkdownName($dossier, $id) === ''
+                && !$dossier->nodeExists(self::DOSSIER_RUNS_FOLDER)
+            ) {
+                try {
+                    $dossier->delete();
+                } catch (\Exception $e) {
+                    // Best-effort repair of a truly empty/interrupted dossier.
+                }
+            }
+            return null;
+        }
+        $raw = $dossier->get(self::DOSSIER_META_FILE)->getContent();
+        $record = json_decode((string)$raw, true);
+        if (!is_array($record)) {
+            throw new ChatMetadataCorruptionException('Gespeichertes Chat-Dossier ist beschädigt.');
+        }
+
+        // New dossiers use a descriptive Markdown filename. Existing chat.md
+        // anchors remain valid and are migrated on the next successful save.
+        $archiveFile = trim((string)($record['archive_file'] ?? ''));
+        if ($archiveFile === '' || !$dossier->nodeExists($archiveFile)) {
+            if ($dossier->nodeExists(self::LEGACY_DOSSIER_CHAT_FILE)) {
+                $archiveFile = self::LEGACY_DOSSIER_CHAT_FILE;
+            } else {
+                $archiveFile = $this->recoverDossierMarkdownName($dossier, $id);
+            }
+        }
+        if ($archiveFile === '') {
+            // The readable Markdown is the lifecycle anchor. Removing it removes
+            // the dossier semantics, including resolver/web research traces.
+            try {
+                $dossier->delete();
+            } catch (\Exception $e) {
+                // A later cleanup/list pass may retry. Never fabricate a live chat.
+            }
+            return null;
+        }
+
+        $record['archive_dir'] = (string)$id;
+        $record['archive_file'] = $archiveFile;
+        $record['dossier_path'] = $this->archivePath() . '/' . (string)$id;
+        $record['runs_path'] = $record['dossier_path'] . '/' . self::DOSSIER_RUNS_FOLDER;
+        $record['archive_path'] = $record['dossier_path'] . '/' . $archiveFile;
+        return $record;
+    }
+
     private function cleanId($id) {
         $id = (string)$id;
         if ($id !== '' && preg_match('/^[A-Za-z0-9_-]{8,64}$/', $id)) {
             return $id;
         }
         return bin2hex(random_bytes(12));
+    }
+
+    /**
+     * Return the stable conversation id used by both the provider request and
+     * the Nextcloud dossier. This server-side fallback makes first-turn
+     * provenance independent of browser asset caches/older JavaScript.
+     */
+    public function ensureConversationId($id) {
+        return $this->cleanId($id);
     }
 
     private function metaName($id) {
@@ -195,13 +313,18 @@ class ChatStore {
     }
 
     private function normalizeScopes($scopes) {
-        $allowed = ['documents', 'mailarchive', 'webarchive', 'chatarchive', 'web'];
+        $allowed = ['documents', 'mailarchive', 'chatarchive', 'web'];
         $out = [];
         if (!is_array($scopes)) {
             return $out;
         }
         foreach ($scopes as $scope) {
             $value = strtolower(trim((string)$scope));
+            // Historic chat metadata may still say webarchive. Persisted Web
+            // Evidence now belongs to the Chatarchive lifecycle/source class.
+            if ($value === 'webarchive') {
+                $value = 'chatarchive';
+            }
             if (in_array($value, $allowed, true) && !in_array($value, $out, true)) {
                 $out[] = $value;
             }
@@ -290,7 +413,6 @@ class ChatStore {
         $scopeLabels = [
             'documents' => 'Dokumente',
             'mailarchive' => 'Mailarchiv',
-            'webarchive' => 'Webarchiv',
             'chatarchive' => 'Chatarchiv',
             'web' => 'Web',
         ];
@@ -336,7 +458,7 @@ class ChatStore {
             $existing = $this->load($id, false);
         } catch (ChatMetadataCorruptionException $e) {
             // Damaged metadata must not block saving a new message. Treat the
-            // record as absent; the next save rewrites a valid metadata file.
+            // record as absent; the next save rewrites valid dossier metadata.
             $existing = null;
             $metadataCorrupt = true;
         }
@@ -349,40 +471,96 @@ class ChatStore {
             'messages' => $normalized,
             'source_origin' => 'chat_archive',
             'format' => 'markdown',
+            'archive_layout' => 'research_dossier_v1',
         ];
 
-        $previousArchiveFile = is_array($existing) ? trim((string)($existing['archive_file'] ?? '')) : '';
-        if ($previousArchiveFile === '' && ($metadataCorrupt || is_array($existing))) {
-            $previousArchiveFile = $this->recoverMarkdownName($folder, $id);
-        }
-        // Keep the readable file name stable after first creation so normal
-        // chat title edits do not replace the Nextcloud file and change fileid.
-        $archiveFile = (
-            $previousArchiveFile !== ''
-            && substr($previousArchiveFile, -3) === '.md'
-            && $folder->nodeExists($previousArchiveFile)
-        ) ? $previousArchiveFile : $this->markdownName($record);
+        // New chats are one stable per-conversation research dossier. The
+        // conversation id is the directory key so the server can address the
+        // same dossier without relying on a client-generated title/path.
+        $dossier = $this->dossierFolder($folder, $id, true);
+        $this->ensureRunsFolder($dossier);
+        $previousDossierFile = (
+            is_array($existing) && !empty($existing['dossier_path'])
+            ? trim((string)($existing['archive_file'] ?? ''))
+            : ''
+        );
+        $chatFile = $this->markdownName($record);
+        $markdown = $this->writeFile(
+            $dossier,
+            $chatFile,
+            $this->renderMarkdown($record)
+        );
 
-        $markdown = $this->writeFile($folder, $archiveFile, $this->renderMarkdown($record));
-        $record['archive_file'] = $archiveFile;
-        $record['archive_path'] = $this->archivePath() . '/' . $archiveFile;
+        $record['archive_dir'] = $id;
+        $record['archive_file'] = $chatFile;
+        $record['dossier_path'] = $this->archivePath() . '/' . $id;
+        $record['runs_path'] = $record['dossier_path'] . '/' . self::DOSSIER_RUNS_FOLDER;
+        $record['archive_path'] = $record['dossier_path'] . '/' . $chatFile;
         $record['document_id'] = 'files:' . (string)$markdown->getId();
 
-        $legacyHtml = $this->legacyHtmlName($id);
-        if ($folder->nodeExists($legacyHtml)) {
-            $folder->get($legacyHtml)->delete();
-        }
-
+        // Update metadata before deleting a previous dossier filename. The delete
+        // listener can then distinguish stale/renamed Markdown from the current
+        // lifecycle anchor and will not remove runs during a chat rename.
         $this->writeFile(
-            $folder,
-            $this->metaName($id),
+            $dossier,
+            self::DOSSIER_META_FILE,
             json_encode($record, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT)
         );
-        if ($folder->nodeExists($this->legacyMetaName($id))) {
-            $folder->get($this->legacyMetaName($id))->delete();
+        if (
+            $previousDossierFile !== ''
+            && $previousDossierFile !== $chatFile
+            && $dossier->nodeExists($previousDossierFile)
+        ) {
+            try {
+                $dossier->get($previousDossierFile)->delete();
+            } catch (\Exception $e) {
+                // The new Markdown + metadata are authoritative; stale old name
+                // is cleanup only and must not fail the completed chat save.
+            }
         }
+
+        // Successful dossier write migrates any legacy flat representation of
+        // this conversation. Existing old chats remain readable until saved.
+        $legacyArchiveFile = (
+            is_array($existing) && empty($existing['dossier_path'])
+            ? trim((string)($existing['archive_file'] ?? ''))
+            : ''
+        );
+        foreach ([$this->metaName($id), $this->legacyMetaName($id), $this->legacyHtmlName($id)] as $legacyName) {
+            try {
+                if ($folder->nodeExists($legacyName)) {
+                    $folder->get($legacyName)->delete();
+                }
+            } catch (\Exception $e) {
+                // The dossier is already authoritative; stale/locked legacy
+                // artifacts are cleanup only and must not fail the completed chat.
+            }
+        }
+        if (
+            $legacyArchiveFile !== ''
+            && $legacyArchiveFile !== self::LEGACY_DOSSIER_CHAT_FILE
+        ) {
+            try {
+                if ($folder->nodeExists($legacyArchiveFile)) {
+                    $folder->get($legacyArchiveFile)->delete();
+                }
+            } catch (\Exception $e) {
+                // Best-effort migration cleanup; list/load prefer the dossier.
+            }
+        } elseif ($metadataCorrupt) {
+            try {
+                $recovered = $this->recoverMarkdownName($folder, $id);
+                if ($recovered !== '' && $folder->nodeExists($recovered)) {
+                    $folder->get($recovered)->delete();
+                }
+            } catch (\Exception $e) {
+                // Best-effort cleanup only.
+            }
+        }
+
         return $record;
     }
+
 
     public function load($id, $throwIfMissing = true) {
         $id = $this->cleanId($id);
@@ -393,6 +571,14 @@ class ChatStore {
             }
             return null;
         }
+
+        $dossierRecord = $this->loadDossierRecord($folder, $id);
+        if (is_array($dossierRecord)) {
+            return $dossierRecord;
+        }
+
+        // Legacy flat archive compatibility. Old chats are migrated to the dossier layout
+        // on their next successful save.
         $metaName = $this->metaName($id);
         if (!$folder->nodeExists($metaName) && $folder->nodeExists($this->legacyMetaName($id))) {
             $metaName = $this->legacyMetaName($id);
@@ -411,9 +597,7 @@ class ChatStore {
 
         // The readable archive file is the lifecycle anchor.  If a user deletes
         // it manually in Nextcloud, stale hidden metadata must not keep the chat
-        // alive as an invisible duplicate.  The delete-event listener handles
-        // the normal case immediately; this is the repair path for older/missed
-        // events.
+        // alive as an invisible duplicate.
         $archiveFile = $this->resolveArchiveFile($folder, $id, $record);
         if ($archiveFile === '') {
             $this->deleteMetadataFiles($folder, $id);
@@ -428,12 +612,41 @@ class ChatStore {
         return $record;
     }
 
+
     public function listChats() {
         $folder = $this->archiveFolder(false);
         if ($folder === null) {
             return [];
         }
         $items = [];
+        $seen = [];
+
+        // Dossier v1 entries.
+        foreach ($folder->getDirectoryListing() as $node) {
+            $name = (string)$node->getName();
+            if (!preg_match('/^[A-Za-z0-9_-]{8,64}$/', $name) || !method_exists($node, 'getDirectoryListing')) {
+                continue;
+            }
+            try {
+                $record = $this->loadDossierRecord($folder, $name);
+                if (!is_array($record)) {
+                    continue;
+                }
+                $id = (string)($record['id'] ?? $name);
+                $seen[$id] = true;
+                $items[] = [
+                    'id' => $id,
+                    'title' => (string)($record['title'] ?? 'Recherche'),
+                    'updated_at' => (string)($record['updated_at'] ?? ''),
+                    'created_at' => (string)($record['created_at'] ?? ''),
+                    'scopes' => is_array($record['scopes'] ?? null) ? $record['scopes'] : [],
+                ];
+            } catch (\Exception $e) {
+                // One damaged dossier must not hide the rest of the archive.
+            }
+        }
+
+        // Legacy flat entries remain visible until they are saved/migrated.
         foreach ($folder->getDirectoryListing() as $node) {
             $name = $node->getName();
             if (!preg_match('/^\.([A-Za-z0-9_-]{8,64})\.(?:sunaq|akirag)\.json$/', $name, $match)) {
@@ -443,6 +656,9 @@ class ChatStore {
                 $record = json_decode((string)$node->getContent(), true);
                 if (is_array($record)) {
                     $id = (string)($record['id'] ?? $match[1]);
+                    if (isset($seen[$id])) {
+                        continue;
+                    }
                     if ($this->resolveArchiveFile($folder, $id, $record) === '') {
                         $this->deleteMetadataFiles($folder, $id);
                         continue;
@@ -456,7 +672,7 @@ class ChatStore {
                     ];
                 }
             } catch (\Exception $e) {
-                // One damaged chat must not hide the rest of the archive.
+                // One damaged legacy chat must not hide the rest of the archive.
             }
         }
         usort($items, function ($a, $b) {
@@ -464,6 +680,7 @@ class ChatStore {
         });
         return $items;
     }
+
 
     public function rename($id, $title) {
         try {
@@ -484,15 +701,32 @@ class ChatStore {
         if ($folder === null) {
             return;
         }
-        $metadataCorrupt = false;
-        try {
-            $record = $this->load($id, false);
-        } catch (ChatMetadataCorruptionException $e) {
-            // Confirmed damaged metadata must not prevent deletion of its
-            // matching managed archive. Storage/read failures still propagate.
-            $record = null;
-            $metadataCorrupt = true;
+
+        // Dossier layout: deleting a chat removes chat.md, metadata, and all
+        // research runs atomically at the Nextcloud folder boundary.
+        $dossier = $this->dossierFolder($folder, $id, false);
+        if ($dossier !== null) {
+            $dossier->delete();
         }
+
+        // Legacy cleanup for pre-dossier chats and partially migrated records.
+        $metadataCorrupt = false;
+        $record = null;
+        $metaName = $this->metaName($id);
+        if (!$folder->nodeExists($metaName) && $folder->nodeExists($this->legacyMetaName($id))) {
+            $metaName = $this->legacyMetaName($id);
+        }
+        if ($folder->nodeExists($metaName)) {
+            // Storage/read failures still propagate. Only malformed legacy
+            // metadata is tolerated here so a damaged chat remains deletable.
+            $raw = $folder->get($metaName)->getContent();
+            $record = json_decode((string)$raw, true);
+            if (!is_array($record)) {
+                $metadataCorrupt = true;
+                $record = null;
+            }
+        }
+
         $names = [$this->metaName($id), $this->legacyMetaName($id), $this->legacyHtmlName($id)];
         if (is_array($record) && !empty($record['archive_file'])) {
             $names[] = (string)$record['archive_file'];
@@ -508,4 +742,5 @@ class ChatStore {
             }
         }
     }
+
 }

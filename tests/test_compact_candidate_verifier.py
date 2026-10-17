@@ -67,8 +67,30 @@ def test_normal_compact_verifier_schema_and_evidence(monkeypatch):
     assert ef["mentioned_entities"] == ["Nordstern GmbH"]
     schema = calls[0]["response_format"]
     props = schema["properties"]["documents"]["items"]["properties"]
-    assert "reason" not in props
+    assert "reason" in props
     assert "evidence_frame" not in props
+
+
+def test_candidate_verifier_prompt_treats_substantive_topical_cross_references_as_direct_evidence():
+    prompt = provider.CANDIDATE_VERIFIER_SYSTEM_PROMPT
+    assert 'breite Entitäts-/Informationsanfrage' in prompt
+    assert 'substanzielle Tatsachen über genau diese Entität' in prompt
+    assert 'inhaltlich aussagekräftige Querverweise' in prompt
+    assert 'lediglich genannt oder zitiert' in prompt
+
+
+def test_common_verifier_policy_is_appended_after_preserved_profile_override(monkeypatch):
+    monkeypatch.setattr(
+        provider,
+        "_prompt",
+        lambda name, default: "ALTES PROFIL: Zitate sind immer reference_only",
+    )
+    prompt = provider._candidate_verifier_prompt()
+    assert prompt.startswith("ALTES PROFIL")
+    assert "GEMEINSAMER VERIFIER-VERTRAG" in prompt
+    assert "source_origin=chat_archive" in prompt
+    assert "Elasticsearch-Ausschnitte" in prompt
+    assert "NICHT in eine Forderung umgedeutet" in prompt
 
 
 def test_normal_compact_verifier_splits_malformed_batch(monkeypatch):

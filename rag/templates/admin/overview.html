@@ -2,29 +2,61 @@
 {% block title %}Übersicht · RAG Admin{% endblock %}
 {% block content %}
 <div class="heading-row">
-  <div><h1>Übersicht</h1><p class="muted">Betriebs- und Administrationsstatus der Middleware. Für die Backend-Detailprüfung steht die geschützte Health-Ausgabe separat bereit.</p></div>
-  <a class="button secondary" href="/rag-api/health" target="_blank" rel="noopener">Systemdiagnose ↗</a>
+  <div><h1>Übersicht</h1><p class="muted">Betriebs- und Administrationsstatus der Middleware.</p></div>
+  <a class="button secondary" href="{{ request.app.url_path_for('admin_system') }}">Systemdiagnose</a>
 </div>
 
 <div class="cards">
-  <div class="card"><span>Benutzer</span><strong>{{ user_stats.total }}</strong><small>{{ user_stats.enabled }} aktiv · {{ mail_accounts }} Mailkonto/-konten</small></div>
+  <div class="card"><span>Benutzer</span><strong>{{ user_stats.total }}</strong><small>{{ user_stats.enabled }} aktiv{% if mail_available %} · {{ mail_accounts }} Mailkonto/-konten{% endif %}</small></div>
+  {% if graph_enabled %}
   <div class="card"><span>Graph-Entitäten</span><strong>{{ stats.persons + stats.organizations }}</strong><small>{{ stats.persons }} Personen · {{ stats.organizations }} Organisationen</small></div>
   <div class="card"><span>Merge-Kandidaten</span><strong>{{ stats.merge_candidates }}</strong><small><a href="{{ request.app.url_path_for('admin_candidates') }}">prüfen</a></small></div>
   <div class="card"><span>Graph Queue</span><strong>{{ queue.pending }}</strong><small>{{ queue.running }} running · {{ queue.counts.error or 0 }} Fehler</small></div>
+  {% endif %}
 </div>
 
 <section>
 <h2>Betrieb</h2>
 <table class="compact"><tbody>
 <tr><th>RAG API / Admin</th><td><span class="status ok">ok</span></td><td>Diese Seite wird vom API-Prozess ausgeliefert.</td></tr>
-<tr><th>Graph Worker</th><td><span class="status {{ 'ok' if services.graph_worker else 'degraded' }}">{{ 'aktiviert' if services.graph_worker else 'deaktiviert' }}</span></td><td>{% if services.graph_worker %}{{ queue.worker.state or '—' }}{% if queue.worker.heartbeat_age_seconds is not none %} · Heartbeat {{ queue.worker.heartbeat_age_seconds }} s{% endif %}{% else %}Automatische Verarbeitung aus · Auto-Enqueue {{ 'an' if services.graph_auto_enqueue else 'aus' }}{% endif %}</td></tr>
-<tr><th>Sync Worker</th><td><span class="status {{ 'ok' if services.sync_worker else 'degraded' }}">{{ 'aktiviert' if services.sync_worker else 'deaktiviert' }}</span></td><td>Elasticsearch → Qdrant</td></tr>
-<tr><th>Mail</th><td><span class="status {{ 'ok' if services.mail_feature else 'degraded' }}">{{ 'aktiviert' if services.mail_feature else 'deaktiviert' }}</span></td><td>Worker: {{ 'aktiv' if services.mail_worker else 'aus' }} · benutzerbezogener IMAP-Import</td></tr>
-<tr><th>Web Research</th><td><span class="status {{ 'ok' if services.web else 'degraded' }}">{{ 'aktiviert' if services.web else 'deaktiviert' }}</span></td><td>globale Engine-Konfiguration</td></tr>
+{% if graph_enabled %}<tr><th>Graph Worker</th><td><span class="status {{ 'ok' if services.graph_worker else 'degraded' }}">{{ 'aktiviert' if services.graph_worker else 'deaktiviert' }}</span></td><td>{% if services.graph_worker %}{{ queue.worker.state or '—' }}{% if queue.worker.heartbeat_age_seconds is not none %} · Heartbeat {{ queue.worker.heartbeat_age_seconds }} s{% endif %}{% else %}Automatische Verarbeitung aus · Auto-Enqueue {{ 'an' if services.graph_auto_enqueue else 'aus' }}{% endif %}</td></tr>{% endif %}
+{% if vector_enabled %}
+<tr>
+  <th>Sync Worker</th>
+  <td><span class="status {{ 'ok' if services.sync_worker and services.sync_worker_runtime else 'degraded' }}">{{ 'freigegeben' if services.sync_worker and services.sync_worker_runtime else 'pausiert' if services.sync_worker else 'nicht konfiguriert' }}</span></td>
+  <td>
+    Elasticsearch → Qdrant
+    {% if services.sync_worker %}
+    <form method="post" action="{{ request.app.url_path_for('admin_worker_control', worker_name='sync_worker') }}" class="inline-form topgap">
+      <input type="hidden" name="enabled" value="{{ '0' if services.sync_worker_runtime else '1' }}">
+      <button class="small {{ 'danger-outline' if services.sync_worker_runtime else '' }}" type="submit">{{ 'Pausieren' if services.sync_worker_runtime else 'Freigeben' }}</button>
+      <a class="button secondary small" href="{{ request.app.url_path_for('admin_vector') }}">Details</a>
+    </form>
+    {% endif %}
+  </td>
+</tr>
+{% endif %}
+{% if mail_available %}
+<tr>
+  <th>Mail</th>
+  <td><span class="status {{ 'ok' if services.mail_feature and services.mail_worker and services.mail_worker_runtime else 'degraded' }}">{{ 'freigegeben' if services.mail_feature and services.mail_worker and services.mail_worker_runtime else 'pausiert' if services.mail_feature and services.mail_worker else 'deaktiviert' }}</span></td>
+  <td>
+    benutzerbezogener IMAP-Import
+    {% if services.mail_feature and services.mail_worker %}
+    <form method="post" action="{{ request.app.url_path_for('admin_worker_control', worker_name='mail_worker') }}" class="inline-form topgap">
+      <input type="hidden" name="enabled" value="{{ '0' if services.mail_worker_runtime else '1' }}">
+      <button class="small {{ 'danger-outline' if services.mail_worker_runtime else '' }}" type="submit">{{ 'Pausieren' if services.mail_worker_runtime else 'Freigeben' }}</button>
+    </form>
+    {% endif %}
+  </td>
+</tr>
+{% endif %}
+{% if web_research_available %}<tr><th>Web Research</th><td><span class="status {{ 'ok' if services.web else 'degraded' }}">{{ 'aktiviert' if services.web else 'deaktiviert' }}</span></td><td>globale Engine-Konfiguration</td></tr>{% endif %}
 <tr><th>Credential Store</th><td><span class="status {{ 'ok' if security_ok else 'degraded' }}">{{ 'verschlüsselt' if security_ok else 'prüfen' }}</span></td><td><a href="{{ request.app.url_path_for('admin_security') }}">Sicherheitsstatus</a></td></tr>
 </tbody></table>
 </section>
 
+{% if graph_enabled %}
 <section>
 <h2>Graph-Qualität</h2>
 <div class="cards small">
@@ -40,4 +72,5 @@
   <div class="card"><span>NOT_SAME_AS</span><strong>{{ stats.not_same_as_decisions }}</strong></div>
 </div>
 </section>
+{% endif %}
 {% endblock %}

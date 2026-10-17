@@ -8,18 +8,18 @@ Each direct subdirectory is one selectable model:
 
 ```text
 models/
-  standard/   # user-visible name: Schnell
+  standard/   # documentation name: Standard; current German label: Schnell
     profile.yaml
     prompts/
       retrieval_planner.txt
       candidate_verifier.txt
       evidence_decision.txt
       rag_answer.txt
-  thorough/   # user-visible name: Gründlich
+  thorough/   # documentation name: Thorough; current German label: Gründlich
     profile.yaml
     prompts/
       ...
-  deep/       # user-visible name: Tief
+  deep/       # documentation name: Deep; current German label: Tief
     profile.yaml
     prompts/
       ...
@@ -66,7 +66,7 @@ one retrieval round, Evidence Review is off, and planner thinking remains off.
 For remote LLM roles these profile budgets remain subject to separate
 administrator-controlled `SUNAQ_REMOTE_HARD_*` ceilings. The shipped ceilings are
 intentionally at least as high as the shipped profile budgets so they remain a
-safety boundary rather than silently collapsing Schnell, Gründlich and Tief back
+safety boundary rather than silently collapsing Standard (Schnell), Thorough (Gründlich) and Deep (Tief) back
 to the same window. Preserved 0.8.5 `REMOTE_*` values are treated as explicit
 tighter caps for upgrade safety; review, remove or raise those legacy overrides
 only when the larger profile budget is intentionally allowed to leave the host.
@@ -92,7 +92,7 @@ The shipped `sunaq-standard` profile has `legacy_config_overlay: true` as a
 0.8.5 compatibility bridge. If an upgraded installation still contains the old
 request-local sections in `config.yaml`, those values override the
 corresponding Standard profile values only. Other SunaQ models are unaffected.
-Fresh 0.8.6 configurations contain no such legacy sections, so the bridge is
+Fresh 0.8.7-rc1 configurations contain no such legacy sections, so the bridge is
 inert.
 
 Once an upgraded installation has intentionally transferred its tuning into the
@@ -109,7 +109,7 @@ Example:
 
 ```yaml
 deployment_overrides:
-  super-light:
+  dockerized:
     retrieval_planner:
       verification_candidate_limit: 10
     graph_retrieval:
@@ -118,9 +118,84 @@ deployment_overrides:
       backend: none
 ```
 
-This lets Super-Light keep Neo4j for entity/alias expansion while forbidding the
-Graph document arm and heavyweight reranking. Deployment overrides are merged
+Deployment-specific overrides may tune packaging-sensitive defaults without
+conflating deployment with the architecture tier. The shipped profiles use the
+`dockerized` override only for budget-preserving settings; SRC/ERG policy gates
+still determine the effective retrieval arms. Deployment overrides are merged
 over the model's own section values during startup compilation.
+
+## Research backends per SunaQ model
+
+A user-selectable SunaQ model is the unit for both research budgets and
+**authorized research capabilities**. The global administrator-owned registry
+defines available backend IDs, URLs, credentials and hard limits. The model
+selects one registered backend for Web research; it cannot construct, enable or
+change a backend. A user's allowed model list remains a separate admin grant.
+
+Two kinds must stay separate:
+
+| Kind | Candidate adapters | Result ownership |
+| --- | --- | --- |
+| Web Retrieval | Brave Search, future Brave LLM Context | Web evidence; SunaQ verifies and produces the answer |
+| Delegated Research | OpenAI Web Search, future Gemini or Brave Answers | External service produces answer and citations; SunaQ controls provenance, egress and chat persistence |
+
+The current packaging is turn-oriented rather than hiding provider
+switches below one generic Web button:
+
+- normal SunaQ models (for example Standard/Thorough/Deep (Schnell/Gründlich/Tief)) may expose native Web
+  Retrieval such as Brave Search alongside internal sources;
+- Delegated Research should normally be exposed as a separate user-visible
+  SunaQ model (for example "OpenAI Research"), making cost and external
+  processing an explicit turn-level choice;
+
+The Nextcloud client keeps the same conversation id and sends the accumulated
+message history with whichever SunaQ model is selected for the next turn.
+Users can therefore move between normal SunaQ models and Delegated Research
+without starting a new chat. The selected model determines
+the current turn's capability envelope; it does not own the conversation.
+
+Profile fragment (supported by the current registry):
+
+~~~yaml
+capabilities:
+  documents: true
+  web: true
+research:
+  web_backend: openai-research
+~~~
+
+'config.yaml' would register 'openai-research' separately. The model only
+references that ID; the effective grant is intersected with architecture tier,
+global configuration and per-user permission. If the ID is invalid, absent,
+or disabled, the request must fail closed rather than silently selecting an
+alternative provider. No provider-specific API keys belong in profile YAML.
+
+**Current status:** Profile 'research.web_backend' selects a named entry from the
+administrator-owned 'config.yaml:research_backends' registry. Implemented
+adapters are 'brave_search' (existing native Web pipeline configured in
+web.yaml) and 'openai' (hosted Web Search). Model packages without an explicit
+binding retain the global 'delegated_research' or
+'SUNAQ_RESEARCH_PROVIDER' choice for upgrade compatibility.
+
+A model can set 'capabilities.web: false' or 'research.web_backend: none' to
+disable Web. Unknown/disabled backends are rejected, never silently replaced.
+The Nextcloud 0.3.16 UI updates visible source selectors on model changes.
+Existing clients remain server-authorized but may show outdated selectors.
+
+**Current egress status:** The shared outbound policy is implemented with
+`research_query`, `model_processing` and `embedding` classes. Research
+queries default to deterministic `guard`; model processing defaults to
+non-destructive `audit`; embeddings default to `allow`. Administrators may
+set any class to `allow`, `audit`, `guard` or `block`.
+
+**Not yet implemented:** Gemini, Brave LLM Context, Brave Answers and combined
+Documents+Web through a delegated Research Provider. Combined requests for a
+delegated backend still fail explicitly rather than silently switching engines.
+The preferred UX is to use native Brave Web Retrieval in normal models and
+switch to a dedicated Delegated Research model for a separate turn in the same
+chat.
+
+See docs/RETRIEVAL-ARCHITECTURE.md sections 3.5-3.9.
 
 ## LLM roles
 
@@ -154,8 +229,9 @@ roles:
 `prompts` maps logical prompt slots to files within the model directory. A
 simple filename resolves below `models/<model>/prompts/`.
 
-The four core research slots currently packaged per model are:
+The core research slots currently packaged per model are:
 
+- `query_rewriter` -> backend-neutral SearchSpec generation;
 - `planner` -> retrieval/query planning;
 - `verifier` -> candidate document verification;
 - `evidence` -> evidence-control decision;
@@ -171,23 +247,23 @@ engineering for the research roles.
 
 The shipped user-facing order is deterministic:
 
-1. **Schnell** (`sunaq-standard`, order 10)
-2. **Gründlich** (`sunaq-thorough`, order 20)
-3. **Tief** (`sunaq-deep`, order 30)
+1. **Standard (Schnell)** (`sunaq-standard`, order 10)
+2. **Thorough (Gründlich)** (`sunaq-thorough`, order 20)
+3. **Deep (Tief)** (`sunaq-deep`, order 30)
 
 The internal IDs remain stable even if a display label changes. The legacy
 provider model ID `nextcloud-hybrid-rag` remains an alias of
 `sunaq-standard`.
 
-For the current 0.8.6-rc1 experiment, all three profiles deliberately use
+For the current 0.8.7-rc1 release candidate, all three profiles deliberately use
 **one retrieval round**, `evidence_control.mode: off` and planner
 `thinking: false`. The intended difference is budget only:
 
 | Display name | Model ID | Candidate/verifier window | Answer context |
 | --- | --- | ---: | ---: |
-| Schnell | `sunaq-standard` | 10 | 10 docs / 25k chars |
-| Gründlich | `sunaq-thorough` | 30 | 30 docs / 100k chars |
-| Tief | `sunaq-deep` | 50 | 50 docs / 200k chars |
+| Standard (Schnell) | `sunaq-standard` | 10 | 10 docs / 25k chars |
+| Thorough (Gründlich) | `sunaq-thorough` | 30 | 30 docs / 100k chars |
+| Deep (Tief) | `sunaq-deep` | 50 | 50 docs / 200k chars |
 
 This isolation is intentional. Additional retrieval rounds and model thinking
 are separate experiments and are not part of rc1's shipped behaviour.
@@ -198,8 +274,8 @@ A hard limit warning is emitted only when known candidates were not checked.
 
 ## Per-user access
 
-`sunaq-standard` / **Schnell** is the safe default entitlement. Gründlich and
-Tief are opt-in per canonical user through SunaQ Admin. The authenticated
+`sunaq-standard` / **Standard (Schnell)** is the safe default entitlement. Thorough (Gründlich) and
+Deep (Tief) are opt-in per canonical user through SunaQ Admin. The authenticated
 `/v1/models` response exposes only models currently allowed for that user.
 
 Follow-up actions may suggest rerunning the same query with a stronger model,
@@ -210,7 +286,7 @@ never suggest itself as an upgrade.
 
 The model registry and prompt files are loaded at API/provider process startup.
 After changing a profile package, restart the normal API/provider processes
-before testing it. In Dockerized Super-Light, `models/` is mounted read-only
+before testing it. In the Dockerized deployment, `models/` is mounted read-only
 into both API and provider containers, so the normal Maintenance ON/OFF
 recreate cycle reloads administrator-owned profile and model-specific prompt
 changes; an image rebuild is not required for those files.

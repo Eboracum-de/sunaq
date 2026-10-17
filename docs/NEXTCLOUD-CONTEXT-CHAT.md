@@ -1,6 +1,6 @@
 # Relationship to Nextcloud Context Chat
 
-**Reference:** `0.8.6-rc1`  
+**Reference:** `0.8.7-rc1`  
 **External facts checked:** 2026-09-19
 
 Nextcloud Context Chat is the most relevant comparison for SunaQ because it is Nextcloud's own native RAG/search assistant solution. This document is not a feature-ranking or a claim that one architecture is universally better. The two projects optimize for different operating assumptions.
@@ -25,7 +25,7 @@ Context Chat is therefore the natural first choice to evaluate for a current Nex
 
 ## 2. Different authorization strategy
 
-AKI deliberately does not copy Nextcloud ACL state into its retrieval stores as the final authorization source.
+SunaQ deliberately does not copy Nextcloud ACL state into its retrieval stores as the final authorization source.
 
 Its core model is:
 
@@ -52,7 +52,7 @@ Nextcloud's current administration manual explicitly states that Context Chat do
 
 SunaQ uses a different authorization model rather than claiming a generally stronger one. Each concrete candidate is checked through Nextcloud WebDAV with the current user's own Nextcloud credential. This deliberately reuses the same access path used by ordinary WebDAV clients and mounted/synchronized Nextcloud file access instead of maintaining an independent authorization copy inside the RAG index.
 
-The practical consequence is architectural: AKI attempts to inherit the security decisions of the already-operated Nextcloud/WebDAV environment at request time. Deployments using unusual request-dependent `files_accesscontrol` rules should nevertheless include those rules in their acceptance test, because such policies can depend on request properties such as source address, URL, time or user agent.
+The practical consequence is architectural: SunaQ attempts to inherit the security decisions of the already-operated Nextcloud/WebDAV environment at request time. Deployments using unusual request-dependent `files_accesscontrol` rules should nevertheless include those rules in their acceptance test, because such policies can depend on request properties such as source address, URL, time or user agent.
 
 The live check is batched. With the current default `acl.batch_size: 100`, a set of 50 candidate file IDs is checked in a single WebDAV `SEARCH` request, not 50 individual requests. The cost is therefore normally one authenticated Nextcloud round trip per bounded candidate batch.
 
@@ -88,13 +88,13 @@ SunaQ is also UI-agnostic. The bundled SunaQ Recherche app is one client, while 
 
 That flexibility moves trust to the provider-client boundary. A trusted client API key authenticates the integration server, not the person using its UI; the integration supplies the external user identity that is mapped to the corresponding server-side Nextcloud credential. Client keys must therefore remain server-side. For exposed integrations, reverse-proxy network allowlists, mTLS or equivalent controls are useful defense in depth in addition to the provider key.
 
-This makes AKI relevant to existing/heterogeneous installations and operators who accept more hands-on administration in exchange for control over retrieval, integration and model placement.
+This makes SunaQ relevant to existing/heterogeneous installations and operators who accept more hands-on administration in exchange for control over retrieval, integration and model placement.
 
-It does **not** make AKI a substitute for the broader maturity, native UI integration, support path or ecosystem of Context Chat.
+It does **not** make SunaQ a substitute for the broader maturity, native UI integration, support path or ecosystem of Context Chat.
 
 ## 5. Shared knowledge versus evidence
 
-AKI intentionally allows organization-wide reuse of curated identity/alias knowledge and shared Finding curation. The benefit is that users do not repeat the same Graph-Lite work.
+SunaQ intentionally allows organization-wide reuse of curated identity/alias knowledge and shared Finding curation. The benefit is that users do not repeat the same Graph-Lite work.
 
 That shared state is retrieval/curation knowledge, not a grant to read its supporting source.
 
@@ -105,13 +105,13 @@ A user can benefit from an alias first established by another user's work; any d
 | Topic | Nextcloud Context Chat | SunaQ |
 |---|---|---|
 | Primary position | native Nextcloud Assistant/RAG stack | independent middleware for existing Nextcloud/FTS estates |
-| Current minimum Nextcloud in official docs | 32 | AKI app/docs target 23+; deployment compatibility must be acceptance-tested per installation |
+| Current minimum Nextcloud in official docs | 32 | SunaQ app/docs target 23+; deployment compatibility must be acceptance-tested per installation |
 | Retrieval store | Context Chat backend knowledge/index stack | existing Elasticsearch first; optional Qdrant/Neo4j |
 | Authorization model | access scope represented in Context Chat content/index lifecycle | current Nextcloud visibility checked live for concrete file candidates |
 | Frontend | native Assistant integration | SunaQ Recherche or separate OpenAI-compatible frontends; composable with other tools when explicitly trusted |
 | Request process | Nextcloud task/background infrastructure; background workers recommended for faster pickup | independent long-running API/provider request path |
 | Model placement | configurable Nextcloud task-processing providers | role-specific, model-agnostic local/remote backends |
-| Graph-Lite curation | not an AKI-equivalent design goal | explicit optional AKI subsystem |
+| Graph-Lite curation | not an SunaQ-equivalent design goal | explicit optional SunaQ subsystem |
 | Operational maturity | official Nextcloud project/ecosystem | release-candidate project with limited external usage |
 
 The table describes project shape, not a quality score.

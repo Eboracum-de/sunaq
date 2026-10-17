@@ -1,0 +1,39 @@
+FROM python:3.13-slim-bookworm
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    PYTHONPATH=/app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --gid 10001 rag \
+    && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/rag --shell /usr/sbin/nologin rag
+
+WORKDIR /app
+
+# Private enterprise/internal CA certificates supplied by the installer live here.
+# The directory always exists, but may contain only the harmless .keep placeholder.
+COPY runtime/ca/ /usr/local/share/ca-certificates/rag-custom/
+RUN update-ca-certificates
+
+COPY requirements-dockerized.txt /tmp/requirements-dockerized.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-dockerized.txt
+
+COPY rag/ /app/rag/
+COPY prompts/ /app/prompts/
+COPY models/ /app/models/
+COPY ontology/ /app/ontology/
+
+# Site configuration is runtime state and is bind-mounted by Compose. Do not
+# bake config.yaml/web.yaml into the image: besides avoiding stale configuration,
+# this keeps the image-side mount targets type-neutral for fresh installations.
+RUN mkdir -p /app/runtime \
+    && chown -R rag:rag /app /home/rag
+
+USER rag

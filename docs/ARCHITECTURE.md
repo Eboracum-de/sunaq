@@ -1,9 +1,10 @@
 # SunaQ architecture
-## Architecture and design baseline 0.8.6-rc1.2
+## Architecture and design baseline 0.8.7-rc1
 
-**Updated:** 24 September 2026  
-**Status:** Release Candidate  
-**Reference version:** `0.8.6-rc1.2`
+**Updated:** 9 October 2026  
+**Status:** 0.8.7-rc1 release-candidate architecture
+
+For the rationale behind the trust envelopes and design choices, see [WHITEPAPER.md](WHITEPAPER.md).
 
 ---
 
@@ -36,48 +37,91 @@ The model layers are independently configurable. Embedding models, rerankers and
 
 ### 1.1 SRC and ERG capability layers
 
-The codebase enforces two architecture tiers:
+The codebase enforces three architecture envelopes for the retrieval/data plane:
 
 ```text
 A — Secure RAG Core (SRC)
-    Nextcloud documents
+    Nextcloud Documents
             ↓
-    FullTextSearch / Elasticsearch (files only)
+    deterministic Files compiler
             ↓
-       live Nextcloud ACL (mandatory)
+    FullTextSearch / Elasticsearch
             ↓
- local or administrator-approved LLM roles
-    one retrieval round
+       live Nextcloud ACL
+            ↓
+         verifier/answer
 
-B — Eboracum Research Gate (ERG)
-    SRC foundation + selected extensions
+B — ERG Internal
+    SRC + locally controlled derived state
             ↓
-    Mail / Web / Chat archives
-    broader external egress surfaces
-    live Web research / Playwright
-    Qdrant / semantic retrieval
-    Findings / Graph-Lite / document graph
-    additional retrieval rounds
+    optional Qdrant / local resolver / Findings / archives
+            ↓
+       live Nextcloud ACL for private documents
+
+C — ERG Full
+    ERG Internal + explicitly granted external research/resolution
+            ↓
+    Brave/Web Retrieval / Delegated Research / external resolver adapters
 ```
 
-SRC is a runtime contract in rc1.2, not a marketing label. Incompatible
-configuration fails validation; omitted retrieval arms are normalized to
-`files`; deterministic document selectors are filtered to ordinary Documents;
-and ERG-only internal endpoints are unavailable. Neo4j may still provide
-administrator-owned seed/alias context without becoming a document-evidence arm.
-Remote LLM routing is an administrator-controlled egress choice within either
-tier; SRC does not require zero model egress, and remote evidence caps remain
-mandatory whenever a role endpoint is classified as remote.
+SRC is a runtime contract, not a marketing label. Incompatible configuration
+fails validation; ordinary Documents are the only evidence source, `files` is
+the only document-retrieval arm and graph/query-context surfaces are unavailable.
+SRC is intentionally a first-class lexical architecture: planner output is
+backend-neutral structured intent, and deterministic middleware compiles that
+intent into Elasticsearch/FullTextSearch requests. Vector retrieval is not
+required to repair weak Files semantics.
 
-ERG remains a menu rather than a monolithic advanced mode. Enabling an ERG
-capability can add retained state, untrusted input, external egress,
-latency/resource cost or lifecycle obligations.
+ERG Internal adds locally controlled derived state and therefore additional
+lifecycle/provenance obligations. ERG Full adds external research and resolver
+boundaries and therefore additional egress/provider obligations. Neither tier
+changes the rule that private document evidence needs current live Nextcloud
+authorization.
 
-Super-Light ships as formal SRC in rc1.2. The full reference configuration is
-ERG for upgrade compatibility with installations that already used optional
-capabilities. See [SRC-ERG.md](SRC-ERG.md).
+Remote LLM routing is an orthogonal administrator-controlled processing choice;
+SRC does not require zero model egress. Deployment packaging is orthogonal as well: `--architecture-tier` selects the normative SRC / ERG Internal / ERG Full boundary, `core|workgroup|full` are recommended capability presets, and `standard|dockerized` select deployment.
 
-### 1.2 Policy/inspection boundaries
+See [SRC-ERG.md](SRC-ERG.md) for the normative envelope and preset mapping.
+
+### 1.2 Resolver adapters and portable research artifacts
+
+ERG resolver adapters own provider-specific schemas and normalization. The core
+does not add provider fields (for example OpenRegister financial or
+representation structures) to the generic retrieval policy.
+
+An adapter may return a bounded generic research-artifact envelope alongside
+its normalized enrichment:
+
+- inline text artifacts, such as a cleaned provider snapshot or portable CSV;
+- remote primary-source artifacts identified by an HTTPS URL that is consumed
+  transiently and never persisted;
+- optional Markdown supplied by the adapter for inclusion in the human-readable
+  research summary.
+
+The provider core knows only how to validate/download the generic envelope,
+write artifacts below the current Nextcloud ResearchRun and link them from
+`recherche.md`. Provider-specific interpretation stays in the adapter.
+
+For OpenRegister the current projection is:
+
+```text
+sources/openregister/<external-id>/
+    details.json       # cleaned structured provider snapshot
+    facts.csv          # portable path/value projection
+    openregister-source-XX.pdf
+```
+
+The important structured rows are also rendered into `recherche.md`, so a
+synchronized dossier remains useful without a running Neo4j instance or
+Nextcloud UI. The separate OpenRegister Neo4j graph is an optional derived
+index/exploration view, not the sole evidence store and not an automatic
+general-purpose retrieval arm.
+
+Archive roots remain excluded from ordinary implicit document retrieval; this
+prevents SunaQ from silently feeding its own prior research back as independent
+primary evidence. Reuse of an archived dossier remains explicit.
+
+### 1.3 Policy/inspection boundaries
 
 rc1.1 now wires a small, shared hook contract into the boundaries where SunaQ
 sends data outward, fetches untrusted content or writes imported/generated
@@ -86,7 +130,7 @@ content back to Nextcloud. The stages are `outbound_query`, `pre_fetch`,
 
 The shipped evaluator remains deliberately a no-op: every stage returns
 `ALLOW`, so the hooks do not claim malware, DLP or reputation filtering.
-rc1.2 adds non-optional application-level SSRF/network destination enforcement
+The current line retains non-optional application-level SSRF/network destination enforcement
 for Web and Playwright independently of this hook scaffold. Concrete scanner/DLP
 adapters remain optional future extensions. Evaluator failures are not swallowed,
 allowing a configured required adapter to fail closed.
@@ -140,8 +184,8 @@ Public Web discovery, fetch, passage selection, relevance review and archiving a
 ### 3.6 SunaQ profiles are research policies, not LLM identities
 
 The OpenAI-compatible `/v1/models` endpoint exposes SunaQ research profiles rather
-than raw backend-model names. The shipped rc1 profiles are **Schnell**,
-**Gründlich** and **Tief**.
+than raw backend-model names. The shipped rc1 profiles are **Standard (Schnell)**,
+**Thorough (Gründlich)** and **Deep (Tief)**.
 
 All three currently use one retrieval round, Evidence Review off and planner
 thinking off. Their intentional difference is the amount of candidate
@@ -149,7 +193,7 @@ verification and answer context they may consume. This keeps the first profile
 experiment attributable to budget rather than mixing budget, extra retrieval
 rounds and model reasoning.
 
-Model access is server-side and per canonical user. Schnell is the default;
+Model access is server-side and per canonical user. Standard (Schnell) is the default;
 stronger profiles are opt-in. A follow-up action may recommend a stronger model
 only when that model is actually allowed for the current user.
 
@@ -272,7 +316,7 @@ evaluator returns `ALLOW` for all stages; concrete adapters remain deferred.
 
 | Component | Responsibility | Authorizes private document access? |
 |---|---|---:|
-| Query Rewriter | creates SearchSpec and lightweight analysis fields | No |
+| Query Rewriter | creates backend-neutral SearchSpec intent (entities, concepts, concept groups, constraints, semantic query) | No |
 | Neo4j | seed/alias/entity context; optional graph retrieval and curation | No |
 | Elasticsearch | lexical candidate discovery | No |
 | Qdrant | semantic candidate discovery | No |
@@ -282,7 +326,7 @@ evaluator returns `ALLOW` for all stages; concrete adapters remain deferred.
 | Answer model | answer generation from authorized evidence | No |
 | Brave/SearXNG | public URL discovery | N/A |
 | Web relevance gate | source relevance after actual fetch | N/A |
-| Planned policy/inspection hooks (rc1.2) | optional outbound-query, pre-fetch, post-fetch, pre-persist and remote-model-egress policy/inspection | No |
+| Policy/inspection hook scaffold | optional outbound-query, pre-fetch, post-fetch, pre-persist and remote-model-egress policy/inspection | No |
 
 ---
 
@@ -290,40 +334,61 @@ evaluator returns `ALLOW` for all stages; concrete adapters remain deferred.
 
 ### 6.1 Normal path
 
-Each retrieval round uses the same interface:
+The planner describes semantic intent; it does not own backend query syntax.
 
-1. A compact Neo4j seed/alias context may be loaded before rewrite.
-2. The user question is rewritten into one `SearchSpec`.
-3. `elastic_query` is parsed and compiled deterministically into Elasticsearch JSON.
-4. `semantic_query` is sent to Qdrant when enabled.
-5. Candidate lists are fused and deduplicated.
-6. An optional reranker may reorder the bounded candidate set.
-7. Live Nextcloud ACL removes unauthorized files.
-8. The Candidate Verifier may check direct document support.
-9. The answer model receives only selected evidence.
+For the normal Files path:
+
+1. The Provider rewrites the user request into one backend-neutral `SearchSpec`.
+2. The deterministic Files compiler converts entities, concept groups and safe
+   literal constraints into Elasticsearch JSON.
+3. If ERG has an available/granted vector arm, `semantic_query` is sent to
+   Qdrant as an independent recall signal.
+4. Available retrieval arms are fused/deduplicated according to the active
+   profile.
+5. An optional reranker may reorder the bounded candidate set.
+6. Live Nextcloud ACL removes unauthorized private document candidates.
+7. The Candidate Verifier may check direct document support only on this
+   authorized set.
+8. Evidence control/answer selection operates on authorized verified evidence.
 
 Example:
 
-```text
-User:
-Find invoices from Example Ltd. from 2025
-
-SearchSpec:
-  elastic_query:  +Example +2025 +invoice
-  semantic_query: invoices from Example Ltd. from 2025
-  entities:       Example Ltd.
-  concepts:       invoice
-  constraints:    year=2025
+```json
+{
+  "semantic_query": "invoices from Example Ltd. in 2025",
+  "entities": ["Example Ltd."],
+  "concepts": ["invoice"],
+  "concept_groups": [
+    {
+      "required": true,
+      "terms": ["invoice", "Rechnung"]
+    }
+  ],
+  "constraints": [
+    {"kind": "year", "value": "2025"}
+  ],
+  "verification_requirements": [
+    "The document itself is an invoice from Example Ltd."
+  ]
+}
 ```
 
-0.8.6 request budgets come from the selected SunaQ profile. The shipped rc1
-profiles use one retrieval round and candidate/answer windows of 10, 30 and 50
-documents for Schnell, Gründlich and Tief respectively. See
-`models/README.md` for the exact profile budgets and administrator hard caps.
+A deterministic compiler can turn this into logic equivalent to:
 
-`max_retrieval_rounds: 1` means one rewrite followed by one retrieval run.
+```text
+MUST "Example Ltd."
+MUST (invoice OR Rechnung)
+MUST 2025
+```
 
-If more rounds are configured, a later round may produce a revised SearchSpec from the bounded visible result picture. It still uses the same retrieval pipeline and configured backend policy.
+The planner never emits raw Elasticsearch DSL. The legacy `elastic_query`
+field is accepted only on compatibility paths and is not part of the current
+planner response contract.
+
+The shipped Standard (Schnell), Thorough (Gründlich) and Deep (Tief) profiles currently use one retrieval
+round with progressively larger verifier/answer budgets. See
+`models/README.md` and [TECHNICAL-REFERENCE.md](TECHNICAL-REFERENCE.md) for
+the exact current profile values.
 
 ### 6.2 Explicit retrieval directives
 
@@ -339,26 +404,41 @@ Neo4j seed/alias expansion is independent from the optional graph document-retri
 
 ---
 
-## 7. SearchSpec, QueryFrame, EvidenceFrame and RetrievalRecord
+## 7. SearchSpec, QueryFrame, EvidenceFrame and retrieval provenance
 
 ### 7.1 SearchSpec
 
-The SearchSpec is the executable retrieval description.
+SearchSpec is a structured semantic retrieval-intent contract. It is
+backend-neutral on the current planner path.
 
 Typical fields include:
 
 ```json
 {
-  "elastic_query": "+Example +2025 +invoice",
   "semantic_query": "invoices from Example Ltd. in 2025",
   "entities": ["Example Ltd."],
+  "entity_hints": [],
   "concepts": ["invoice"],
+  "concept_groups": [
+    {
+      "required": true,
+      "terms": ["invoice", "Rechnung"]
+    }
+  ],
   "constraints": [{"kind": "year", "value": "2025"}],
   "verification_requirements": [
     "The document itself is an invoice from Example Ltd."
   ]
 }
 ```
+
+Each concept group is OR over its terms. A required group becomes a deterministic
+MUST(OR(...)) condition in the Files compiler; an optional group contributes
+ranking/context. Safe literal constraints such as explicit years, identifiers
+or filenames may be compiled deterministically from the original request.
+
+The planner owns semantic classification and lexical alternatives. Middleware
+owns occurrence semantics and backend syntax.
 
 ### 7.2 QueryFrame
 
@@ -377,9 +457,33 @@ Important relation bindings include:
 - `contradicted` — the document supports a materially different relationship;
 - `unclear` — the document does not allow a reliable decision.
 
-### 7.4 RetrievalRecord
+### 7.4 Retrieval provenance
 
-Optional retrieval/evidence audit records:
+SunaQ separates pre-retrieval decision provenance from post-ACL execution
+provenance.
+
+**`retrieval-decision.v2.json`** records what was understood and granted:
+original/normalized query, structured planner intent, policy resolution and
+bounded effective budgets. It deliberately does not contain backend query
+syntax.
+
+**`retrieval-execution.v1.json`** records what was actually executed. Backend
+queries may be stored, but private document candidate provenance begins only
+after live Nextcloud ACL. The portable record therefore contains only
+ACL-authorized candidates, ranks expressed within the authorized candidate set,
+verifier decisions for those authorized candidates and final selected
+documents. Raw ES hit counts, identities of denied candidates, pre-ACL backend
+ranks and scores are excluded because they can reveal hidden repository state.
+
+**`documents.json`** records the authorized documents that actually reached
+the answer context and follows the same post-ACL rank rule.
+
+Protected server logs may retain richer pre-ACL diagnostics for operators under
+the normal log-access policy. They are not part of portable ResearchRun
+provenance.
+
+Optional local RetrievalRecord files remain available for development/audit
+work:
 
 ```yaml
 retrieval_record:
@@ -387,9 +491,8 @@ retrieval_record:
   directory: "runtime/retrieval-records"
 ```
 
-They store structured query, SearchSpec/QueryFrame, document references, verifier metadata and EvidenceFrames, but not complete document bodies.
-
-A QueryFrame must not be imported automatically as a graph fact.
+A QueryFrame is a search hypothesis and must not be imported automatically as a
+graph fact.
 
 ---
 
@@ -415,7 +518,7 @@ reranker:
   fallback_backend: none
 ```
 
-Super-Light can operate without a reranker. Deduplication remains a separate preprocessing step.
+Dockerized SRC can operate without a reranker. Deduplication remains a separate preprocessing step.
 
 ---
 
@@ -569,8 +672,7 @@ Search snippets are discovery metadata and are not answer evidence.
 
 ### 11.2 Evidence pipeline
 
-Current rc1.2 execution is shown together with the policy-hook insertion points
-points:
+Current execution is shown together with the policy-hook insertion points:
 
 ```text
 derived/public search query
@@ -627,9 +729,7 @@ Archive roots are excluded from ordinary internal retrieval so archived public m
 
 Playwright rendering is optional and produces a readable research snapshot, not a complete WARC/WACZ forensic capture.
 
-Web-archive writes pass the rc1.1 `pre_persist` hook; rc1.2 should attach configurable policy adapters
-after content inspection and before SunaQ writes the archive artifact into
-Nextcloud. This allows a deployment to attach malware/content/DLP policy without
+Web/archive writes pass the `pre_persist` hook after content inspection and before SunaQ writes the archive artifact into Nextcloud. Concrete scanner/DLP adapters remain administrator-supplied; the shipped hook scaffold itself does not claim such scanning. This allows a deployment to attach malware/content/DLP policy without
 coupling the archive implementation to one scanner.
 
 ---
@@ -685,7 +785,7 @@ authority*:
 | Research Findings / graph extraction, when enabled | **Yes** | persistent knowledge pollution is possible |
 | Web-after queries, when enabled | **Yes** | possible query-egress manipulation; separate policy boundary |
 
-The shipped 0.8.6-rc1.2 profiles use one retrieval round. Corpus text therefore
+The shipped Standard/Thorough/Deep (Schnell/Gründlich/Tief) profiles currently use one retrieval round. Corpus text therefore
 does not feed back into their query rewriter during the same request. A future
 multi-round profile intentionally changes that assumption and must be evaluated
 as a larger prompt-injection surface.
@@ -849,17 +949,13 @@ graph_queue:
 
 This permits a component to be configured without automatically starting periodic CPU-intensive or privacy-sensitive processing.
 
-The current release line tests:
+The current release line separates three concepts:
 
-- `standard + native`;
-- `super-light + dockerized`.
+- **architecture tier** — SRC / ERG Internal / ERG Full, the normative policy boundary;
+- **capability preset** — `core|workgroup|full`, a recommended component bundle within a tier;
+- **deployment mode** — Standard/native or Dockerized/containerized.
 
-These are combinations of two independent axes:
-
-- **functional profile** — enabled retrieval/graph/UI capabilities;
-- **deployment mode** — native or containerized service operation.
-
-Super-Light uses the same middleware core and can remain Elasticsearch-centric without Qdrant or a local reranker.
+Both deployment modes use the same middleware core and architecture policy. Optional local components are selected independently where supported; packaging choices are not architecture-tier definitions.
 
 ---
 
@@ -898,11 +994,11 @@ This is recovery, not a unified purge/rollback transaction: SunaQ does not atomi
 
 ## 19. Current release-candidate boundaries
 
-`0.8.6-rc1` is the current release-candidate baseline.
+`0.8.7-rc1` is the current release-candidate baseline.
 
 Known limits include:
 
-- only `standard+native` and `super-light+dockerized` are released/tested deployment combinations;
+- Standard/native and Dockerized/containerized are the released deployment mechanisms; individual optional local components still have packaging-specific availability;
 - no unified cross-store purge/restore transaction;
 - no complete prompt-injection defense;
 - Web snapshots are research artifacts, not full WARC/WACZ captures;

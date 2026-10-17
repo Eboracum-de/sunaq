@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from rag.retrieval_planner import (
     detect_exhaustive_intent,
     is_strict_lexical_query,
@@ -5,6 +7,15 @@ from rag.retrieval_planner import (
     normalize_generated_probes,
     semanticize_query,
 )
+
+
+def test_query_rewriter_keeps_bare_entity_recall_oriented():
+    prompt = (
+        Path(__file__).resolve().parent.parent / "prompts" / "query_rewriter.txt"
+    ).read_text(encoding="utf-8")
+    assert "breite Informationssuche zu dieser Entität" in prompt
+    assert "Erfinde dann kein zusätzliches zwingendes Sachkonzept" in prompt
+    assert "The planner describes intent; it does not own Elasticsearch syntax." in prompt
 
 
 def test_config_yaml_rounds_override_legacy_env():

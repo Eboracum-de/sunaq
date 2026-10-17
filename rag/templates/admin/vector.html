@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Vektor · RAG Admin{% endblock %}
+{% block content %}
+<div class="heading-row">
+  <div>
+    <h1>Vektor / Qdrant</h1>
+    <p class="muted">Read-only Übersicht der konfigurierten Qdrant-Collection und des Elasticsearch→Qdrant-Syncs.</p>
+  </div>
+  <a class="button secondary" href="{{ request.app.url_path_for('admin_vector') }}">Neu prüfen</a>
+</div>
+
+<div class="cards">
+  <div class="card"><span>Elasticsearch</span><strong>{{ corpus.es_documents if corpus.es_documents is not none else '—' }}</strong><small>Dokumente im Index{% if corpus.es_count_ok %} · {{ corpus.es_count_latency_ms }} ms{% elif corpus.es_count_error %} · {{ corpus.es_count_error }}{% endif %}</small></div>
+  <div class="card"><span>Vektorisiert</span><strong>{{ corpus.vectorized_documents if corpus.vectorized_documents is not none else '—' }}</strong><small>Dokumente mit mindestens einem Vektor{% if corpus.last_sync_at %} · Stand {{ corpus.last_sync_at }}{% endif %}</small></div>
+  <div class="card"><span>Qdrant-Punkte</span><strong>{{ qdrant.points_count if qdrant.points_count is not none else '—' }}</strong><small>Chunks/Vektoren{% if corpus.chunks is not none %} · Sync-State {{ corpus.chunks }}{% endif %}</small></div>
+  <div class="card"><span>Sync</span><strong class="metric-small">{{ 'freigegeben' if worker.runtime_enabled else 'pausiert' }}</strong><small>Config: {{ 'an' if worker.configured else 'aus' }} · Intervall {{ worker.poll_interval_seconds }} s · Pause-Check alle {{ worker.pause_check_documents }} Dokumente</small></div>
+</div>
+
+<section>
+<h2>Sync-Worker</h2>
+<p>Der Worker-Prozess darf installiert/laufend sein, führt aber nur bei gesetzter Laufzeitfreigabe Synchronisationsläufe aus. Neue Installationen starten bewusst pausiert.</p>
+{% if worker.configured %}
+<form method="post" action="{{ request.app.url_path_for('admin_worker_control', worker_name='sync_worker') }}" class="inline-form">
+  <input type="hidden" name="enabled" value="{{ '0' if worker.runtime_enabled else '1' }}">
+  <button class="{{ 'danger-outline' if worker.runtime_enabled else '' }}" type="submit">{{ 'Sync pausieren' if worker.runtime_enabled else 'Sync freigeben' }}</button>
+  <span class="muted">max_documents={{ worker.max_documents }} · enqueue_graph={{ 'an' if worker.enqueue_graph else 'aus' }}</span>
+</form>
+{% else %}
+<p class="muted">Sync-Worker ist in config.yaml nicht aktiviert.</p>
+{% endif %}
+</section>
+
+<section>
+<h2>Abdeckung des Vektorkorpus</h2>
+<p class="muted">Der Elasticsearch-Zähler ist der rohe Indexbestand. Unterschiede zum Vektorkorpus können durch Pfadfilter, semantische Ausschlüsse (z. B. Archive/Rohmail), leeren extrahierten Text oder zurückgestellte Embeddings entstehen. Die Übersicht fragt Nextcloud nicht ab.</p>
+<dl class="details">
+  <dt>Letzter Sync</dt><dd>{{ corpus.last_sync_at or '—' }}{% if corpus.last_sync_at %} · {{ 'vollständiger Lauf' if corpus.complete_full_scan else 'Teil-/Scope-Lauf' }}{% endif %}</dd>
+  <dt>Im Lauf gescannt</dt><dd>{{ corpus.scanned if corpus.scanned is not none else '—' }}</dd>
+  <dt>Für Semantik zugelassen</dt><dd>{{ corpus.eligible_seen if corpus.eligible_seen is not none else '—' }}</dd>
+  <dt>Im letzten Lauf ausgeschlossen</dt><dd>{{ corpus.excluded_semantic if corpus.excluded_semantic is not none else '—' }}</dd>
+  <dt>Im letzten Lauf außerhalb Scope</dt><dd>{{ corpus.out_of_scope if corpus.out_of_scope is not none else '—' }}</dd>
+  <dt>Ohne Vektor (leer)</dt><dd>{{ corpus.empty_documents if corpus.empty_documents is not none else '—' }}</dd>
+  <dt>Im letzten Lauf zurückgestellt</dt><dd>{{ corpus.embedding_deferred if corpus.embedding_deferred is not none else '—' }}</dd>
+</dl>
+</section>
+
+<section>
+<h2>Collection-Details</h2>
+<dl class="details">
+  <dt>Collection</dt><dd>{{ qdrant.collection }}</dd>
+  <dt>Status</dt><dd>{{ qdrant.status }}</dd>
+  <dt>Optimizer</dt><dd>{{ qdrant.optimizer_status or '—' }}</dd>
+  <dt>HNSW-indexierte Vektoren</dt><dd>{{ qdrant.indexed_vectors_count if qdrant.indexed_vectors_count is not none else '—' }} <span class="muted">(bei kleinen Collections kann 0 normal sein)</span></dd>
+  <dt>Vektorkonfiguration</dt><dd class="mono smalltext">{{ qdrant.vectors | tojson }}</dd>
+</dl>
+<details class="topgap"><summary>Qdrant Rohantwort</summary><pre class="preview">{{ qdrant.raw | tojson(indent=2) }}</pre></details>
+</section>
+{% endblock %}

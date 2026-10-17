@@ -7,7 +7,6 @@ import re
 import json
 from difflib import SequenceMatcher
 from pathlib import Path, PurePosixPath
-from urllib.parse import urlencode
 
 import httpx
 import yaml
@@ -37,6 +36,7 @@ from rag.logging_utils import get_logger
 from rag.query_specificity import is_broad_entity_query
 from rag.retrieval_planner import extract_safe_hard_constraints
 from rag.tls_compat import configure_tls_compat
+from rag.nextcloud_links import NextcloudVersionProbe, build_nextcloud_source_url
 from rag.retrieval_signal import (
     analyze_score_curve,
     choose_retrieval_strategy,
@@ -127,6 +127,8 @@ NEXTCLOUD_BASE_URL = (
     .rstrip("/")
 )
 
+_NEXTCLOUD_VERSION_PROBE = NextcloudVersionProbe(NEXTCLOUD_BASE_URL, config)
+
 # Public web snapshots remain in Nextcloud for provenance, but by default they
 # are not candidates in the ordinary internal evidence arms.
 INTERNAL_EXCLUDE_PATHS = internal_exclude_paths()
@@ -161,12 +163,12 @@ def _es_origin_clause(origins) -> dict:
 
 
 def _es_special_scope_clause(scope: str, roots_by_scope: dict[str, tuple[str, ...]]) -> dict:
-    origin_by_scope = {
-        "mailarchive": "mail_archive",
-        "webarchive": "web_archive",
-        "chatarchive": "chat_archive",
+    origins_by_scope = {
+        "mailarchive": ("mail_archive",),
+        # Legacy web_archive records are now part of the Chats source class.
+        "chatarchive": ("chat_archive", "web_archive"),
     }
-    should = [_es_origin_clause([origin_by_scope[scope]])]
+    should = [_es_origin_clause(origins_by_scope[scope])]
     # Path matching is deliberately only a recovery/legacy fallback. Native
     # source_origin is the normal retrieval filter; roots keep scopes usable
     # after an ES rebuild until the admin runs source-origin reconcile.
@@ -191,18 +193,20 @@ def _apply_source_scope_to_es(bool_query: dict, source_scopes=None) -> set[str] 
         log.warning("source_origin auto-mirror failed; continuing with path fallback: %s", exc)
     roots_by_scope = {
         "mailarchive": tuple(mail_archive_roots()),
-        "webarchive": tuple(web_archive_roots()),
-        "chatarchive": tuple(chat_archive_roots()),
+        "chatarchive": tuple(sorted(
+            set(chat_archive_roots()) | set(web_archive_roots()),
+            key=str.casefold,
+        )),
     }
 
     if scopes is None:
         # Client-neutral implicit default: ordinary documents only.
-        for scope in ("mailarchive", "webarchive", "chatarchive"):
+        for scope in ("mailarchive", "chatarchive"):
             bool_query["must_not"].append(_es_special_scope_clause(scope, roots_by_scope))
         return None
 
     selected_special = {scope for scope in scopes if scope != "documents"}
-    all_special = {"mailarchive", "webarchive", "chatarchive"}
+    all_special = {"mailarchive", "chatarchive"}
 
     if "documents" in scopes:
         # Ordinary documents are the complement of special origins.  Exclude
@@ -1236,28 +1240,12 @@ def nextcloud_source_url(
     directory: str,
     openfile: str | int | None,
 ) -> str:
-    """Build the canonical Nextcloud Files URL for a retrieval result."""
-
-    if not NEXTCLOUD_BASE_URL:
-        return ""
-
-    if openfile in (None, ""):
-        return ""
-
-    directory = (directory or "/").strip()
-    if directory != "/":
-        directory = "/" + directory.strip("/")
-
-    params = urlencode(
-        {
-            "dir": directory,
-            "openfile": str(openfile),
-        }
-    )
-
-    return (
-        f"{NEXTCLOUD_BASE_URL}"
-        f"/index.php/apps/files/?{params}"
+    """Build the version-compatible Nextcloud Files URL for a retrieval result."""
+    return build_nextcloud_source_url(
+        NEXTCLOUD_BASE_URL,
+        directory,
+        openfile,
+        major_version=_NEXTCLOUD_VERSION_PROBE.major_version(),
     )
 
 
@@ -2196,8 +2184,8 @@ def elastic_search(
 
     elastic_query = str(getattr(plan, "elastic_query", "") or "").strip()
     if search_spec_mode and elastic_query:
-        # rc3: execute the LLM-authored human-style Nextcloud expression with
-        # the same content/title semantics as the proven /elastic path.
+        # Legacy compatibility path only. New planner output is structured
+        # intent and reaches Elasticsearch through lexical_groups below.
         for token in nextcloud_query_tokens(elastic_query):
             clause = {
                 "bool": {
@@ -2218,6 +2206,30 @@ def elastic_search(
 
         for term in plan.should:
             bool_query["should"].append(lexical_term_clause(term))
+
+    # Structured planner intent is compiled here, never by the LLM. Each group
+    # is an OR over lexical alternatives. Required groups become MUST(OR(...));
+    # optional groups remain ranking signals.
+    for group in getattr(plan, "lexical_groups", []) or []:
+        if not isinstance(group, dict):
+            continue
+        alternatives = [
+            lexical_term_clause(str(term).strip())
+            for term in (group.get("terms") or [])
+            if str(term).strip()
+        ]
+        if not alternatives:
+            continue
+        clause = {
+            "bool": {
+                "should": alternatives,
+                "minimum_should_match": 1,
+            }
+        }
+        if bool(group.get("required")):
+            bool_query["must"].append(clause)
+        else:
+            bool_query["should"].append(clause)
 
 
     required_entity_groups = [
@@ -2392,6 +2404,11 @@ def elastic_search(
             },
         },
     }
+
+    if diagnostics is not None:
+        # Query text/DSL is safe execution provenance. Candidate counts/ranks
+        # remain server-internal until after live ACL.
+        diagnostics["compiled_query"] = body.get("query") or {}
 
 
     es_endpoint = (
@@ -4471,6 +4488,38 @@ def resolve_document_references(
 # Gesamte Suchpipeline
 # ------------------------------------------------------------
 
+_BACKEND_DISPLAY_NAMES = {
+    "files": "Dokumentensuche",
+    "vector": "Vektorsuche",
+    "graph": "Graph-Suche",
+}
+
+
+def _degraded_retrieval_message(
+    backend_status: dict[str, dict],
+    degraded: list[str],
+) -> str:
+    """Describe degraded retrieval without implying nonexistent fallback arms."""
+    unavailable = ", ".join(_BACKEND_DISPLAY_NAMES.get(name, name) for name in degraded)
+    healthy_requested = [
+        name
+        for name, state in backend_status.items()
+        if state.get("requested")
+        and state.get("enabled", True)
+        and state.get("available")
+    ]
+    if healthy_requested:
+        return (
+            f"Nicht verfügbar: {unavailable}. "
+            "Die übrigen verfügbaren Suchdienste wurden weiterhin verwendet, "
+            "lieferten für diese Anfrage jedoch keinen verwertbaren Treffer."
+        )
+    return (
+        f"Nicht verfügbar: {unavailable}. "
+        "Für diese Anfrage stand kein weiterer Suchdienst zur Verfügung."
+    )
+
+
 def perform_search(
     question: str,
     limit: int = FINAL_LIMIT,
@@ -4667,12 +4716,14 @@ def perform_search(
                 lambda: plan_from_search_spec(
                     search_spec,
                     entity_context=entity_context,
+                    original_query=question,
                     entity_recall=entity_recall,
                 ),
                 timings,
             )
             log.info(
-                "query rewrite effective: elastic_present=%s semantic_present=%s neo4j_expansions=%d",
+                "query intent effective: lexical_groups=%d legacy_elastic_present=%s semantic_present=%s neo4j_expansions=%d",
+                len(getattr(plan, "lexical_groups", []) or []),
                 bool(str(getattr(plan, "elastic_query", "") or "").strip()),
                 bool(str(getattr(plan, "semantic_query", "") or "").strip()),
                 len(getattr(plan, "entity_should_phrases", []) or []),
@@ -4745,9 +4796,14 @@ def perform_search(
                     "error": f"{type(exc).__name__}: {exc}",
                 }
                 timings.setdefault("elasticsearch", 0.0)
+                remaining_arms = sorted(active_arms - {"files"})
+                suffix = (
+                    f"; fahre mit verbleibenden Retrieval-Armen fort: {','.join(remaining_arms)}"
+                    if remaining_arms
+                    else "; kein weiterer Retrieval-Arm aktiv"
+                )
                 print(
-                    f"[RAG] WARNUNG Elasticsearch nicht verfügbar: {type(exc).__name__}: {exc}; "
-                    "fahre mit verbleibenden Retrieval-Armen fort",
+                    f"[RAG] WARNUNG Elasticsearch nicht verfügbar: {type(exc).__name__}: {exc}{suffix}",
                     flush=True,
                 )
         else:
@@ -5474,13 +5530,26 @@ def perform_search(
         ]
         if not final_results and degraded:
             retrieval_mode = "degraded_no_results"
-            retrieval_message = (
-                "Nicht verfügbar: "
-                f"{', '.join(degraded)}. Die übrigen verfügbaren Suchdienste wurden weiterhin verwendet, "
-                "lieferten für diese Anfrage jedoch keinen verwertbaren Treffer."
-            )
+            retrieval_message = _degraded_retrieval_message(backend_status, degraded)
         else:
             retrieval_message = ""
+
+        execution_queries: dict[str, dict] = {}
+        if "files" in active_arms and es_diagnostics.get("compiled_query"):
+            execution_queries["files"] = {
+                "backend": "elasticsearch",
+                "query": es_diagnostics.get("compiled_query"),
+            }
+        if "vector" in active_arms and QDRANT_ENABLED and str(getattr(plan, "semantic_query", "") or "").strip():
+            execution_queries["vector"] = {
+                "backend": "qdrant",
+                "query": str(getattr(plan, "semantic_query", "") or "").strip(),
+            }
+        if "graph" in active_arms and graph_diagnostics.get("resolved_entity_ids"):
+            execution_queries["graph"] = {
+                "backend": "neo4j",
+                "resolved_entity_ids": list(graph_diagnostics.get("resolved_entity_ids") or []),
+            }
 
         return {
 
@@ -5507,6 +5576,9 @@ def perform_search(
 
             "backend_status":
                 backend_status,
+
+            "execution_queries":
+                execution_queries,
 
             "retrieval_signal":
                 retrieval_signal,
@@ -6136,11 +6208,7 @@ def perform_multi_probe_search(
     ]
     if not final_results and degraded:
         retrieval_mode = "degraded_no_results"
-        retrieval_message = (
-            "Nicht verfügbar: "
-            f"{', '.join(degraded)}. Die übrigen verfügbaren Suchdienste wurden weiterhin verwendet, "
-            "lieferten für diese Anfrage jedoch keinen verwertbaren Treffer."
-        )
+        retrieval_message = _degraded_retrieval_message(backend_status, degraded)
     else:
         retrieval_mode = (
             "multi_probe_reranked" if reranker_used

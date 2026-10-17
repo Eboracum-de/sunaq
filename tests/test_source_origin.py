@@ -18,6 +18,15 @@ def test_hidden_mail_metadata_is_machine_metadata_and_excluded():
     assert is_internal_excluded_path("Mailarchiv/x/.mailmeta.json")
 
 
+def test_any_hidden_file_basename_is_machine_metadata_and_excluded():
+    assert classify_source_origin("Documents/.conversation.json") == "machine_metadata"
+    assert classify_source_origin("Documents/.notes.md") == "machine_metadata"
+    assert is_internal_excluded_path("Documents/.conversation.json")
+    # Only the basename is treated as hidden; a normal file below a dot-directory
+    # keeps its ordinary source classification.
+    assert classify_source_origin("Documents/.private/notes.md") == "internal"
+
+
 def test_per_user_web_archive_root_is_excluded(tmp_path, monkeypatch):
     import sqlite3
     import rag.source_origin as source_origin
@@ -68,3 +77,11 @@ def test_elasticsearch_queries_exclude_sunaq_sidecars_before_candidate_limit():
     root = Path(__file__).resolve().parent.parent
     source = (root / "rag" / "search.py").read_text(encoding="utf-8")
     assert source.count('{"wildcard": {"title.keyword": "*/.*.sunaq.json"}}') >= 2
+
+def test_legacy_web_archive_origin_is_retrieved_via_chatarchive_scope():
+    import rag.source_origin as source_origin
+
+    record = {"source_origin": "web_archive", "path": "Webarchiv/legacy/source.txt"}
+    assert source_origin.source_scope_allows_record("files:legacy", record["path"], {"chatarchive"}, indexed_origin=record["source_origin"])
+    assert not source_origin.source_scope_allows_record("files:legacy", record["path"], {"documents"}, indexed_origin=record["source_origin"])
+

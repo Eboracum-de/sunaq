@@ -1,6 +1,7 @@
 <?php
 namespace OCA\Sunaq\Controller;
 
+use OCA\Sunaq\Http\SseResponse;
 use OCA\Sunaq\Service\ChatStore;
 use OCA\Sunaq\Service\RagProxy;
 use OCP\AppFramework\Controller;
@@ -72,7 +73,12 @@ class ChatController extends Controller {
         }
 
         try {
-            $result = $this->proxy->chat($messages, $sourceScopes, $model, $requestId);
+            // The provider must receive the same stable conversation id that
+            // will later become the Nextcloud dossier directory. Do this
+            // server-side as well as in JavaScript so a stale browser asset
+            // cannot lose first-turn ResearchRun provenance.
+            $conversationId = $this->store->ensureConversationId($conversationId);
+            $result = $this->proxy->chat($messages, $sourceScopes, $conversationId, $model, $requestId);
             $stored = $messages;
             $assistantCreatedAt = gmdate('c');
             $assistant = [
@@ -91,17 +97,21 @@ class ChatController extends Controller {
             $result['message_created_at'] = $assistantCreatedAt;
             $result['chat_archive_enabled'] = !empty($archiveSettings['enabled']);
             if (!empty($archiveSettings['enabled'])) {
-                $chat = $this->store->save($conversationId, $stored, $sourceScopes);
-                $this->proxy->registerChatArchive(
-                    $chat['document_id'] ?? '',
-                    $chat['archive_path'] ?? ''
-                );
-                $result['conversation'] = [
-                    'id' => $chat['id'],
-                    'title' => $chat['title'],
-                    'updated_at' => $chat['updated_at'],
-                    'scopes' => $chat['scopes'],
-                ];
+                try {
+                    $chat = $this->store->save($conversationId, $stored, $sourceScopes);
+                    $this->proxy->registerChatArchive(
+                        $chat['document_id'] ?? '',
+                        $chat['archive_path'] ?? ''
+                    );
+                    $result['conversation'] = [
+                        'id' => $chat['id'],
+                        'title' => $chat['title'],
+                        'updated_at' => $chat['updated_at'],
+                        'scopes' => $chat['scopes'],
+                    ];
+                } catch (\Exception $archiveException) {
+                    $result['archive_warning'] = 'Antwort erstellt, Chatarchiv konnte jedoch nicht aktualisiert werden.';
+                }
             }
             return new DataResponse($result);
         } catch (\InvalidArgumentException $e) {
@@ -112,6 +122,121 @@ class ChatController extends Controller {
             return new DataResponse(['error' => 'Middleware nicht erreichbar.'], 502);
         }
     }
+
+
+    /**
+     * Stream the provider response to the browser. The legacy send() endpoint
+     * remains unchanged for compatibility/fallback.
+     *
+     * @NoAdminRequired
+     *
+     * @param array $messages
+     * @param array $sourceScopes
+     * @param string $conversationId
+     * @param string $model
+     * @param string $requestId
+     * @return SseResponse|DataResponse
+     */
+    public function stream($messages = [], $sourceScopes = [], $conversationId = '', $model = '', $requestId = '') {
+        if (!is_array($messages)) {
+            return new DataResponse(['error' => 'Ungültiger Gesprächsverlauf.'], 400);
+        }
+        if (!is_array($sourceScopes)) {
+            $sourceScopes = [];
+        }
+
+        try {
+            $conversationId = $this->store->ensureConversationId($conversationId);
+        } catch (\Exception $e) {
+            return new DataResponse(['error' => 'Ungültige Conversation-ID.'], 400);
+        }
+
+        return new SseResponse(function ($emit) use (
+            $messages,
+            $sourceScopes,
+            $conversationId,
+            $model,
+            $requestId
+        ) {
+            try {
+                $result = $this->proxy->streamChat(
+                    $messages,
+                    $sourceScopes,
+                    $conversationId,
+                    $model,
+                    $requestId,
+                    $emit
+                );
+
+                $stored = $messages;
+                $assistantCreatedAt = gmdate('c');
+                $assistant = [
+                    'role' => 'assistant',
+                    'content' => isset($result['content']) ? (string)$result['content'] : '',
+                    'created_at' => $assistantCreatedAt,
+                ];
+                if (!empty($result['sources']) && is_array($result['sources'])) {
+                    $assistant['sources'] = $result['sources'];
+                }
+                if (!empty($result['source_scopes']) && is_array($result['source_scopes'])) {
+                    $assistant['source_scopes'] = $result['source_scopes'];
+                }
+                $stored[] = $assistant;
+
+                $archiveSettings = $this->syncArchiveSettings();
+                $result['message_created_at'] = $assistantCreatedAt;
+                $result['chat_archive_enabled'] = !empty($archiveSettings['enabled']);
+
+                if (!empty($archiveSettings['enabled'])) {
+                    try {
+                        $chat = $this->store->save($conversationId, $stored, $sourceScopes);
+                        $this->proxy->registerChatArchive(
+                            $chat['document_id'] ?? '',
+                            $chat['archive_path'] ?? ''
+                        );
+                        $result['conversation'] = [
+                            'id' => $chat['id'],
+                            'title' => $chat['title'],
+                            'updated_at' => $chat['updated_at'],
+                            'scopes' => $chat['scopes'],
+                        ];
+                    } catch (\Exception $archiveException) {
+                        $result['archive_warning'] = 'Antwort erstellt, Chatarchiv konnte jedoch nicht aktualisiert werden.';
+                    }
+                }
+
+                call_user_func(
+                    $emit,
+                    "event: sunaq_meta\n"
+                    . 'data: ' . json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+                    . "\n\n"
+                );
+                call_user_func($emit, "event: sunaq_done\ndata: {}\n\n");
+            } catch (\InvalidArgumentException $e) {
+                call_user_func(
+                    $emit,
+                    "event: sunaq_error\ndata: "
+                    . json_encode(['error' => $e->getMessage()], JSON_UNESCAPED_UNICODE)
+                    . "\n\n"
+                );
+            } catch (\RuntimeException $e) {
+                call_user_func(
+                    $emit,
+                    "event: sunaq_error\ndata: "
+                    . json_encode(['error' => $e->getMessage()], JSON_UNESCAPED_UNICODE)
+                    . "\n\n"
+                );
+            } catch (\Exception $e) {
+                call_user_func(
+                    $emit,
+                    "event: sunaq_error\ndata: "
+                    . json_encode(['error' => 'Middleware nicht erreichbar.'], JSON_UNESCAPED_UNICODE)
+                    . "\n\n"
+                );
+            }
+        });
+    }
+
 
     /**
      * @NoAdminRequired

@@ -63,6 +63,37 @@ def test_tei_scores_are_mapped_by_index_not_response_order(monkeypatch):
     assert calls[0][1]["return_text"] is False
     assert calls[0][2]["trust_env"] is True
 
+def test_tei_payload_uses_model_processing_policy(monkeypatch):
+    calls = []
+    policy_calls = []
+
+    def policy(stage, *, content, metadata):
+        policy_calls.append((stage, content, metadata))
+        return {
+            "query": "checked-q",
+            "texts": [f"checked-{value}" for value in content["texts"]],
+        }
+
+    def responder(payload):
+        assert payload["query"] == "checked-q"
+        assert payload["texts"] == ["checked-a"]
+        return FakeResponse([{"index": 0, "score": 0.7}])
+
+    monkeypatch.setattr(rr, "apply_policy_hook", policy)
+    monkeypatch.setattr(
+        rr.httpx,
+        "Client",
+        lambda **kwargs: FakeClient(responder, calls, **kwargs),
+    )
+
+    r = rr.Reranker(backend="tei", tei_url="https://reranker.example.invalid")
+    assert r.score("q", ["a"])[0]["score"] == 0.7
+    assert policy_calls
+    assert policy_calls[0][0] == rr.PRE_MODEL_EGRESS
+    assert policy_calls[0][2]["egress_class"] == "model_processing"
+    assert policy_calls[0][2]["kind"] == "reranker"
+
+
 def test_tei_batches_without_losing_global_input_order(monkeypatch):
     calls = []
     seen = []

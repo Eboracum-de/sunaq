@@ -1,11 +1,11 @@
 # Known limitations
 
-**Reference:** `0.8.6-rc1.2`
+**Reference:** `0.8.7-rc1` release candidate
 
 This file records current limits so that beta expectations match the code. Items
 listed here are not necessarily defects; several are deliberate scope boundaries.
 
-## 0.8.6 profile/client limitations
+## Profile/client limitations
 
 - SunaQ model packages are loaded at API/provider startup. Editing
   `models/<profile>/profile.yaml` or its prompt files requires a process restart.
@@ -23,7 +23,7 @@ listed here are not necessarily defects; several are deliberate scope boundaries
   `reasoning_content` bridge is deferred because it would require restructuring
   the current SSE orchestration.
 - The provider's implicit source default is ordinary documents only. In SunaQ
-  Recherche 0.3.4, optional Mail/Webarchive/Chat/Web controls start hidden and
+  Recherche 0.3.16, optional Mail/Webarchive/Chat/Web controls start hidden and
   are shown only after the authenticated capability response confirms the global
   and per-user gates. Explicit Slash-Directives are subject to the same server-side
   policy; they do not bypass an administrator-disabled source.
@@ -33,8 +33,7 @@ listed here are not necessarily defects; several are deliberate scope boundaries
 
 ## Installation and deployment
 
-- Only `standard + native` and `super-light + dockerized` are supported/tested
-  deployment mappings in the 0.8.6-rc1.2 candidate.
+- The public installer now separates `standard|dockerized` deployment from `core|workgroup|full` capability presets. Not every optional service is bundled in every deployment: in particular Dockerized may permit an ERG vector capability while having no local Qdrant service.
 - Installer/rerun preflight validates the install source, non-empty install
   prefix, CA files and Docker availability before destructive refresh steps, and
   refuses a running existing SunaQ stack. Explicitly supplied Nextcloud and
@@ -43,12 +42,13 @@ listed here are not necessarily defects; several are deliberate scope boundaries
   diagnostic only and cannot prove that an authenticated endpoint, model backend
   or later runtime path will remain usable; use the smoke/acceptance checks and
   archive the generated `install/last-install-command.sh` for reproducible reruns.
-- Super-Light intentionally relies on external Nextcloud, Elasticsearch and LLM
-  services. Their availability and backup are outside the local Compose stack.
-- rc1.2 uses file-backed runtime secret material for SunaQ API/provider/mail/Graph/model service credentials, so those values no longer need to appear in the normal container environment. The optional bundled OpenWebUI still receives its scoped provider-client key through its upstream-supported environment interface; `docker compose config` can therefore expose that one optional UI credential when OpenWebUI is enabled. Docker-daemon access remains root-equivalent, and `runtime.env`, generated secret files, local Compose `.env` files and backups remain sensitive.
-- Bundled nginx and OpenWebUI are opt-in in Super-Light. SunaQ Recherche is the
+- Dockerized deployments rely on external Nextcloud and Elasticsearch services;
+  model endpoints are configured separately and may also be external. Their
+  availability and backup are outside the local Compose stack.
+- The current line uses file-backed runtime secret material for SunaQ API/provider/mail/Graph/model service credentials, so those values no longer need to appear in the normal container environment. The optional bundled OpenWebUI still receives its scoped provider-client key through its upstream-supported environment interface; `docker compose config` can therefore expose that one optional UI credential when OpenWebUI is enabled. Docker-daemon access remains root-equivalent, and `runtime.env`, generated secret files, local Compose `.env` files and backups remain sensitive.
+- Bundled nginx and OpenWebUI are opt-in in Dockerized deployments. SunaQ Recherche is the
   reference slim Nextcloud UI for the current beta.
-- Super-Light prepares the SunaQ application/provider image during installation,
+- Dockerized installation prepares the SunaQ application/provider image during installation,
   but the selected Neo4j image may still be pulled only when maintenance mode is
   disabled for the first normal start. This can make `maintenance-mode.sh off`
   perform an unexpected network download; pulling selected runtime images during
@@ -77,11 +77,13 @@ listed here are not necessarily defects; several are deliberate scope boundaries
   asks for documents. Completeness/counting intent has separate limits and must
   fail conservatively when those limits prevent a defensible complete result.
 - Normal verifier/answer windows are selected by the SunaQ profile rather than by
-  one deployment-global default: Schnell 10, Gründlich 30, Tief 50. Deployment
+  one deployment-global default: Standard/Schnell 10, Thorough/Gründlich 30, Deep/Tief 50. Deployment
   and administrator hard caps can still reduce unavailable capabilities.
-- Super-Light has no local reranker. Deduplication is independent and remains
-  active, but Elasticsearch ranking plus verifier behavior can still be less
-  precise than a well-tuned reranked standard deployment on difficult corpora.
+- The Dockerized baseline does not bundle a local heavyweight reranker.
+  Deduplication is independent and remains active, but Elasticsearch ranking plus
+  verifier behavior can still be less precise than a deployment with a tuned
+  reranker on difficult corpora. External/TEI reranking can be configured
+  independently of deployment mode.
 - Exact duplicate grouping can use Nextcloud FullTextSearch's valid 32-hex
   `hash` (MD5 of extracted FullTextSearch content, not a raw-file byte hash) as
   the primary exact-content signal. Distinct Nextcloud file IDs remain separate ACL
@@ -93,11 +95,14 @@ listed here are not necessarily defects; several are deliberate scope boundaries
   the current user's live ACL and current source-scope policy before joining the
   normal verifier pool. This is short-lived turn continuity, not persistent entity
   memory; structured conversation entity state remains a later enhancement.
-- Query rewriting is intentionally conservative. The model emits a small SearchSpec with a Nextcloud-compatible `elastic_query` and a natural
-  `semantic_query`; it never emits raw Elasticsearch JSON DSL. Grammatical normalization is allowed,
-  but factual synonyms must not be invented and explicit names/identifiers/years must
-  not be silently discarded. Additional retrieval rounds are optional and remain
-  bounded by administrator configuration.
+- Query rewriting is intentionally conservative. The model emits backend-neutral
+  SearchSpec intent: entities, concepts, concept groups, constraints, a natural
+  semantic query and verification requirements. Deterministic middleware compiles
+  Files/Elasticsearch syntax. Planner quality is still model-dependent: poor
+  semantic grouping or weak lexical alternatives can reduce recall/precision even
+  though backend syntax is code-owned. Explicit names/identifiers/years must not be
+  silently discarded. Additional retrieval rounds remain bounded by administrator
+  configuration.
 - ACL-denied documents are removed without adaptive backfill of lower-ranked candidates.
   This can yield less evidence even when an authorized document existed below the
   bounded final window. The current order is retrieval/fusion, optional reranking,
@@ -131,12 +136,16 @@ listed here are not necessarily defects; several are deliberate scope boundaries
 
 ## SunaQ Recherche
 
-- SunaQ Recherche 0.3.4 targets Nextcloud 23+. Each canonical user has exactly one configured Nextcloud chat-archive path and a per-user enable/disable gate below the global `chat_archive.enabled` switch; the default path is `SunaQ-Chats/`. SunaQ does not simultaneously scan an old `AKI-Chats/` folder and the new path. Operators upgrading an older RC can either configure that user to keep using `AKI-Chats/` or move the archive files once into the selected path. Path changes do not move files automatically. Legacy `.akirag.json` / HTML records remain readable within the selected path. Chat archives are a separate, optional `/chatarchive` source scope, not automatically trusted as primary document evidence. A saved chat is a new Nextcloud file with its own ACL/lifecycle; revoking the original source document does not automatically erase text already copied into the chat. Strict revocation deployments should leave chat archive disabled or define a retention/purge process.
+- SunaQ Recherche 0.3.16 targets Nextcloud 23+. Each canonical user has exactly one configured Nextcloud chat-archive path and a per-user enable/disable gate below the global `chat_archive.enabled` switch; the default path is `SunaQ-Chats/`. SunaQ does not simultaneously scan an old `AKI-Chats/` folder and the new path. Operators upgrading an older RC can either configure that user to keep using `AKI-Chats/` or move the archive files once into the selected path. Path changes do not move files automatically. Legacy `.akirag.json` / HTML records remain readable within the selected path. Chat archives are a separate, optional `/chatarchive` source scope, not automatically trusted as primary document evidence. A saved chat is a new Nextcloud file with its own ACL/lifecycle; revoking the original source document does not automatically erase text already copied into the chat. Strict revocation deployments should leave chat archive disabled or define a retention/purge process.
 - The app is deliberately thin. Advanced provider diagnostics and administration
   remain in SunaQ Admin rather than being duplicated in SunaQ Recherche.
+- Nextcloud's own Markdown/text preview may render URLs stored in archived
+  `chat.md` as non-clickable depending on the deployed viewer/security policy.
+  SunaQ preserves the URLs in the archive; this is a Nextcloud presentation
+  limitation and is not a reason to relax the deployment's security settings.
 
 ## Graph
-- rc1.2 provides no provenance-aware migration of a historical ERG Neo4j graph into SRC. During the RC line, converting an existing ERG installation to SRC requires an explicit full Neo4j reset and re-import of trusted CardDAV/administrator seeds. This avoids allowing older document-derived identities to influence SRC query expansion.
+- 0.8.7-rc1 provides no provenance-aware migration of historical ERG Qdrant/Neo4j state into SRC. Converting an existing ERG installation to strict SRC requires explicit removal/reset of SunaQ-owned derived retrieval state. CardDAV/administrator graph seeds must **not** be re-imported into SRC; deployments that need those local resolver identities should use ERG Internal.
 
 - CardDAV seeds and SunaQ Research Findings are lightweight graph inputs. Full
   document graph extraction remains comparatively expensive and opt-in.
@@ -180,16 +189,16 @@ listed here are not necessarily defects; several are deliberate scope boundaries
 - The current console recovery workflow covers SunaQ-owned configuration, SQLite,
   credential/master-key state and bundled Neo4j. It does not back up Nextcloud,
   Elasticsearch, Qdrant, external Neo4j, OpenWebUI/Playwright state or model
-  caches. Restore currently requires the same supported deployment profile/mode
+  caches. Restore currently requires the same supported deployment mode
   and installation prefix. Master-key rotation remains a separate follow-up.
 - Global service secrets such as provider/backend API keys still live in protected
   environment files rather than a dedicated external secret manager.
-- The measured 4 GiB Super-Light success point is not a hard upper bound. Chromium
+- The measured 4 GiB historical Super-Light/Dockerized success point is not a hard upper bound. Chromium
   produces transient memory peaks; capacity should be verified under the intended
   Web Research workload.
 - Elasticsearch unavailability is translated to a friendly service-unavailable
   response, but the middleware cannot answer private document questions while its
-  required Super-Light document arm is down.
+  required Elasticsearch/files document arm is down.
 
 ### Verifier/Answer budgets
 

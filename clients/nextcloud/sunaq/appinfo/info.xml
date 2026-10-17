@@ -4,7 +4,7 @@
     <name>SunaQ Recherche</name>
     <summary>Interaktive Recherche über das Eboracum Research Gateway</summary>
     <description>Schlankes Nextcloud-Frontend für SunaQ, das Eboracum Research Gateway. Die App archiviert Recherche-Chats im persönlichen Nextcloud-Dateibereich und verbindet angemeldete Nextcloud-Nutzer mit dem Gateway; die finale Dokument-ACL bleibt serverseitig.</description>
-    <version>0.3.4</version>
+    <version>0.3.16</version>
     <licence>agpl</licence>
     <author>Eboracum GmbH</author>
     <namespace>Sunaq</namespace>

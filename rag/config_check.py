@@ -13,6 +13,9 @@ from typing import Any
 
 import yaml
 
+from rag.architecture_policy import ERG_FULL, architecture_tier, validate_runtime_model
+from rag.config_security import validate_static_security_config
+from rag.egress_policy import load_egress_policy
 from rag.sunaq_models import PROFILE_CONFIG_SECTIONS, load_model_registry
 
 
@@ -51,7 +54,7 @@ def _effective_model_configs(
     cfg: dict[str, Any],
     *,
     models_dir: str | Path | None = None,
-) -> tuple[list[tuple[str, dict[str, Any]]], bool]:
+) -> tuple[list[tuple[str, dict[str, Any]]], bool, list[Any]]:
     """Return the same effective models the runtime will load.
 
     Packaged models win even when an upgraded installation still contains old
@@ -59,15 +62,17 @@ def _effective_model_configs(
     models falls back to the legacy single-model config path.
     """
     registry = load_model_registry(cfg, models_dir=models_dir)
-    models = [(model.model_id, model.config) for model in registry.list()]
-    legacy = all(model.directory is None for model in registry.list())
-    return models, legacy
+    runtime_models = registry.list()
+    models = [(model.model_id, model.config) for model in runtime_models]
+    legacy = all(model.directory is None for model in runtime_models)
+    return models, legacy, runtime_models
 
 
 def check_config(
     cfg: dict[str, Any],
     *,
     models_dir: str | Path | None = None,
+    web_cfg: dict[str, Any] | None = None,
 ) -> list[ConfigIssue]:
     """Return static configuration errors and warnings without external probes."""
     issues: list[ConfigIssue] = []
@@ -84,8 +89,109 @@ def check_config(
         _get(cfg, "deployment.mode", "native") or "native"
     ).strip().lower()
 
+    for message in validate_static_security_config(cfg, require_complete=False):
+        issues.append(ConfigIssue("error", message))
+
+    if web_cfg is not None:
+        if not isinstance(web_cfg, dict):
+            issues.append(ConfigIssue("error", "web configuration root must be a mapping"))
+        else:
+            tier = architecture_tier(cfg)
+            if tier != ERG_FULL:
+                external_web_flags = (
+                    ("web.enabled", _truthy(_get(web_cfg, "enabled", False), False)),
+                    (
+                        "web.archive.enabled",
+                        _truthy(_get(web_cfg, "archive.enabled", False), False),
+                    ),
+                    (
+                        "web.archive.renderer.enabled",
+                        _truthy(
+                            _get(web_cfg, "archive.renderer.enabled", False),
+                            False,
+                        ),
+                    ),
+                )
+                for label, enabled in external_web_flags:
+                    if enabled:
+                        issues.append(
+                            ConfigIssue(
+                                "error",
+                                f"{label}=true requires architecture.tier=erg_full; "
+                                f"current tier is {tier}",
+                            )
+                        )
+            allow_insecure_nextcloud = _truthy(
+                _get(cfg, "security.allow_insecure_nextcloud", False), False
+            )
+            nextcloud_cfg = _get(cfg, "nextcloud", {}) or {}
+            archive_cfg = _get(web_cfg, "archive", {}) or {}
+            canonical_nextcloud_tls = bool(
+                str(nextcloud_cfg.get("ca_file") or "").strip()
+                or "verify_tls" in nextcloud_cfg
+            )
+            if "verify_tls" in archive_cfg:
+                legacy_verify = _truthy(archive_cfg.get("verify_tls"), True)
+                if canonical_nextcloud_tls:
+                    issues.append(
+                        ConfigIssue(
+                            "warning",
+                            "web.archive.verify_tls is a deprecated compatibility setting and "
+                            "is ignored because config.yaml nextcloud.ca_file/verify_tls is authoritative",
+                        )
+                    )
+                elif not legacy_verify and not allow_insecure_nextcloud:
+                    issues.append(
+                        ConfigIssue(
+                            "error",
+                            "web.archive.verify_tls=false would disable TLS verification for "
+                            "credential-bearing Nextcloud WebDAV; configure nextcloud.ca_file/"
+                            "nextcloud.verify_tls or set security.allow_insecure_nextcloud=true "
+                            "only for an explicit lab exception",
+                        )
+                    )
+                elif not legacy_verify:
+                    issues.append(
+                        ConfigIssue(
+                            "warning",
+                            "web.archive.verify_tls=false is an explicit insecure Nextcloud "
+                            "compatibility mode",
+                        )
+                    )
+
+            legacy_archive_ca = str(archive_cfg.get("ca_file") or "").strip()
+            if legacy_archive_ca and canonical_nextcloud_tls:
+                issues.append(
+                    ConfigIssue(
+                        "warning",
+                        "web.archive.ca_file is deprecated and ignored because config.yaml "
+                        "nextcloud.ca_file/verify_tls is authoritative",
+                    )
+                )
+
+            for path in (
+                "search.verify_tls",
+                "fetch.verify_tls",
+                "relevance.verify_tls",
+                "archive.renderer.verify_tls",
+            ):
+                value = _get(web_cfg, path, None)
+                if value is not None and not _truthy(value, True):
+                    issues.append(
+                        ConfigIssue(
+                            "warning",
+                            f"web.{path}=false disables TLS certificate verification for that "
+                            "outbound Web/LLM/renderer connection",
+                        )
+                    )
+
     try:
-        model_configs, legacy_model_config = _effective_model_configs(
+        load_egress_policy(cfg)
+    except (TypeError, ValueError) as exc:
+        issues.append(ConfigIssue("error", f"invalid egress policy: {exc}"))
+
+    try:
+        model_configs, legacy_model_config, runtime_models = _effective_model_configs(
             cfg, models_dir=models_dir
         )
     except Exception as exc:
@@ -97,12 +203,22 @@ def check_config(
         )
         model_configs = [("fallback", cfg)]
         legacy_model_config = True
+        runtime_models = []
+
+    for model in runtime_models:
+        for message in validate_runtime_model(cfg, model):
+            issues.append(ConfigIssue("error", message))
 
     if not legacy_model_config:
+        # capabilities/research/resolver_research are optional RC2 extensions.
+        # Upgraded 0.8.6 installations keep administrator-owned model packages,
+        # so newly introduced sections must remain safely defaultable instead of
+        # turning an otherwise valid legacy profile into a startup error.
+        required_profile_sections = PROFILE_CONFIG_SECTIONS - {"capabilities", "research", "resolver_research"}
         for model_id, model_cfg in model_configs:
             missing = sorted(
                 section
-                for section in PROFILE_CONFIG_SECTIONS
+                for section in required_profile_sections
                 if not isinstance(model_cfg.get(section), dict)
             )
             if missing:
@@ -175,6 +291,35 @@ def check_config(
             )
         )
 
+    if deployment_mode == "dockerized" and sync_enabled:
+        effective_state_db = _get(cfg, "sync.state_db", None)
+        if effective_state_db in (None, ""):
+            effective_state_db = _get(cfg, "state_db", "runtime/state.sqlite")
+        docker_runtime_paths = (
+            ("sync.state_db", str(effective_state_db or "").strip()),
+            (
+                "sync.embedding_deferred_file",
+                str(_get(cfg, "sync.embedding_deferred_file", "runtime/embedding-deferred.jsonl") or "").strip(),
+            ),
+            (
+                "sync.status_file",
+                str(_get(cfg, "sync.status_file", "runtime/sync-status.json") or "").strip(),
+            ),
+        )
+        for label, raw_path in docker_runtime_paths:
+            normalized = raw_path.replace("\\", "/")
+            if not (
+                normalized.startswith("runtime/")
+                or normalized.startswith("/app/runtime/")
+            ):
+                issues.append(
+                    ConfigIssue(
+                        "error",
+                        f"{label} must live below runtime/ in dockerized deployment; "
+                        f"configured path {raw_path!r} would not use the persistent /app/runtime mount",
+                    )
+                )
+
     for model_id, evidence_control_mode in evidence_modes.items():
         if evidence_control_mode not in {"off", "review"}:
             issues.append(
@@ -231,6 +376,37 @@ def check_config(
             )
         )
 
+    if sync_enabled and not qdrant_enabled:
+        issues.append(
+            ConfigIssue(
+                "error",
+                "sync_worker.enabled=true requires qdrant.enabled=true",
+            )
+        )
+
+    if sync_enabled:
+        missing_operational_defaults: list[str] = []
+        if _get(cfg, "sync_worker.pause_check_documents", None) in (None, ""):
+            missing_operational_defaults.append("sync_worker.pause_check_documents")
+        if _get(cfg, "sync.status_file", None) in (None, ""):
+            missing_operational_defaults.append("sync.status_file")
+        if _get(cfg, "sync.embedding_deferred_file", None) in (None, ""):
+            missing_operational_defaults.append("sync.embedding_deferred_file")
+        if (
+            _get(cfg, "sync.state_db", None) in (None, "")
+            and _get(cfg, "state_db", None) in (None, "")
+        ):
+            missing_operational_defaults.append("sync.state_db")
+        if missing_operational_defaults:
+            issues.append(
+                ConfigIssue(
+                    "warning",
+                    "sync configuration relies on runtime defaults for: "
+                    + ", ".join(missing_operational_defaults)
+                    + "; rerun the installer/config upgrade or materialize these keys explicitly",
+                )
+            )
+
     if qdrant_enabled:
         embedding_backend = str(_get(cfg, "embedding.backend", "") or "").strip()
         embedding_model = str(_get(cfg, "embedding.model", "") or "").strip()
@@ -281,56 +457,13 @@ def check_config(
                 )
             )
 
-    if profile == "super-light":
-        if deployment_mode != "dockerized":
-            issues.append(
-                ConfigIssue(
-                    "error",
-                    "deployment.profile=super-light requires deployment.mode=dockerized",
-                )
+    if profile == "dockerized" and deployment_mode != "dockerized":
+        issues.append(
+            ConfigIssue(
+                "error",
+                "deployment.profile=dockerized requires deployment.mode=dockerized",
             )
-        required_false = {
-            "qdrant.enabled": qdrant_enabled,
-            "sync_worker.enabled": sync_enabled,
-            "graph_indexer.enabled": _truthy(
-                _get(cfg, "graph_indexer.enabled", False), False
-            ),
-            "graph_entity_discovery.enabled": _truthy(
-                _get(cfg, "graph_entity_discovery.enabled", False), False
-            ),
-            "graph_relation_discovery.enabled": _truthy(
-                _get(cfg, "graph_relation_discovery.enabled", False), False
-            ),
-        }
-        if not es_enabled:
-            issues.append(
-                ConfigIssue(
-                    "error",
-                    "deployment.profile=super-light requires elasticsearch.enabled=true",
-                )
-            )
-        if any(value != "none" for value in rerankers.values()):
-            issues.append(
-                ConfigIssue(
-                    "error",
-                    "deployment.profile=super-light requires reranker.backend=none",
-                )
-            )
-        if any(graph_model_enabled.values()):
-            issues.append(
-                ConfigIssue(
-                    "error",
-                    "deployment.profile=super-light requires graph_retrieval.enabled=false",
-                )
-            )
-        for path, enabled in required_false.items():
-            if enabled:
-                issues.append(
-                    ConfigIssue(
-                        "error",
-                        f"deployment.profile=super-light requires {path}=false",
-                    )
-                )
+        )
 
     return issues
 
@@ -344,6 +477,19 @@ def load_config_file(path: str | Path) -> dict[str, Any]:
     return cfg
 
 
+def load_optional_config_file(path: str | Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    cfg_path = Path(path)
+    if not cfg_path.exists():
+        return None
+    with cfg_path.open("r", encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle) or {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{cfg_path} root must be a mapping")
+    return cfg
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Check SunaQ / ERG configuration consistency without network access"
@@ -353,17 +499,25 @@ def main(argv: list[str] | None = None) -> int:
         default="config.yaml",
         help="configuration file (default: config.yaml)",
     )
+    parser.add_argument(
+        "--web-config",
+        default="web.yaml",
+        help="optional web configuration file (default: web.yaml if present)",
+    )
     args = parser.parse_args(argv)
 
     try:
         cfg = load_config_file(args.config)
+        web_cfg = load_optional_config_file(args.web_config)
     except Exception as exc:
-        print(f"ERROR: cannot load {args.config}: {exc}")
+        print(f"ERROR: cannot load configuration: {exc}")
         return 2
 
-    issues = check_config(cfg)
+    issues = check_config(cfg, web_cfg=web_cfg)
     profile = str(_get(cfg, "deployment.profile", "default") or "default")
     print(f"Config: {args.config}")
+    if web_cfg is not None:
+        print(f"Web config: {args.web_config}")
     print(f"Profile: {profile}")
 
     if not issues:

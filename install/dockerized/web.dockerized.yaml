@@ -1,0 +1,56 @@
+# Dockerized Web Research defaults: disabled; optional Playwright renderer is local/loopback and fail-open.
+enabled: false
+search:
+  provider: brave
+  url: ''
+  api_key_env: WEB_SEARCH_API_KEY
+  max_results: 10
+  timeout: 20
+  verify_tls: true
+fetch:
+  timeout: 25
+  verify_tls: true
+  concurrency: 4
+  max_redirects: 5
+  max_bytes: 15000000
+  max_text_chars: 300000
+  user_agent: SunaQ-WebEvidence/0.8.7
+  allow_private: false
+relevance:
+  api_key_env: WEB_LLM_API_KEY
+  verify_tls: true
+  timeout: 180
+  num_ctx: 16384
+  num_predict: 800
+  preview_chars: 4200
+  min_score: 0.58
+  max_sources: 5
+archive:
+  enabled: false
+  exclude_from_internal_retrieval: true
+  write_research_markdown: true
+  write_text_snapshot: true
+  write_raw_pdf: true
+  write_raw_html: false
+  write_fetch_log: true
+  write_metadata_json: true
+  write_rendered_pdf: true
+  renderer:
+    enabled: false
+    background: true
+    background_runs: 1
+    url: http://127.0.0.1:8090/render
+    timeout: 45
+    verify_tls: true
+    max_bytes: 52428800
+    landscape: true
+    prefer_css_page_size: false
+    viewport:
+      width: 1440
+      height: 900
+    persist_state: true
+    cleanup:
+      cookie_consent: "off"
+      dismiss_overlays: false
+      remove_overlays: false
+  timeout: 30

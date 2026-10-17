@@ -31,7 +31,8 @@ def test_chat_archive_evidence_is_admin_gated_by_default():
     api_source = (root / "rag" / "api.py").read_text()
     assert 'os.getenv("CHAT_ARCHIVE_ENABLED", _chat_archive_default)' in provider_source
     assert 'def _disabled_requested_sources(' in provider_source
-    assert '"chatarchive": chat_enabled' in provider_source
+    assert '"chatarchive": bool(chat_enabled' in provider_source
+    assert 'model_caps.get("chatarchive", True)' in provider_source
     assert 'classify_source_origin(' in api_source
     assert '== "chat_archive"' in api_source
     assert 'not CHAT_ARCHIVE_ENABLED' in api_source
@@ -39,10 +40,10 @@ def test_chat_archive_evidence_is_admin_gated_by_default():
     assert '"reason": "chat_archive_disabled"' in provider_source
 
 
-def test_explicit_archives_parse_without_changing_engine():
+def test_legacy_webarchive_directive_aliases_to_chatarchive():
     parsed = _parse_retrieval_directives('/webarchive /chatarchive Vorgang')
     assert parsed.error is None
-    assert parsed.source_scopes == {'webarchive', 'chatarchive'}
+    assert parsed.source_scopes == {'chatarchive'}
     assert parsed.retrieval_arms is None
 
 
@@ -101,15 +102,17 @@ def test_sunaq_client_has_scope_ui_and_server_side_chat_archive():
     proxy = (root / 'lib' / 'Service' / 'RagProxy.php').read_text(encoding='utf-8')
     store = (root / 'lib' / 'Service' / 'ChatStore.php').read_text(encoding='utf-8')
     controller = (root / 'lib' / 'Controller' / 'ChatController.php').read_text(encoding='utf-8')
-    for scope in ['documents', 'mailarchive', 'webarchive', 'chatarchive', 'web']:
+    for scope in ['documents', 'mailarchive', 'chatarchive', 'web']:
         assert f'value="{scope}"' in main
+    assert 'value="webarchive"' not in main
     assert 'value="documents" checked' in main
     assert 'value="mailarchive" checked' not in main
     assert 'explicit user source selection wins over UI state' in proxy
     assert "const FOLDER = 'SunaQ-Chats'" in store
     assert "chat_archive_path" in store
     assert "LEGACY_FOLDER" not in store
-    assert "$record['archive_path'] = $this->archivePath() . '/' . $archiveFile;" in store
+    assert "$record['archive_path'] = $record['dossier_path'] . '/' . $chatFile;" in store
+    assert "LEGACY_DOSSIER_CHAT_FILE = 'chat.md'" in store
     assert '.akirag.json' in store
     assert "'source_origin' => 'chat_archive'" in store
     assert "'format' => 'markdown'" in store
@@ -130,7 +133,7 @@ def test_chat_archive_registration_writes_registry_before_es_mirror(monkeypatch)
         def resolve_visible_file_path(self, document_id, *, rag_user_id=None):
             assert rag_user_id == 'alice'
             assert document_id == 'files:74710'
-            return 'AKI-Chats/2026-09-22 - Vogelsang 280 - abcdef12.md'
+            return 'AKI-Chats/2026-09-22 - Musterweg 280 - abcdef12.md'
 
     calls = []
     monkeypatch.setattr(api, 'live_acl', FakeAcl())
@@ -151,7 +154,7 @@ def test_chat_archive_registration_writes_registry_before_es_mirror(monkeypatch)
     result = api.register_chat_archive_source(
         api.ChatArchiveRegisterRequest(
             document_id='files:74710',
-            path='AKI-Chats/2026-09-22 - Vogelsang 280 - abcdef12.md',
+            path='AKI-Chats/2026-09-22 - Musterweg 280 - abcdef12.md',
         ),
         SimpleNamespace(headers={'x-rag-user-id': 'alice'}),
     )
@@ -162,7 +165,7 @@ def test_chat_archive_registration_writes_registry_before_es_mirror(monkeypatch)
         'files:74710',
         'chat_archive',
         {
-            'source_path': 'AKI-Chats/2026-09-22 - Vogelsang 280 - abcdef12.md',
+            'source_path': 'AKI-Chats/2026-09-22 - Musterweg 280 - abcdef12.md',
             'classification_source': 'chat_archive_write',
         },
     )]
@@ -190,7 +193,7 @@ def test_vector_default_matches_explicit_documents_only(monkeypatch):
     monkeypatch.setattr(search, 'embeddings', FakeEmbeddings())
     monkeypatch.setattr(search, 'store', FakeStore())
 
-    plan = SimpleNamespace(semantic_query='Vogelsang')
+    plan = SimpleNamespace(semantic_query='Musterweg')
     search.vector_search(plan, {}, source_scopes=None)
     search.vector_search(plan, {}, source_scopes={'documents'})
 
@@ -224,7 +227,7 @@ def test_vector_documents_scope_excludes_all_archive_origins(monkeypatch):
     monkeypatch.setattr(search, 'store', FakeStore())
 
     search.vector_search(
-        SimpleNamespace(semantic_query='Vogelsang'),
+        SimpleNamespace(semantic_query='Musterweg'),
         {},
         source_scopes={'documents'},
     )
@@ -250,3 +253,13 @@ def test_use_findings_enrichment_is_deferred_until_after_answer_generation():
     assert "await _store_use_research_findings(" not in use_branch
     assert "_BACKGROUND_TASKS.add(task)" in provider
     assert '_ACTIVE_PROGRESS_ID.set("")' in provider
+
+def test_chatarchive_scope_includes_legacy_web_archive_provenance():
+    import rag.source_origin as source_origin
+
+    assert source_origin.normalize_source_scopes({"webarchive"}) == {"chatarchive"}
+    assert source_origin.source_origins_for_scopes({"chatarchive"}) == {
+        "chat_archive",
+        "web_archive",
+    }
+

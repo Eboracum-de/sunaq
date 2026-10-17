@@ -367,21 +367,21 @@ def test_evidence_relation_endpoint_uses_unique_exact_seed_resolution():
     store = object.__new__(GraphStore)
     store.research_finding_detail = lambda finding_id: {  # type: ignore[method-assign]
         "finding": {
-            "entity_texts": ["Ariane Seeger"],
+            "entity_texts": ["Alice Example"],
             "entity_roles": ["betroffene Person"],
             "evidence_frame_json": (
-                '{"relations":[{"source":"Alexander Eichner",'
-                '"predicate":"adressiert ein Schreiben an","target":"Ariane Seeger"}]}'
+                '{"relations":[{"source":"Bob Example",'
+                '"predicate":"adressiert ein Schreiben an","target":"Alice Example"}]}'
             ),
         },
         "curated_entities": [],
         "resolved_entities": [
-            {"text": "Ariane Seeger", "entity_id": "person-seeger", "display_name": "Ariane Seeger"}
+            {"text": "Alice Example", "entity_id": "person-alice", "display_name": "Alice Example"}
         ],
     }
     store._resolve_existing_query_entity = lambda text: (  # type: ignore[method-assign]
-        {"entity_id": "person-eichner", "display_name": "Alexander Eichner", "labels": ["Entity", "Person"]}
-        if text == "Alexander Eichner"
+        {"entity_id": "person-bob", "display_name": "Bob Example", "labels": ["Entity", "Person"]}
+        if text == "Bob Example"
         else None
     )
     store.find_entities = lambda text, limit=6: []  # type: ignore[method-assign]
@@ -389,9 +389,9 @@ def test_evidence_relation_endpoint_uses_unique_exact_seed_resolution():
 
     result = store.research_finding_entity_options("f")
 
-    eichner = next(item for item in result if item["text"] == "Alexander Eichner")
+    eichner = next(item for item in result if item["text"] == "Bob Example")
     assert eichner["role"] == "Relationsquelle"
-    assert eichner["auto_resolved"]["entity_id"] == "person-eichner"
+    assert eichner["auto_resolved"]["entity_id"] == "person-bob"
 
 
 def test_relation_observation_optional_finding_reads_are_property_safe():
@@ -493,11 +493,11 @@ def test_suppressed_finding_entity_is_hidden_only_from_curated_evidence_view():
         "constraints": [],
         "entities": [],
         "mentioned_entities": [
-            {"value": "Alexander Eichner"},
+            {"value": "Bob Example"},
             {"value": "Office t-m"},
         ],
         "relations": [
-            {"source": "Ariane Seeger", "predicate": "schreibt an", "target": "Alexander Eichner"},
+            {"source": "Alice Example", "predicate": "schreibt an", "target": "Bob Example"},
             {"source": "Office t-m", "predicate": "ist", "target": "Absender"},
         ],
         "has_content": True,
@@ -505,7 +505,7 @@ def test_suppressed_finding_entity_is_hidden_only_from_curated_evidence_view():
 
     curated = _filter_suppressed_evidence(raw_view, ["Office t-m"])
 
-    assert [item["value"] for item in curated["mentioned_entities"]] == ["Alexander Eichner"]
+    assert [item["value"] for item in curated["mentioned_entities"]] == ["Bob Example"]
     assert len(curated["relations"]) == 1
     assert raw_view["mentioned_entities"][1]["value"] == "Office t-m"
 
@@ -601,18 +601,18 @@ def test_unique_contextual_alias_is_a_default_finding_resolution():
         if "EntityFormDecision" in query or "MATCH (o:EntityObservation" in query:
             return []
         return [{
-            "entity_id": "org-zahoransky",
-            "display_name": "Zahoransky AG",
+            "entity_id": "org-example-machinery",
+            "display_name": "Example Machinery AG",
             "labels": ["Entity", "Organization"],
             "match_kind": "alias",
         }]
 
     store._run = fake_run  # type: ignore[method-assign]
 
-    result = store._resolve_existing_query_entity("Zahoransky")
+    result = store._resolve_existing_query_entity("Example Machinery")
 
     assert result is not None
-    assert result["entity_id"] == "org-zahoransky"
+    assert result["entity_id"] == "org-example-machinery"
     assert result["match_kind"] == "alias"
     assert "HAS_SEARCH_ALIAS" in calls[-1][0]
 
@@ -621,12 +621,12 @@ def test_bulk_entity_defaults_applies_only_pending_unique_matches():
     store = object.__new__(GraphStore)
     store.research_finding_entity_options = lambda finding_id, limit=1: [  # type: ignore[method-assign]
         {
-            "text": "Zahoransky",
+            "text": "Example Machinery",
             "curated": None,
             "suppressed": False,
             "auto_resolved": {
                 "entity_id": "org-z",
-                "display_name": "Zahoransky AG",
+                "display_name": "Example Machinery AG",
                 "match_kind": "alias",
             },
         },
@@ -640,13 +640,13 @@ def test_bulk_entity_defaults_applies_only_pending_unique_matches():
     calls = []
     store.curate_research_finding_entity = lambda finding_id, **kwargs: (  # type: ignore[method-assign]
         calls.append((finding_id, kwargs))
-        or {"target_entity_id": kwargs["target_entity_id"], "target_display_name": "Zahoransky AG"}
+        or {"target_entity_id": kwargs["target_entity_id"], "target_display_name": "Example Machinery AG"}
     )
 
     result = store.accept_research_finding_entity_defaults("f1", curator_actor="tester")
 
     assert result["applied_count"] == 1
-    assert calls[0][1]["entity_text"] == "Zahoransky"
+    assert calls[0][1]["entity_text"] == "Example Machinery"
     assert calls[0][1]["reason"] == "unique_alias_default"
 
 
