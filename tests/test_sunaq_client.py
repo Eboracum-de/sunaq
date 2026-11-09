@@ -7,7 +7,7 @@ APP = ROOT / "clients" / "nextcloud" / "sunaq"
 
 def test_sunaq_client_is_packaged_for_nextcloud_23_plus():
     root = ET.parse(APP / "appinfo" / "info.xml").getroot()
-    assert root.findtext("version") == "0.3.16"
+    assert root.findtext("version") == "0.3.21"
     dependency = root.find("./dependencies/nextcloud")
     assert dependency is not None
     assert dependency.attrib.get("min-version") == "23"
@@ -117,7 +117,7 @@ def test_sunaq_026_archive_registration_is_bounded_and_damaged_chats_remain_dele
     assert "Gespeicherter Chat ist beschädigt und kann nicht umbenannt werden." in store
     assert "$item['sources'] = $sources;" in store
     assert "### Quellen" not in store
-    assert readme.startswith("# SunaQ Recherche 0.3.16")
+    assert readme.startswith("# SunaQ Recherche 0.3.21")
     assert "persistent per-user chat history as Markdown plus metadata" in readme
     assert "Legacy-HTML" in readme
 
@@ -447,3 +447,54 @@ def test_sunaq_file_action_controller_keeps_noadmin_annotations_nc23_compatible(
         assert doc_end >= 0
         docblock = controller[doc_start:doc_end + 2]
         assert "\n     * @NoAdminRequired\n" in docblock
+
+
+
+def test_sunaq_admin_has_own_visible_section_and_server_status_probe():
+    info = (APP / "appinfo" / "info.xml").read_text(encoding="utf-8")
+    settings = (APP / "lib" / "Settings" / "Admin.php").read_text(encoding="utf-8")
+    section = (APP / "lib" / "Sections" / "AdminSection.php").read_text(encoding="utf-8")
+    routes = (APP / "appinfo" / "routes.php").read_text(encoding="utf-8")
+    controller = (APP / "lib" / "Controller" / "AdminController.php").read_text(encoding="utf-8")
+    template = (APP / "templates" / "admin.php").read_text(encoding="utf-8")
+    js = (APP / "js" / "admin.js").read_text(encoding="utf-8")
+    css = (APP / "css" / "admin.css").read_text(encoding="utf-8")
+    provider = (ROOT / "rag" / "openai_provider.py").read_text(encoding="utf-8")
+
+    assert "<admin-section>OCA\\Sunaq\\Sections\\AdminSection</admin-section>" in info
+    assert "return 'sunaq';" in settings
+    assert "implements IIconSection" in section
+    assert "return 'sunaq';" in section
+    assert "return 'SunaQ';" in section
+    assert "imagePath('sunaq', 'app-dark.svg')" in section
+    dark_icon = (APP / "img" / "app-dark.svg").read_text(encoding="utf-8")
+    assert 'stroke="#000"' in dark_icon
+
+    assert "admin#status" in routes
+    assert "'/admin/status'" in routes
+    assert "public function status()" in controller
+    assert "$baseUrl . '/v1/models'" in controller
+    assert "'Authorization' => 'Bearer ' . $apiKey" in controller
+    assert "IUserSession" in controller
+    assert "$this->userSession->getUser()" in controller
+    assert "$headers['X-RAG-User-ID'] = $uid" in controller
+    assert "'maintenance' => $maintenance" in controller
+    assert "'configuredModelCount' => $configuredModelCount" in controller
+    assert "'architectureTier'" in controller
+    assert "'adminUrl' => $baseUrl . '/rag-admin/'" in controller
+
+    assert 'id="sunaq-connection-status"' in template
+    assert 'id="sunaq-test-connection"' in template
+    assert 'id="sunaq-server-admin-link"' in template
+    assert "function testConnection()" in js
+    assert "/apps/sunaq/admin/status" in js
+    assert "testConnection();" in js
+    assert "document.readyState === 'loading'" in js
+    assert "init();" in js
+    assert "Maintenance-Modus aktiv" in js
+    assert "von ' + data.configuredModelCount + ' Modellen für diesen Nutzer freigegeben" in js
+    assert ".sunaq-admin-card" in css
+
+    assert '"version": VERSION' in provider
+    assert '"architecture_tier": architecture_tier(PROVIDER_CONFIG)' in provider
+    assert '"configured_model_count": len(SUNAQ_MODEL_REGISTRY.list())' in provider

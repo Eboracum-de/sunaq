@@ -1,6 +1,6 @@
 # Retrieval architecture prototype
 
-**Status:** retrieval architecture for the `0.8.7-rc1` release candidate  
+**Status:** retrieval architecture for the `0.8.8-rc1` release candidate  
 **Principle:** **modular first, distributed second**
 
 This document defines the intended seams for incrementally reducing

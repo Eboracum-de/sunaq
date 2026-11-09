@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.8-rc1 – 2026-11-09
+- Align the main SunaQ query/rewrite contract with the newer SunaQ Find path: keep model output at structured intent/SearchSpec level, preserve explicit entities/concepts/constraints and compile final Elasticsearch queries deterministically in middleware code.
+- Improve first-pass lexical retrieval without changing the one-round default architecture; quoted phrases remain guarded as phrases while entity/concept alternatives are compiled into deterministic required/optional groups.
+- Add a periodic ES→Qdrant sync heartbeat (default every 30s) with compact scan/delta counters, plus explicit stale-cleanup phase logging.
+- Avoid repeated full-source hydration for hashless Elasticsearch records by using the cheap ES document version as the reconciliation fingerprint; batch empty/excluded inventory writes to prevent thousands of serial Qdrant roundtrips.
+- Harden upgrades by completing legacy/incomplete `research_backends.brave-search` and `openai-research` declarations without overriding administrator choices; bound Neo4j schema-init attempts and expose retry errors.
+- Move Elasticsearch→Qdrant reconciliation authority from SQLite into Qdrant itself. Complete runs now compare the ES `_id+hash` inventory against a compact companion Qdrant sync-inventory collection (one metadata point per ES document, no semantic vector payload), hydrate only true deltas, and delete stale vector points from the ES↔Qdrant set difference. Existing vectorized SQLite rows are used only once as a migration source; normal vector sync no longer reads or writes `state.sqlite`.
+- Make complete unscoped Elasticsearch→Qdrant synchronization a true inventory-delta pass: Elasticsearch returns only lightweight `_id` + `hash`/document-version metadata, SunaQ compares those fingerprints against the Qdrant companion inventory, and only new/changed documents are hydrated through batched Elasticsearch `_mget` calls. Vectorized, empty and semantically excluded dispositions remain in the Qdrant inventory so unchanged exclusions require no repeated full fetch; missing ES IDs remove stale vector and inventory points deterministically.
+- Reduce sync log noise by moving per-document semantic-filter messages from INFO to DEBUG; the normal INFO log retains aggregate exclusion counters.
+- Keep full-scan deletion detection and deterministic Qdrant vector/inventory lifecycle semantics, add a process lock so manual and periodic sync runs cannot mutate vector state concurrently, and expose last-run duration plus new/updated/unchanged/deleted/full-source-fetch counters in the Vector Admin view.
+- Add an Admin **Jetzt synchronisieren** action and raise the default background poll interval from 5 to 15 minutes; fresh installations still start the runtime sync gate paused.
+- Pin the bundled Qdrant server image to validated `qdrant/qdrant:v1.19.2` while retaining Qdrant as the current vector backend for 0.8.8.
+
 ## 0.8.7-rc1 – 2026-10-17
 - Finalize the first public 0.8.7 release-candidate runtime identifier as `0.8.7-rc1` across Admin, API and Provider surfaces; internal development branch numbering is not exposed as the release version.
 - Release the bundled Nextcloud app as 0.3.16 with **Dateinamen mit SunaQ vorschlagen** in Files: keep the NC23-25 legacy action path, add compatibility adapters for the NC26-32 and NC33+ Files action generations, keep file IDs string-safe, require explicit user confirmation, and execute the rename through Nextcloud's Node API.

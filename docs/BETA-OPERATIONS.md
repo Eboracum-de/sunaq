@@ -1,6 +1,6 @@
 # Beta operations runbook
 
-**Reference:** `0.8.7-rc1`  
+**Reference:** `0.8.8-rc1`  
 **Target:** controlled beta deployment behind an administrator-managed network boundary
 
 This document is the short operational path for the current beta candidate. For
@@ -9,7 +9,7 @@ administration see `ADMINISTRATION.md`.
 
 ## 1. Supported deployment and architecture axes
 
-0.8.7-rc1 separates deployment packaging from the information/data boundary.
+0.8.8-rc1 retains the deployment/architecture separation introduced in 0.8.7 and hardens the existing-installation upgrade and synchronization paths.
 Both supported deployment mechanisms use the same middleware contracts:
 
 | Axis | Values | Meaning |
@@ -102,7 +102,7 @@ Apache should then proxy only `/v1/`, `/auth/nextcloud/`, `/rag-admin/`, `/rag-a
 
 ### Reruns and recorded installation command
 
-The installer also refuses a non-empty `--prefix` that is not recognized as an SunaQ installation. This is a safety boundary because profile refreshes replace selected top-level paths such as `rag/`, `docs/` and `clients/`. A typo such as pointing `--prefix` at an unrelated application directory must therefore fail before any files are changed. Fresh 0.8.6 installs should use the default dedicated `/opt/sunaq` path. Recognized older installations keep their existing prefix and legacy marker compatibility; new installs write `.sunaq-installation` plus installer state for future reruns.
+The installer also refuses a non-empty `--prefix` that is not recognized as an SunaQ installation. This is a safety boundary because profile refreshes replace selected top-level paths such as `rag/`, `docs/` and `clients/`. A typo such as pointing `--prefix` at an unrelated application directory must therefore fail before any files are changed. Fresh 0.8.8-rc1 installs should use the default dedicated `/opt/sunaq` path. Recognized older installations keep their existing prefix and legacy marker compatibility; new installs write `.sunaq-installation` plus installer state for future reruns.
 
 
 After installation, keep `/opt/sunaq/install/last-install-command.sh` with the
@@ -163,7 +163,7 @@ sudo /opt/sunaq/install/maintenance-mode.sh on
 sudo /opt/sunaq/install/backup-restore.sh create /srv/sunaq-backups
 ```
 
-`create` writes a timestamped directory such as `sunaq-backup-20261016-123702Z` and verifies it before publishing it. The recovery set contains SunaQ-owned configuration/runtime state, administrator-owned `models/`, non-Qdrant SQLite state including `runtime/users.sqlite`, the matching credential master key, worker-control state, current Dockerized site state, private CA/TLS/operator state below the installation prefix and bundled Neo4j when selected. It deliberately does not back up Nextcloud, Elasticsearch, rebuildable Qdrant or its sync database, external Neo4j, OpenWebUI/Playwright state or model caches.
+`create` writes a timestamped directory such as `sunaq-backup-20261016-123702Z` and verifies it before publishing it. The recovery set contains SunaQ-owned configuration/runtime state, administrator-owned `models/`, non-Qdrant SQLite state including `runtime/users.sqlite`, the matching credential master key, worker-control state, current Dockerized site state, private CA/TLS/operator state below the installation prefix and bundled Neo4j when selected. It deliberately does not back up Nextcloud, Elasticsearch, rebuildable Qdrant data, including its companion sync-inventory collection, external Neo4j, OpenWebUI/Playwright state or model caches.
 
 Treat the recovery directory as a secret: it contains service credentials and the credential master key. Store it with restrictive permissions and, where appropriate, encrypted/off-host.
 
@@ -182,7 +182,7 @@ sudo /opt/sunaq/install/backup-restore.sh restore \
   /srv/sunaq-backups/sunaq-backup-YYYYMMDD-HHMMSSZ --yes
 ```
 
-Restore is intentionally conservative: the supported deployment profile/mode and installation prefix must match the recovery set. Existing non-Qdrant SQLite main/WAL/SHM state covered by the set is replaced coherently; bundled Neo4j is restored when included. Because Qdrant itself is not included, any restored legacy vector-sync database is removed. Restore or reset any surviving Qdrant collection as appropriate and run a full ES -> Qdrant sync before returning to service. A successful restore **leaves SunaQ in maintenance mode**. Run smoke/health/live-ACL checks and at least one authenticated document query before returning to normal service:
+Restore is intentionally conservative: the supported deployment profile/mode and installation prefix must match the recovery set. Existing non-Qdrant SQLite main/WAL/SHM state covered by the set is replaced coherently; bundled Neo4j is restored when included. Because Qdrant itself is not included, any restored legacy vector-sync SQLite state is not treated as authoritative. Restore or reset any surviving Qdrant vector/inventory collections as appropriate and run a full ES -> Qdrant sync before returning to service. A successful restore **leaves SunaQ in maintenance mode**. Run smoke/health/live-ACL checks and at least one authenticated document query before returning to normal service:
 
 ```bash
 sudo /opt/sunaq/install/maintenance-mode.sh off
@@ -192,7 +192,7 @@ Earlier recovery acceptance exercised a real `users.sqlite` loss: the provider f
 
 For cross-system recovery order, key/master-key pairing and deletion/lifecycle scope, see `DATA-LIFECYCLE.md`.
 
-## 4. SunaQ Recherche 0.3.16
+## 4. SunaQ Recherche 0.3.21
 
 SunaQ Recherche is the preferred slim Nextcloud UI for this beta. It targets Nextcloud 23+.
 Install the `sunaq` app in Nextcloud, enable it, then configure **SunaQ URL**
@@ -362,7 +362,7 @@ will be used. Nextcloud, Elasticsearch and the LLM are external in this figure.
 
 ## 10. Beta freeze
 
-0.8.7-rc1 is the current deployment/operations release-candidate baseline.
+0.8.8-rc1 is the current deployment/operations release-candidate baseline.
 Expected follow-up work before broader feature expansion is security/curation
 hardening, documentation consistency and adversarial code-vs-docs tests (ACL,
 aliases, Findings, archive boundaries and untrusted content). A change that alters

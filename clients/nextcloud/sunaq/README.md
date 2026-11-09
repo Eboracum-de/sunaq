@@ -1,6 +1,6 @@
-# SunaQ Recherche 0.3.16
+# SunaQ Recherche 0.3.21
 
-Schlankes Nextcloud-23+-Frontend für SunaQ / Eboracum Research Gateway 0.8.6.
+Schlankes Nextcloud-23+-Frontend für SunaQ / Eboracum Research Gateway 0.8.8-rc1.
 
 ## Current behaviour
 
@@ -111,3 +111,11 @@ optional Kontakt-DB synchronization.
 
 - 0.3.15: adds an NC23-compatible SSE proxy and incremental browser rendering; keeps the existing JSON chat endpoint as fallback and preserves provider follow-up actions through the request-status channel.
 - 0.3.16: adds the SunaQ filename-suggestion action to Nextcloud Files, keeping the NC23-25 legacy adapter and adding separate current Files adapters for NC26-32 and NC33+; rename remains user-confirmed and is executed through Nextcloud's Node API.
+
+- 0.3.17: aligns the user layout with SunaQ Find, adds admin-side diagnostics/display controls and runtime status, and bumps the app version so updated browser assets are invalidated reliably.
+
+- 0.3.18: restores chat-style composer placement below the conversation and removes the focus shadow that could visually break the composer border in Nextcloud themes.
+
+- 0.3.19: decouples the chat column from sidebar height, keeps the composer directly below the latest answer, and clips Nextcloud hover/focus layers to the rounded composer border.
+
+- 0.3.20: fixes the collapsed research-history layout by switching the workspace to a single full-width chat column when the sidebar is hidden.

@@ -1,6 +1,6 @@
 # SRC / ERG Internal / ERG Full architecture
 
-**Status:** target architecture for the `0.8.7-rc1` development line. The
+**Status:** target architecture for the `0.8.8-rc1` release-candidate line. The
 three tiers are enforced capability/trust envelopes, not separate products and
 not deployment mechanisms.
 

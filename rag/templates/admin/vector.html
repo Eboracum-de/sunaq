@@ -4,7 +4,7 @@
 <div class="heading-row">
   <div>
     <h1>Vektor / Qdrant</h1>
-    <p class="muted">Read-only Übersicht der konfigurierten Qdrant-Collection und des Elasticsearch→Qdrant-Syncs.</p>
+    <p class="muted">Übersicht der konfigurierten Qdrant-Collection und des Elasticsearch→Qdrant-Syncs.</p>
   </div>
   <a class="button secondary" href="{{ request.app.url_path_for('admin_vector') }}">Neu prüfen</a>
 </div>
@@ -20,11 +20,17 @@
 <h2>Sync-Worker</h2>
 <p>Der Worker-Prozess darf installiert/laufend sein, führt aber nur bei gesetzter Laufzeitfreigabe Synchronisationsläufe aus. Neue Installationen starten bewusst pausiert.</p>
 {% if worker.configured %}
+<div class="inline-form">
 <form method="post" action="{{ request.app.url_path_for('admin_worker_control', worker_name='sync_worker') }}" class="inline-form">
   <input type="hidden" name="enabled" value="{{ '0' if worker.runtime_enabled else '1' }}">
   <button class="{{ 'danger-outline' if worker.runtime_enabled else '' }}" type="submit">{{ 'Sync pausieren' if worker.runtime_enabled else 'Sync freigeben' }}</button>
   <span class="muted">max_documents={{ worker.max_documents }} · enqueue_graph={{ 'an' if worker.enqueue_graph else 'aus' }}</span>
 </form>
+<form method="post" action="{{ request.app.url_path_for('admin_vector_sync_now') }}" class="inline-form">
+  <button class="secondary" type="submit">Jetzt synchronisieren</button>
+  <span class="muted">Manueller Vollabgleich; ein bereits laufender Sync wird nicht parallel gestartet.</span>
+</form>
+</div>
 {% else %}
 <p class="muted">Sync-Worker ist in config.yaml nicht aktiviert.</p>
 {% endif %}
@@ -34,8 +40,11 @@
 <h2>Abdeckung des Vektorkorpus</h2>
 <p class="muted">Der Elasticsearch-Zähler ist der rohe Indexbestand. Unterschiede zum Vektorkorpus können durch Pfadfilter, semantische Ausschlüsse (z. B. Archive/Rohmail), leeren extrahierten Text oder zurückgestellte Embeddings entstehen. Die Übersicht fragt Nextcloud nicht ab.</p>
 <dl class="details">
-  <dt>Letzter Sync</dt><dd>{{ corpus.last_sync_at or '—' }}{% if corpus.last_sync_at %} · {{ 'vollständiger Lauf' if corpus.complete_full_scan else 'Teil-/Scope-Lauf' }}{% endif %}</dd>
+  <dt>Letzter Sync</dt><dd>{{ corpus.last_sync_at or '—' }}{% if corpus.last_sync_at %} · {{ 'vollständiger Lauf' if corpus.complete_full_scan else 'Teil-/Scope-Lauf' }}{% endif %}{% if corpus.duration_seconds is not none %} · {{ corpus.duration_seconds }} s{% endif %}</dd>
   <dt>Im Lauf gescannt</dt><dd>{{ corpus.scanned if corpus.scanned is not none else '—' }}</dd>
+  <dt>Volltext geladen</dt><dd>{{ corpus.full_source_fetched if corpus.full_source_fetched is not none else '—' }} <span class="muted">(nur neu/geändert bzw. filterbedingt)</span></dd>
+  <dt>Neu / geändert / unverändert</dt><dd>{{ corpus.new if corpus.new is not none else '—' }} / {{ corpus.updated if corpus.updated is not none else '—' }} / {{ corpus.unchanged if corpus.unchanged is not none else '—' }}</dd>
+  <dt>Gelöscht</dt><dd>{{ corpus.deleted if corpus.deleted is not none else '—' }}</dd>
   <dt>Für Semantik zugelassen</dt><dd>{{ corpus.eligible_seen if corpus.eligible_seen is not none else '—' }}</dd>
   <dt>Im letzten Lauf ausgeschlossen</dt><dd>{{ corpus.excluded_semantic if corpus.excluded_semantic is not none else '—' }}</dd>
   <dt>Im letzten Lauf außerhalb Scope</dt><dd>{{ corpus.out_of_scope if corpus.out_of_scope is not none else '—' }}</dd>

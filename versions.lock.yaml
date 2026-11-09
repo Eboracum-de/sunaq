@@ -1,4 +1,4 @@
-release: 0.8.7-rc1
+release: 0.8.8-rc1
 python:
   torch: 2.13.0+cpu
   transformers: 4.57.6
@@ -10,9 +10,9 @@ docker:
     digest: sha256:97d490c12ba55b4946b01546d1c3ed324e8d41ab1c9fcb2a616aa470620e5b46
     ref: nginx:1.30.4-alpine3.24@sha256:97d490c12ba55b4946b01546d1c3ed324e8d41ab1c9fcb2a616aa470620e5b46
   qdrant:
-    tag: qdrant/qdrant:v1.19.0
-    digest: sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
-    ref: qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
+    tag: qdrant/qdrant:v1.19.2
+    digest: sha256:b7b0444c4c351c970b98e90a6f89c2ee4287c65b44e52b4cb503fa5b2aa927ad
+    ref: qdrant/qdrant:v1.19.2@sha256:b7b0444c4c351c970b98e90a6f89c2ee4287c65b44e52b4cb503fa5b2aa927ad
   neo4j:
     tag: neo4j:5.26.29-community
     digest: sha256:d9dd3dc7d1c78fa959191ff02dbdcbefadceaf83eee23428fb92a58cac8ad3fe

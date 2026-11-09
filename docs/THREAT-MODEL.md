@@ -1,6 +1,6 @@
 # Threat model and security boundaries
 
-**Reference:** `0.8.7-rc1` development line
+**Reference:** `0.8.8-rc1` release-candidate line
 
 This document states the security assumptions of SunaQ as they exist in the current release-candidate line. It separates **retrieval knowledge**, **authorization**, and **answer evidence** because these have deliberately different sharing rules.
 

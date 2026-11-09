@@ -1,8 +1,8 @@
 # SunaQ technical reference
 ## Technical documentation and command reference
 
-**Version:** `0.8.7-rc1` development reference  
-**Updated:** 9 October 2026
+**Version:** `0.8.8-rc1` release-candidate reference  
+**Updated:** 9 November 2026
 
 This file is the consolidated technical reference for the current retrieval-architecture development line. It is not a tagged release contract. Where older notes conflict with the current implementation, this reference together with `config.yaml`, `models/*/profile.yaml`, `models/README.md`, `web.yaml`, `provider.env.example` and `versions.lock.yaml` describes the intended branch baseline. Design rationale lives in `docs/WHITEPAPER.md`; architecture-tier policy lives in `docs/SRC-ERG.md`.
 
@@ -44,7 +44,7 @@ Without a user UI, `/` redirects to `/rag-admin/`.
 
 ### Internal API trust boundary
 
-Port `8765` is an internal FastAPI service and is loopback-bound by the supported profiles. The current 0.8.7-rc1 line enforces explicit route zones through central FastAPI dependencies:
+Port `8765` is an internal FastAPI service and is loopback-bound by the supported profiles. The current 0.8.8-rc1 line enforces explicit route zones through central FastAPI dependencies:
 
 - `PUBLIC`: no internal machine credential; currently only `/live`;
 - `INTERNAL`: requires `X-AKI-Internal-Key` / `RAG_INTERNAL_API_KEY`;
@@ -58,7 +58,7 @@ Core FastAPI routes expose their assigned zone in OpenAPI as `x-aki-security-zon
 
 ### Architecture, preset, model-profile and deployment axes
 
-0.8.7-rc1 separates four independent concepts:
+0.8.8-rc1 retains four independent concepts:
 
 - **SRC / ERG Internal / ERG Full** are enforced retrieval/data-plane trust
   envelopes. SRC is Documents-only Files/Elasticsearch with mandatory live ACL
@@ -1902,7 +1902,7 @@ For latency measurements, record the WebDAV SEARCH time separately from total an
 
 # 22. Current feature/freeze status
 
-**Implemented on the current 0.8.7-rc1 development branch:**
+**Implemented on the current 0.8.8-rc1 release-candidate branch:**
 
 - common middleware core supporting both `standard` and `dockerized` deployment,
   with architecture tier and capability preset selected independently;
@@ -1914,7 +1914,7 @@ For latency measurements, record the WebDAV SEARCH time separately from total an
   boundary;
 - bounded Candidate Verification without adaptive post-denial backfill;
 - deterministic follow-up actions and identity-scoped request progress;
-- SunaQ Recherche **0.3.16** for Nextcloud 23+;
+- SunaQ Recherche **0.3.21** for Nextcloud 23+;
 - Brave/SearXNG Web Research and optional Nextcloud-backed Mail and Chat archives (including persisted Web Evidence);
 - authenticated source-capability filtering: optional sources are available only
   while the global service gate and the canonical user's gate are both enabled,
@@ -1933,7 +1933,7 @@ For latency measurements, record the WebDAV SEARCH time separately from total an
 - maintenance/recovery tooling inherited from earlier release candidates and
   retained in the current line.
 
-**Still intentionally outside the current 0.8.7-rc1 baseline:**
+**Still intentionally outside the current 0.8.8-rc1 baseline:**
 
 - full server-authoritative conversation-state migration as a released/stable contract;
 - configured policy/inspection adapters for the rc1.1 hook scaffold;
@@ -1963,7 +1963,7 @@ inside each caller.
 
 # 23. Release validation
 
-The current 0.8.7-rc1 release-candidate branch builds on the 0.8.6 hardening line and adds boundary-focused regression coverage for:
+The current 0.8.8-rc1 release-candidate branch builds on the 0.8.7 retrieval/provenance line and adds query-contract, synchronization and upgrade-hardening regression coverage in addition to the existing boundary-focused checks for:
 JSON evidence isolation and immutable evidence guards, Web/Playwright SSRF
 controls, file-backed secret loading, SRC/ERG startup/request invariants,
 Documents-only deterministic SRC lookup paths and safe capability preset parsing.

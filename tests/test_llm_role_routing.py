@@ -1,4 +1,6 @@
 import os
+
+import pytest
 from dataclasses import replace
 
 import rag.llm_roles as roles
@@ -201,3 +203,40 @@ def test_explicit_context_budget_equal_to_legacy_default_is_not_a_profile_sentin
     )
     assert included
     assert len(context) <= provider.CONTEXT_MAX_CHARS
+
+
+
+def test_non_loopback_http_llm_requires_explicit_opt_in():
+    with pytest.raises(RuntimeError, match="ALLOW_INSECURE_LLM"):
+        roles.build_role_backends(
+            default_backend="ollama",
+            default_base_url="http://10.0.0.5:11434",
+            default_model="local-model",
+            default_api_key="",
+            default_verify_tls=True,
+            default_ca_file=None,
+        )
+
+    built = roles.build_role_backends(
+        default_backend="ollama",
+        default_base_url="http://10.0.0.5:11434",
+        default_model="local-model",
+        default_api_key="",
+        default_verify_tls=True,
+        default_ca_file=None,
+        default_allow_insecure_http=True,
+    )
+    assert built["default"].base_url == "http://10.0.0.5:11434"
+    assert built["default"].backend.info()["allow_insecure_http"] is True
+
+
+def test_loopback_http_llm_needs_no_insecure_opt_in():
+    built = roles.build_role_backends(
+        default_backend="ollama",
+        default_base_url="http://127.0.0.1:11434",
+        default_model="local-model",
+        default_api_key="",
+        default_verify_tls=True,
+        default_ca_file=None,
+    )
+    assert built["default"].backend.info()["allow_insecure_http"] is False

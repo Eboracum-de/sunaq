@@ -73,10 +73,10 @@ def test_normal_compact_verifier_schema_and_evidence(monkeypatch):
 
 def test_candidate_verifier_prompt_treats_substantive_topical_cross_references_as_direct_evidence():
     prompt = provider.CANDIDATE_VERIFIER_SYSTEM_PROMPT
-    assert 'breite Entitäts-/Informationsanfrage' in prompt
-    assert 'substanzielle Tatsachen über genau diese Entität' in prompt
-    assert 'inhaltlich aussagekräftige Querverweise' in prompt
-    assert 'lediglich genannt oder zitiert' in prompt
+    assert 'broad entity/information request' in prompt
+    assert 'substantive facts clearly attributable to that entity' in prompt
+    assert 'substantively useful cross-references' in prompt
+    assert 'merely named or cited' in prompt
 
 
 def test_common_verifier_policy_is_appended_after_preserved_profile_override(monkeypatch):
@@ -87,10 +87,10 @@ def test_common_verifier_policy_is_appended_after_preserved_profile_override(mon
     )
     prompt = provider._candidate_verifier_prompt()
     assert prompt.startswith("ALTES PROFIL")
-    assert "GEMEINSAMER VERIFIER-VERTRAG" in prompt
+    assert "COMMON VERIFIER CONTRACT" in prompt
     assert "source_origin=chat_archive" in prompt
-    assert "Elasticsearch-Ausschnitte" in prompt
-    assert "NICHT in eine Forderung umgedeutet" in prompt
+    assert "Elasticsearch excerpts" in prompt
+    assert "must NOT be reinterpreted" in prompt
 
 
 def test_normal_compact_verifier_splits_malformed_batch(monkeypatch):
@@ -168,6 +168,6 @@ def test_verifier_prompt_receives_query_rewrite_requirements(monkeypatch):
     ))
     assert len(matches) == 1
     assert uncertain == []
-    assert "VERIFIKATIONSANFORDERUNGEN AUS DEM QUERY-REWRITE" in captured["prompt"]
+    assert "VERIFICATION REQUIREMENTS FROM QUERY REWRITE" in captured["prompt"]
     assert "Februar 2021" in captured["prompt"]
     assert "selbst eine Rechnung" in captured["prompt"]

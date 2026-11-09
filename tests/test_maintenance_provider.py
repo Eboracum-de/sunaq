@@ -68,6 +68,17 @@ async def test_maintenance_health_is_explicit():
     assert result["maintenance"] is True
 
 
+@pytest.mark.asyncio
+async def test_maintenance_model_probe_reports_state_and_version(monkeypatch, tmp_path):
+    cfg, api_key = _registry(tmp_path)
+    monkeypatch.setenv("RAG_CONFIG_FILE", str(cfg))
+    result = await maintenance.list_models(authorization="Bearer " + api_key)
+    assert result["status"] == "maintenance"
+    assert result["maintenance"] is True
+    assert result["version"] == maintenance.VERSION
+    assert len(result["data"]) == 1
+
+
 def test_nginx_admin_returns_explicit_maintenance_status_when_api_is_down():
     root = Path(__file__).resolve().parents[1]
     for name in ("nginx.conf", "nginx-openwebui.conf"):

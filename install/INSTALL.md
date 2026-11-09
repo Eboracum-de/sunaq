@@ -1,4 +1,4 @@
-# Installation – 0.8.7-rc1
+# Installation – 0.8.8-rc1
 
 All deployment variants use the single public entry point `install/install.sh`.
 Architecture boundary, capability bundle and packaging are selected independently:
@@ -18,7 +18,7 @@ Fresh SunaQ installations default to **`/opt/sunaq`**. A recognized existing
 installation is deliberately kept at its current prefix (for example
 `/opt/sunaq`); the installer does not move site-owned runtime state.
 
-The 0.8.7-rc1 release-candidate line retains the 0.8.6 hardening baseline and adds the three-tier SRC / ERG Internal / ERG Full model, deterministic structured Files query compilation, resolver/retriever boundaries and ResearchRun decision/execution provenance. `--architecture-tier` selects the normative policy boundary, `core|workgroup|full` select recommended capability bundles, and `standard|dockerized` select deployment.
+The 0.8.8-rc1 release-candidate line retains the three-tier SRC / ERG Internal / ERG Full model and ResearchRun provenance from 0.8.7, while hardening the structured query/rewrite contract, Elasticsearch compilation, ES→Qdrant synchronization and existing-installation upgrade path. `--architecture-tier` selects the normative policy boundary, `core|workgroup|full` select recommended capability bundles, and `standard|dockerized` select deployment.
 The security and user-configuration model remains:
 
 - multi-user + live Nextcloud ACL is the safe installation default;
@@ -228,7 +228,7 @@ explicit release changes, not side effects of a mutable tag.
 
 Edit `/opt/sunaq/config.yaml`. During this phase the provider returns only `SunaQ ist im Maintenance-Modus. Bitte versuchen Sie es später erneut.` after successful provider-key authentication.
 
-The operator switch uses the installation prefix reported by the installer plan. For a fresh 0.8.7-rc1 installation:
+The operator switch uses the installation prefix reported by the installer plan. For a fresh 0.8.8-rc1 installation:
 
 ```bash
 sudo /opt/sunaq/install/maintenance-mode.sh status
@@ -790,7 +790,7 @@ Qdrant, embedding backend and Nextcloud Live-ACL.
 
 Fresh installs create `runtime/credential-master.key` as `root:rag 0640`, add
 `RAG_CREDENTIAL_MASTER_KEY_FILE` and `RAG_CREDENTIAL_ENCRYPTION=required` to
-`runtime.env`, and verify the encrypted credential store. `0.8.7-rc1` is the current release-candidate baseline; it is not yet a tagged release contract. No upgrade path from unpublished internal snapshots is documented or supported.
+`runtime.env`, and verify the encrypted credential store. `0.8.8-rc1` is the current release-candidate baseline. No upgrade path from unpublished internal snapshots is documented or supported.
 
 The master key must be backed up separately. The Admin UI can report encryption
 status and replace IMAP credentials, but does not reveal stored secrets or create

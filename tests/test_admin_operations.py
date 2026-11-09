@@ -16,7 +16,7 @@ def test_admin_exposes_worker_runtime_controls_without_host_service_privileges()
     assert "admin_worker_control" in vector
 
 
-def test_admin_has_read_only_system_diagnostics_and_vector_views():
+def test_admin_has_system_diagnostics_and_vector_sync_controls():
     admin = (ROOT / "rag/admin_ui.py").read_text(encoding="utf-8")
     base = (ROOT / "rag/templates/admin/base.html").read_text(encoding="utf-8")
     system = (ROOT / "rag/templates/admin/system.html").read_text(encoding="utf-8")
@@ -33,13 +33,15 @@ def test_admin_has_read_only_system_diagnostics_and_vector_views():
     assert "Provider /live" in system
     assert "provider_live_probe" in system
     assert "Qdrant" in vector
-    assert "read-only" in vector.lower()
     assert "Elasticsearch" in vector
     assert "Vektorisiert" in vector
     assert "Für Semantik zugelassen" in vector
     assert "HNSW-indexierte Vektoren" in vector
     assert "_elasticsearch_document_count" in admin
     assert "_sync_status_snapshot" in admin
+    assert '@router.post("/vector/sync-now"' in admin
+    assert "admin_vector_sync_now" in vector
+    assert "full_source_fetched" in vector
 
 
 def test_installers_seed_missing_workers_paused_but_do_not_overwrite_runtime_control():

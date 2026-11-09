@@ -1,6 +1,6 @@
 # Privacy architecture and trust boundary
 
-**Reference:** `0.8.7-rc1` release candidate
+**Reference:** `0.8.8-rc1` release candidate
 
 The middleware deliberately separates access to the complete private corpus from
 processing of already selected evidence. Privacy is therefore not defined as

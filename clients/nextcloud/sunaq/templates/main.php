@@ -2,7 +2,9 @@
 script('sunaq', 'app');
 style('sunaq', 'style');
 ?>
-<div id="sunaq-app" class="sunaq-workspace">
+<div id="sunaq-app" class="sunaq-workspace"
+     data-analysis-mode="<?php p(!empty($_['analysis_mode']) ? '1' : '0'); ?>"
+     data-show-search-strategy="<?php p(!empty($_['show_search_strategy']) ? '1' : '0'); ?>">
     <aside id="sunaq-sidebar" class="sunaq-sidebar" aria-label="Rechercheverlauf">
         <div class="sunaq-sidebar-head">
             <strong>Recherchen</strong>
@@ -31,13 +33,6 @@ style('sunaq', 'style');
                 <div class="sunaq-content">Was möchten Sie finden?</div>
             </div>
         </main>
-
-        <div id="sunaq-status" class="sunaq-status" aria-live="polite"></div>
-        <details id="sunaq-retrieval-strategy" class="sunaq-retrieval-strategy" hidden>
-            <summary>Suchstrategie</summary>
-            <pre id="sunaq-retrieval-strategy-content"></pre>
-        </details>
-
         <form id="sunaq-form" class="sunaq-composer">
             <div class="sunaq-composer-box">
                 <label class="hidden-visually" for="sunaq-input">Suchanfrage</label>
@@ -69,5 +64,16 @@ style('sunaq', 'style');
             </div>
             <p class="sunaq-composer-hint">Enter sendet · Shift+Enter fügt eine neue Zeile ein · Slash-Directives übersteuern die Quellenauswahl.</p>
         </form>
+
+        <div id="sunaq-status" class="sunaq-status" aria-live="polite"></div>
+        <details id="sunaq-retrieval-strategy" class="sunaq-retrieval-strategy" hidden>
+            <summary>Suchstrategie</summary>
+            <pre id="sunaq-retrieval-strategy-content"></pre>
+        </details>
+        <details id="sunaq-analysis" class="sunaq-retrieval-strategy sunaq-analysis" hidden>
+            <summary>Analyse und Laufzeit</summary>
+            <pre id="sunaq-analysis-content"></pre>
+        </details>
+
     </section>
 </div>

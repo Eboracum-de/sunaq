@@ -3,7 +3,14 @@ architecture:
   # src | erg_internal | erg_full. Legacy "erg" is accepted as erg_full.
   tier: erg_full
 
-# SunaQ / Eboracum Research Gateway - 0.8.7-rc1
+# SunaQ / Eboracum Research Gateway - 0.8.8-rc1
+
+# Languages expected in the indexed document corpus for lexical expansion.
+# Independent from the user's interaction/answer language. Default matches
+# SunaQ Find: German corpus vocabulary; add further languages only when the
+# indexed corpus actually uses them.
+retrieval_languages:
+  - de
 
 health:
   timeout_seconds: 4
@@ -154,11 +161,12 @@ retrieval_policy:
 # sync.* is the canonical location for chunk/state settings.
 # Periodic Elasticsearch -> Qdrant synchronization.  The worker performs the
 # same incremental state-aware rag.sync run as the CLI; it does not create a
-# second indexing implementation.  A complete ES scan is cheap for unchanged
-# documents but the interval can be raised for very large corpora.
+# second indexing implementation. Unchanged documents are checked using a
+# lightweight metadata/hash scan; full extracted content is fetched only for
+# new or changed documents.
 sync_worker:
   enabled: true
-  poll_interval_seconds: 300
+  poll_interval_seconds: 900
   # Cooperative pause granularity for an already running full sync.
   pause_check_documents: 25
   # 0 = unlimited. Keep 0 for a background worker so documents later in the
@@ -193,6 +201,7 @@ sync:
       - eml
       - msg
       - mbox
+      - pst
       - zip
       - 7z
       - rar

@@ -1,6 +1,6 @@
 # Roadmap
 
-**Baseline:** `0.8.7-rc1` development line
+**Baseline:** `0.8.8-rc1` release-candidate line
 
 This roadmap starts from the capabilities already delivered in the 0.8.6 release
 candidate. Historical work completed in 0.8.5 and earlier belongs in the
@@ -105,12 +105,39 @@ Historical `architecture.tier: erg` remains an upgrade alias for
 `erg_full`. Model-processing and embedding egress remain orthogonal
 administrator decisions.
 
+## 0.8.8-rc1: query contract and synchronization hardening
+
+0.8.8-rc1 is deliberately an under-the-hood release candidate rather than a new
+product-architecture generation. It keeps the 0.8.7 trust and retrieval model
+while consolidating the newer SunaQ Find-style query/rewrite contract and making
+Elasticsearch → Qdrant reconciliation substantially cheaper and more explicit.
+
+Implemented scope:
+
+- keep model output at the structured intent/SearchSpec layer and compile the
+  final Elasticsearch request deterministically in middleware code;
+- retain the one-round default retrieval model while improving first-pass query
+  interpretation and lexical construction;
+- move normal ES→Qdrant reconciliation authority from SQLite into a compact
+  companion Qdrant sync-inventory collection;
+- compare lightweight Elasticsearch `_id` plus `hash`/document-version
+  fingerprints and hydrate full source only for real deltas;
+- delete stale Qdrant/vector inventory records from the ES↔Qdrant set
+  difference and batch inventory updates for empty/excluded records;
+- add compact sync progress heartbeats and expose delta/full-source counters in
+  Admin;
+- harden installer reruns for legacy research-backend declarations and bound
+  Neo4j schema-init attempts with visible diagnostics.
+
+The server-authoritative chat-history redesign is intentionally deferred to the
+0.9 development line.
+
 The current branch deliberately keeps Standard/Thorough/Deep (Schnell/Thorough (Gründlich) / Deep (Tief)) at one retrieval
 round while the first-pass query architecture is stabilized. More retrieval
 rounds are a later quality experiment, not a substitute for correct first-pass
 semantic planning and deterministic compilation.
 
-## Post-0.8.7-rc1 targets
+## Post-0.8.8-rc1 / 0.9 targets
 
 ### Retrieval-quality experiments
 
@@ -167,7 +194,7 @@ because a question asks for "all" documents.
 
 ### Profile tuning
 
-Use real workloads to tune Schnell/Gründlich/Tief after the 0.8.7-rc1 first-pass retrieval architecture has accumulated field data.
+Use real workloads to tune Schnell/Gründlich/Tief after the 0.8.8-rc1 first-pass query/retrieval path has accumulated field data.
 
 Likely experiments include:
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Bootstrap a blank Linux VM into a usable SunaQ / Eboracum Research Gateway node.
-# 0.8.7-rc1 standard deployment implementation.
+# 0.8.8 development standard deployment implementation.
 
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PREFIX="/opt/sunaq"
@@ -34,6 +34,9 @@ OPENWEBUI_FROM_STATE=0
 WITH_PROXY=0
 PROXY_EXPLICIT=0
 PROXY_FROM_STATE=0
+PROXY_AUTO_SELECTED=0
+PROXY_AUTO_SKIPPED=0
+PROXY_AUTO_SKIP_REASON=""
 PROXY_HTTP_PORT=80
 PROXY_HTTPS_PORT=443
 PROXY_HTTP_PORT_EXPLICIT=0
@@ -90,7 +93,7 @@ Options:
   --core                    Removed legacy shorthand; use --preset core or explicit components
   --with-openwebui          Start/retain bundled OpenWebUI
   --with-playwright         Enable/build/start Playwright Web-archive renderer
-  --with-proxy              Start/retain bundled nginx reverse proxy
+  --with-proxy              Start/retain bundled nginx reverse proxy (fresh default when 80/443 are free)
   --proxy-http-port PORT     nginx HTTP listen port (default: 80)
   --proxy-https-port PORT    nginx HTTPS listen port (default: 443)
   --no-proxy-basic-auth     Disable nginx Basic Auth gate; rate limits remain active
@@ -177,7 +180,7 @@ while [[ $# -gt 0 ]]; do
     --no-playwright) WITH_PLAYWRIGHT=0; PLAYWRIGHT_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; shift ;;
     --with-searxng) echo "--with-searxng was removed from the bundled stack; install/configure SearXNG externally and point web.yaml to it." >&2; exit 2 ;;
     --with-proxy) WITH_PROXY=1; PROXY_EXPLICIT=1; shift ;;
-    --no-proxy) WITH_PROXY=0; PROXY_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; shift ;;
+    --no-proxy) WITH_PROXY=0; PROXY_EXPLICIT=1; shift ;;
     --proxy-http-port) [[ $# -ge 2 ]] || { echo "--proxy-http-port requires a port" >&2; exit 2; }; PROXY_HTTP_PORT="$2"; PROXY_HTTP_PORT_EXPLICIT=1; shift 2 ;;
     --proxy-https-port) [[ $# -ge 2 ]] || { echo "--proxy-https-port requires a port" >&2; exit 2; }; PROXY_HTTPS_PORT="$2"; PROXY_HTTPS_PORT_EXPLICIT=1; shift 2 ;;
     --no-proxy-basic-auth) PROXY_BASIC_AUTH=0; shift ;;
@@ -326,6 +329,149 @@ load_install_state() {
 
 validate_install_prefix
 load_install_state
+
+proxy_port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn 2>/dev/null | awk -v suffix=":""$port" '$4 ~ (suffix "$") { found=1 } END { exit(found ? 0 : 1) }'
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk -v suffix=":""$port" '$4 ~ (suffix "$") { found=1 } END { exit(found ? 0 : 1) }'
+    return $?
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$port" <<'PYPORT'
+import socket, sys
+port = int(sys.argv[1])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind(("0.0.0.0", port))
+except OSError:
+    raise SystemExit(0)
+finally:
+    sock.close()
+raise SystemExit(1)
+PYPORT
+    return $?
+  fi
+  return 2
+}
+
+auto_select_proxy_for_fresh_install() {
+  [[ $PREFIX_RECOGNIZED_SUNAQ -eq 0 && $PROXY_EXPLICIT -eq 0 ]] || return 0
+  local status
+  for port in "$PROXY_HTTP_PORT" "$PROXY_HTTPS_PORT"; do
+    if proxy_port_in_use "$port"; then
+      WITH_PROXY=0
+      PROXY_AUTO_SKIPPED=1
+      PROXY_AUTO_SKIP_REASON="port $port is already in use"
+      return 0
+    else
+      status=$?
+      if [[ $status -eq 2 ]]; then
+        WITH_PROXY=0
+        PROXY_AUTO_SKIPPED=1
+        PROXY_AUTO_SKIP_REASON="port availability could not be checked safely"
+        return 0
+      fi
+    fi
+  done
+  WITH_PROXY=1
+  PROXY_AUTO_SELECTED=1
+}
+
+auto_select_proxy_for_fresh_install
+
+proxy_plan_status() {
+  if [[ $WITH_PROXY -eq 1 ]]; then
+    if [[ $PROXY_FROM_STATE -eq 1 ]]; then
+      printf 'install/start; HTTPS %s + HTTP redirect on %s (retained from existing install)' "$PROXY_HTTPS_PORT" "$PROXY_HTTP_PORT"
+    elif [[ $PROXY_AUTO_SELECTED -eq 1 ]]; then
+      printf 'install/start; HTTPS %s + HTTP redirect on %s (fresh default; ports free)' "$PROXY_HTTPS_PORT" "$PROXY_HTTP_PORT"
+    else
+      printf 'install/start; HTTPS %s + HTTP redirect on %s' "$PROXY_HTTPS_PORT" "$PROXY_HTTP_PORT"
+    fi
+  elif [[ $PROXY_AUTO_SKIPPED -eq 1 ]]; then
+    printf 'skip (fresh default not possible: %s)' "$PROXY_AUTO_SKIP_REASON"
+  else
+    printf 'skip'
+  fi
+}
+
+component_plan_status() {
+  local component="$1"
+  local tier
+  tier="$(requested_architecture_tier)"
+  case "$component:$tier" in
+    qdrant:src|neo4j:src|resolver:src|playwright:src|playwright:erg_internal)
+      printf 'disabled by architecture tier'
+      return 0
+      ;;
+  esac
+  case "$component" in
+    qdrant)
+      [[ $WITH_QDRANT -eq 1 ]] && printf 'install/start' || printf 'disabled/external'
+      ;;
+    neo4j)
+      [[ $WITH_NEO4J -eq 1 ]] && printf 'install/start' || printf 'disabled/external'
+      ;;
+    resolver)
+      [[ $WITH_RESOLVER -eq 1 ]] && printf 'local/component' || printf 'disabled'
+      ;;
+    playwright)
+      if [[ $PLAYWRIGHT_EXPLICIT -eq 1 ]]; then
+        [[ $WITH_PLAYWRIGHT -eq 1 ]] && printf 'enable/build/start' || printf 'disable/remove'
+      elif [[ $WITH_PLAYWRIGHT -eq 1 ]]; then
+        printf 'retain enabled state'
+      else
+        printf 'preserve web.yaml state'
+      fi
+      ;;
+  esac
+}
+
+web_search_plan_status() {
+  if [[ "$(requested_architecture_tier)" == "erg_full" ]]; then
+    printf 'external/admin-managed (not bundled)'
+  else
+    printf 'disabled by architecture tier'
+  fi
+}
+
+web_search_summary_status() {
+  if [[ "$(requested_architecture_tier)" == "erg_full" ]]; then
+    printf 'external/admin-managed; configure web.yaml when needed'
+  else
+    printf 'disabled by architecture tier'
+  fi
+}
+
+component_summary_status() {
+  local component="$1"
+  local tier
+  tier="$(requested_architecture_tier)"
+  case "$component:$tier" in
+    qdrant:src|neo4j:src|resolver:src|playwright:src|playwright:erg_internal)
+      printf 'disabled by architecture tier'
+      return 0
+      ;;
+  esac
+  case "$component" in
+    qdrant)
+      [[ $WITH_QDRANT -eq 1 ]] && printf 'local/running' || printf 'external/not installed by this run'
+      ;;
+    neo4j)
+      [[ $WITH_NEO4J -eq 1 ]] && printf 'local/running' || printf 'external/not installed by this run'
+      ;;
+    resolver)
+      [[ $WITH_RESOLVER -eq 1 ]] && printf 'local/running' || printf 'disabled'
+      ;;
+    playwright)
+      [[ $PLAYWRIGHT_ENABLED -eq 1 ]] && printf 'local/running' || printf 'disabled/not installed by this run'
+      ;;
+  esac
+}
 
 # Fresh installations start from the conservative core capability baseline.
 # --architecture-tier may widen only the policy envelope; it does not
@@ -607,11 +753,11 @@ Install prefix:          $PREFIX
 Service user:            $RAG_USER
 System packages:         $([[ $INSTALL_SYSTEM_PACKAGES -eq 1 ]] && echo install/update || echo leave unchanged)
 Docker/Compose:          $([[ $docker_needed -eq 1 ]] && echo required || echo not required by selected components)
-Reverse proxy/nginx:     $([[ $WITH_PROXY -eq 1 ]] && echo "install/start; HTTPS ${PROXY_HTTPS_PORT} + HTTP redirect on ${PROXY_HTTP_PORT}$([[ $PROXY_FROM_STATE -eq 1 ]] && echo ' (retained from existing install)')" || echo skip)
+Reverse proxy/nginx:     $(proxy_plan_status)
 Proxy Basic Auth gate:    $([[ $WITH_PROXY -eq 1 && $PROXY_BASIC_AUTH -eq 1 ]] && echo enabled || echo disabled)
-Qdrant:                  $([[ $WITH_QDRANT -eq 1 ]] && echo install/start || echo disabled/external)
-Neo4j:                   $([[ $WITH_NEO4J -eq 1 ]] && echo install/start || echo disabled/external)
-ERG resolver:             $([[ $WITH_RESOLVER -eq 1 ]] && echo local/component || echo disabled)
+Qdrant:                  $(component_plan_status qdrant)
+Neo4j:                   $(component_plan_status neo4j)
+ERG resolver:             $(component_plan_status resolver)
 Python venv/dependencies: install/update
 Reranker model cache:     $([[ $DOWNLOAD_RERANKER -eq 1 ]] && echo "pre-download requested (used only for backend=local)" || echo "skip (default; reranker opt-in)")
 LLM/embedding backend:    external/admin-managed (Ollama or compatible service)
@@ -623,19 +769,19 @@ Elasticsearch index:     ${ELASTICSEARCH_INDEX:-<preserve/configure in config.ya
 Architecture tier:       $(requested_architecture_tier)
 Capability preset:       ${PRESET_NAME:-<none>}
 OpenWebUI:                $([[ $WITH_OPENWEBUI -eq 1 ]] && echo "install/start$([[ $OPENWEBUI_FROM_STATE -eq 1 ]] && echo ' (retained from existing install; use --no-openwebui to disable)')" || echo external/skip)
-Playwright renderer:      $([[ $PLAYWRIGHT_EXPLICIT -eq 1 ]] && ([[ $WITH_PLAYWRIGHT -eq 1 ]] && echo enable/build/start || echo disable/remove) || ([[ $WITH_PLAYWRIGHT -eq 1 ]] && echo "retain enabled state" || echo "preserve web.yaml state"))
-Web search service:       external/admin-managed (not bundled)
+Playwright renderer:      $(component_plan_status playwright)
+Web search service:       $(web_search_plan_status)
 ACL mode:                 $([[ $ACL_OFF -eq 1 ]] && echo ACL-OFF-DIAGNOSTIC || ([[ $MULTI_USER -eq 1 ]] && echo multi-user credential_store || echo single_user-live-ACL))
 Systemd units:            $([[ $WITH_SYSTEMD -eq 1 ]] && echo optional install/enable || echo skip \(start scripts are default\))
 Python X.509 strict:      $([[ $X509_STRICT -eq 1 ]] && echo enabled || echo disabled-compatibility-mode)
 Estimated disk use:       roughly ${disk_low}-${disk_high} GiB before indexed/user data
 
-The default install is intentionally minimal: middleware + nginx only. Nextcloud
-and the LLM/embedding backend are expected to be reachable after site configuration.
-Use --core for Qdrant + Neo4j or --full for all bundled optional components. Backend containers
-bind to 127.0.0.1; nginx is the only externally reachable interface.
-A self-signed bootstrap certificate is generated for HTTPS and may be replaced by
-the administrator after installation.
+Fresh installs automatically select the bundled nginx proxy when ports 80 and 443
+are free; use --no-proxy to opt out or integrate with an existing site proxy.
+Nextcloud and the LLM/embedding backend remain external/admin-managed.
+Capability presets remain independent of deployment mode: core is SRC-only,
+workgroup adds internal derived state, and full adds external research capabilities.
+Backend services bind to 127.0.0.1; when selected, nginx is the external interface.
 PLAN
 }
 confirm_plan() {
@@ -1681,17 +1827,20 @@ if [[ $WITH_NEO4J -eq 1 ]]; then
   log "Waiting for Neo4j and applying the idempotent SunaQ schema upgrade"
   NEO4J_SCHEMA_READY=0
   NEO4J_SCHEMA_ATTEMPTS=90
+  NEO4J_SCHEMA_ATTEMPT_TIMEOUT=20
   NEO4J_SCHEMA_STARTED_AT=$(date +%s)
   NEO4J_SCHEMA_LAST_NOTICE=0
+  NEO4J_SCHEMA_LAST_ERROR="$(mktemp)"
   for attempt in $(seq 1 "$NEO4J_SCHEMA_ATTEMPTS"); do
-    # The installer currently runs from $PREFIX/install for Compose. Python
-    # modules live one directory above, so run schema initialization with the
-    # application root as cwd instead of relying on an incidental PYTHONPATH.
+    # Bound every individual driver/schema attempt.  Without an outer timeout,
+    # the Neo4j Python driver can wait for minutes when Bolt is half-open or the
+    # server stops while the installer is retrying.
     if (
       cd "$PREFIX"
       run_as_rag env NEO4J_PASSWORD="$NEO4J_PASSWORD" \
+        timeout --signal=TERM "${NEO4J_SCHEMA_ATTEMPT_TIMEOUT}s" \
         "$PREFIX/.venv/bin/python" -m rag.graph --config "$PREFIX/config.yaml" init
-    ) >/dev/null 2>&1; then
+    ) >"$NEO4J_SCHEMA_LAST_ERROR" 2>&1; then
       NEO4J_SCHEMA_READY=1
       elapsed=$(( $(date +%s) - NEO4J_SCHEMA_STARTED_AT ))
       echo "[INFO] Neo4j is ready; SunaQ schema upgrade completed after ${elapsed}s."
@@ -1700,10 +1849,12 @@ if [[ $WITH_NEO4J -eq 1 ]]; then
     elapsed=$(( $(date +%s) - NEO4J_SCHEMA_STARTED_AT ))
     if (( elapsed - NEO4J_SCHEMA_LAST_NOTICE >= 10 )); then
       echo "[INFO] Neo4j/schema initialization still waiting (${elapsed}s; attempt ${attempt}/${NEO4J_SCHEMA_ATTEMPTS}) ..."
+      tail -n 2 "$NEO4J_SCHEMA_LAST_ERROR" 2>/dev/null | sed 's/^/[INFO] Neo4j init: /' || true
       NEO4J_SCHEMA_LAST_NOTICE=$elapsed
     fi
     sleep 2
   done
+  rm -f "$NEO4J_SCHEMA_LAST_ERROR"
   if [[ $NEO4J_SCHEMA_READY -ne 1 ]]; then
     echo "Neo4j did not become ready or the SunaQ schema upgrade failed." >&2
     (
@@ -1867,13 +2018,13 @@ log "Bootstrap complete"
 cat <<SUMMARY
 
 Installed at: $PREFIX
-Qdrant:      $([[ $WITH_QDRANT -eq 1 ]] && echo local/running || echo external/not installed by this run)
-Neo4j:       $([[ $WITH_NEO4J -eq 1 ]] && echo local/running || echo external/not installed by this run)
-ERG resolver: $([[ $WITH_RESOLVER -eq 1 ]] && echo local/running || echo disabled)
+Qdrant:      $(component_summary_status qdrant)
+Neo4j:       $(component_summary_status neo4j)
+ERG resolver: $(component_summary_status resolver)
 LLM backend: external/admin-managed
 OpenWebUI:   $([[ $WITH_OPENWEBUI -eq 1 ]] && echo local/running || echo external/not installed by this run)
-Playwright:  $([[ $PLAYWRIGHT_ENABLED -eq 1 ]] && echo local/running || echo disabled/not installed by this run)
-Web search:   external/admin-managed; configure web.yaml when needed
+Playwright:  $(component_summary_status playwright)
+Web search:   $(web_search_summary_status)
 Proxy:       $([[ $WITH_PROXY -eq 1 ]] && echo https://HOST/ \(self-signed bootstrap TLS\) || echo skipped)
 Proxy gate:  $([[ $WITH_PROXY -eq 1 && $PROXY_BASIC_AUTH -eq 1 ]] && echo Basic-Auth + rate-limit || echo rate-limit/no Basic-Auth)
 ACL mode:    $([[ $ACL_OFF -eq 1 ]] && echo ACL-OFF-DIAGNOSTIC || ([[ $MULTI_USER -eq 1 ]] && echo credential_store || echo single_user-live-ACL))
@@ -1891,12 +2042,11 @@ Next steps:
   3. Multi-user + live ACL is the default. Users bind through /auth/nextcloud/ensure.
      --single-user requires NEXTCLOUD_USERNAME/NEXTCLOUD_APP_PASSWORD in runtime.env.
      Additional frontends need their own key: python -m rag.provider_clients create CLIENT_ID.
-  4. Optional public web search is external/admin-managed; configure web.yaml and WEB_SEARCH_API_KEY when needed.
-     Per-user CardDAV seeds use the Login-Flow credential and are managed under RAG Admin -> Users -> Kontakt-DB.
+  4. $(if [[ "$(requested_architecture_tier)" == "erg_full" ]]; then echo "Optional public web search is external/admin-managed; configure web.yaml and WEB_SEARCH_API_KEY when needed."; else echo "Public web search is disabled by the selected architecture tier."; fi)
+     $(if [[ "$(requested_architecture_tier)" == "src" ]]; then echo "SRC does not use CardDAV contact seeds."; else echo "Per-user CardDAV seeds use the Login-Flow credential and are managed under RAG Admin -> Users -> Kontakt-DB."; fi)
   5. The provider is now in maintenance mode; normal API/workers are not started.
-  6. External entry point: https://<server-ip>/ (RAG admin: /rag-admin/, health: /rag-api/health).
-     HTTP port 80 redirects to HTTPS. The bootstrap certificate is self-signed;
-     replace install/nginx/tls/server.crt and server.key with site certificates as desired.
+  6. $(if [[ $WITH_PROXY -eq 1 ]]; then echo "External entry point: https://<server-ip>/ (RAG admin: /rag-admin/, health: /rag-api/health)."; else echo "Bundled proxy not installed; integrate the provider/API with your existing reverse proxy before external use."; fi)
+     $(if [[ $WITH_PROXY -eq 1 ]]; then echo "HTTP port $PROXY_HTTP_PORT redirects to HTTPS $PROXY_HTTPS_PORT; replace the bootstrap certificate with site certificates as desired."; else echo "No bundled 80/443 listener was installed."; fi)
   7. Run preflight/smoke checks, then leave maintenance mode:
      sudo $PREFIX/install/maintenance-mode.sh off
   8. Check: $PREFIX/status.sh

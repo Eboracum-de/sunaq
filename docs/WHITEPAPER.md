@@ -1,6 +1,6 @@
 # SunaQ design principles and trust envelopes
 
-**Status:** architectural whitepaper for the 0.8.7-rc1 release-candidate line  
+**Status:** architectural whitepaper for the 0.8.8-rc1 release-candidate line  
 **Scope:** design intent, trust boundaries and system responsibilities
 
 Normative and operational detail lives in [SRC / ERG](SRC-ERG.md),

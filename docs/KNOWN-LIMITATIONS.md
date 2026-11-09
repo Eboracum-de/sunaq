@@ -1,6 +1,6 @@
 # Known limitations
 
-**Reference:** `0.8.7-rc1` release candidate
+**Reference:** `0.8.8-rc1` release candidate
 
 This file records current limits so that beta expectations match the code. Items
 listed here are not necessarily defects; several are deliberate scope boundaries.
@@ -23,7 +23,7 @@ listed here are not necessarily defects; several are deliberate scope boundaries
   `reasoning_content` bridge is deferred because it would require restructuring
   the current SSE orchestration.
 - The provider's implicit source default is ordinary documents only. In SunaQ
-  Recherche 0.3.16, optional Mail/Webarchive/Chat/Web controls start hidden and
+  Recherche 0.3.21, optional Mail/Webarchive/Chat/Web controls start hidden and
   are shown only after the authenticated capability response confirms the global
   and per-user gates. Explicit Slash-Directives are subject to the same server-side
   policy; they do not bypass an administrator-disabled source.
@@ -136,7 +136,7 @@ listed here are not necessarily defects; several are deliberate scope boundaries
 
 ## SunaQ Recherche
 
-- SunaQ Recherche 0.3.16 targets Nextcloud 23+. Each canonical user has exactly one configured Nextcloud chat-archive path and a per-user enable/disable gate below the global `chat_archive.enabled` switch; the default path is `SunaQ-Chats/`. SunaQ does not simultaneously scan an old `AKI-Chats/` folder and the new path. Operators upgrading an older RC can either configure that user to keep using `AKI-Chats/` or move the archive files once into the selected path. Path changes do not move files automatically. Legacy `.akirag.json` / HTML records remain readable within the selected path. Chat archives are a separate, optional `/chatarchive` source scope, not automatically trusted as primary document evidence. A saved chat is a new Nextcloud file with its own ACL/lifecycle; revoking the original source document does not automatically erase text already copied into the chat. Strict revocation deployments should leave chat archive disabled or define a retention/purge process.
+- SunaQ Recherche 0.3.21 targets Nextcloud 23+. Each canonical user has exactly one configured Nextcloud chat-archive path and a per-user enable/disable gate below the global `chat_archive.enabled` switch; the default path is `SunaQ-Chats/`. SunaQ does not simultaneously scan an old `AKI-Chats/` folder and the new path. Operators upgrading an older RC can either configure that user to keep using `AKI-Chats/` or move the archive files once into the selected path. Path changes do not move files automatically. Legacy `.akirag.json` / HTML records remain readable within the selected path. Chat archives are a separate, optional `/chatarchive` source scope, not automatically trusted as primary document evidence. A saved chat is a new Nextcloud file with its own ACL/lifecycle; revoking the original source document does not automatically erase text already copied into the chat. Strict revocation deployments should leave chat archive disabled or define a retention/purge process.
 - The app is deliberately thin. Advanced provider diagnostics and administration
   remain in SunaQ Admin rather than being duplicated in SunaQ Recherche.
 - Nextcloud's own Markdown/text preview may render URLs stored in archived
@@ -145,7 +145,7 @@ listed here are not necessarily defects; several are deliberate scope boundaries
   limitation and is not a reason to relax the deployment's security settings.
 
 ## Graph
-- 0.8.7-rc1 provides no provenance-aware migration of historical ERG Qdrant/Neo4j state into SRC. Converting an existing ERG installation to strict SRC requires explicit removal/reset of SunaQ-owned derived retrieval state. CardDAV/administrator graph seeds must **not** be re-imported into SRC; deployments that need those local resolver identities should use ERG Internal.
+- 0.8.8-rc1 provides no provenance-aware migration of historical ERG Qdrant/Neo4j state into SRC. Converting an existing ERG installation to strict SRC requires explicit removal/reset of SunaQ-owned derived retrieval state. CardDAV/administrator graph seeds must **not** be re-imported into SRC; deployments that need those local resolver identities should use ERG Internal.
 
 - CardDAV seeds and SunaQ Research Findings are lightweight graph inputs. Full
   document graph extraction remains comparatively expensive and opt-in.

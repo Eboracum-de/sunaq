@@ -30,11 +30,21 @@ class Admin implements ISettings {
                 ['1', 'true', 'yes', 'on'],
                 true
             ),
+            'analysis_mode' => in_array(
+                strtolower($this->appConfigValue('analysis_mode', '0')),
+                ['1', 'true', 'yes', 'on'],
+                true
+            ),
+            'show_search_strategy' => in_array(
+                strtolower($this->appConfigValue('show_search_strategy', '1')),
+                ['1', 'true', 'yes', 'on'],
+                true
+            ),
         ]);
     }
 
     public function getSection() {
-        return 'additional';
+        return 'sunaq';
     }
 
     public function getPriority() {

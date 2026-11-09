@@ -75,6 +75,51 @@ def _ensure_nested_key(
     return True
 
 
+def _mapping_child_bounds(
+    lines: list[str],
+    section: str,
+    child: str,
+) -> tuple[int, int] | None:
+    bounds = _section_bounds(lines, section)
+    if bounds is None:
+        return None
+    start, end = bounds
+    child_prefix = f"  {child}:"
+    child_start = None
+    for index in range(start + 1, end):
+        if lines[index].startswith(child_prefix):
+            child_start = index
+            break
+    if child_start is None:
+        return None
+    child_end = end
+    for index in range(child_start + 1, end):
+        line = lines[index]
+        if line.strip() and not line.lstrip().startswith("#") and line.startswith("  ") and not line.startswith("    "):
+            child_end = index
+            break
+    return child_start, child_end
+
+
+def _ensure_mapping_child_key(
+    lines: list[str],
+    section: str,
+    child: str,
+    key: str,
+    rendered_value: str,
+) -> bool:
+    bounds = _mapping_child_bounds(lines, section, child)
+    if bounds is None:
+        return False
+    start, end = bounds
+    prefix = f"    {key}:"
+    for index in range(start + 1, end):
+        if lines[index].startswith(prefix):
+            return False
+    lines.insert(end, f"    {key}: {rendered_value}")
+    return True
+
+
 def _replace_nested_exact(
     lines: list[str],
     section: str,
@@ -181,6 +226,30 @@ def upgrade_text(text: str, *, deployment_mode: str | None = None) -> tuple[str,
             "runtime/sync-status.json",
         ):
             changes.append("sync.status_file=runtime/sync-status.json")
+
+    research_backends = parsed.get("research_backends")
+    if isinstance(research_backends, dict):
+        brave = research_backends.get("brave-search")
+        if isinstance(brave, dict):
+            if "kind" not in brave and _ensure_mapping_child_key(
+                lines, "research_backends", "brave-search", "kind", "web_retrieval"
+            ):
+                changes.append("research_backends.brave-search.kind=web_retrieval")
+            if "adapter" not in brave and _ensure_mapping_child_key(
+                lines, "research_backends", "brave-search", "adapter", "brave_search"
+            ):
+                changes.append("research_backends.brave-search.adapter=brave_search")
+
+        delegated = research_backends.get("openai-research")
+        if isinstance(delegated, dict):
+            if "kind" not in delegated and _ensure_mapping_child_key(
+                lines, "research_backends", "openai-research", "kind", "delegated_research"
+            ):
+                changes.append("research_backends.openai-research.kind=delegated_research")
+            if "adapter" not in delegated and _ensure_mapping_child_key(
+                lines, "research_backends", "openai-research", "adapter", "openai"
+            ):
+                changes.append("research_backends.openai-research.adapter=openai")
 
     rendered = "\n".join(lines)
     if original_had_trailing_newline or rendered:

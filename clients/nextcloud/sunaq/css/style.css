@@ -12,7 +12,7 @@
 }
 
 .sunaq-workspace.sunaq-sidebar-collapsed {
-    grid-template-columns: 0 minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
 }
 
 .sunaq-workspace.sunaq-sidebar-collapsed .sunaq-sidebar {
@@ -102,26 +102,32 @@
     min-height: 0;
     width: 100%;
     max-width: 1120px;
+    height: 100%;
     margin: 0 auto;
     padding: 18px 28px 20px;
+    overflow-y: auto;
+    overflow-x: hidden;
 }
 
 .sunaq-header {
+    position: relative;
     display: flex;
-    align-items: center;
-    gap: 12px;
-    width: min(100%, 880px);
-    margin: 0 auto;
-    padding: 0 0 10px;
+    align-items: flex-start;
+    justify-content: center;
+    width: min(100%, 760px);
+    margin: 4px auto 18px;
+    padding: 0;
+    text-align: center;
 }
 
 .sunaq-header-copy {
     min-width: 0;
+    max-width: 680px;
 }
 
 .sunaq-header h2 {
-    margin: 0;
-    font-size: 1.15rem;
+    margin: 0 0 5px;
+    font-size: 1.35rem;
     line-height: 1.3;
 }
 
@@ -129,6 +135,7 @@
     margin: 2px 0 0;
     color: var(--color-text-maxcontrast, #666);
     font-size: 0.9em;
+    line-height: 1.45;
 }
 
 .sunaq-header code {
@@ -138,6 +145,9 @@
 }
 
 .sunaq-sidebar-toggle {
+    position: absolute;
+    left: 0;
+    top: 0;
     flex: 0 0 auto;
     border: 0;
     background: transparent;
@@ -145,12 +155,12 @@
 
 .sunaq-messages {
     box-sizing: border-box;
-    flex: 1 1 auto;
+    flex: 0 0 auto;
     width: min(100%, 880px);
-    min-height: 180px;
+    min-height: 0;
     margin: 0 auto;
-    overflow-y: auto;
-    padding: 14px 2px 18px;
+    overflow: visible;
+    padding: 14px 2px 4px;
     scroll-behavior: smooth;
 }
 
@@ -203,7 +213,7 @@
 
 .sunaq-status {
     box-sizing: border-box;
-    width: min(100%, 880px);
+    width: min(100%, 760px);
     min-height: 22px;
     margin: 0 auto;
     padding: 0 6px 5px;
@@ -219,7 +229,7 @@
 
 .sunaq-retrieval-strategy {
     box-sizing: border-box;
-    width: min(100%, 880px);
+    width: min(100%, 760px);
     margin: 0 auto 8px;
     padding: 6px 10px;
     border: 1px solid var(--color-border, #d0d0d0);
@@ -244,32 +254,33 @@
 .sunaq-composer {
     box-sizing: border-box;
     flex: 0 0 auto;
-    width: min(100%, 880px);
-    margin: 0 auto;
+    width: min(100%, 760px);
+    margin: 0 auto 8px;
     padding: 0;
 }
 
 .sunaq-composer-box {
-    border: 1px solid var(--color-border, #d0d0d0);
-    border-radius: 18px;
+    border: 2px solid var(--color-border-maxcontrast, #888);
+    border-radius: 20px;
     background: var(--color-main-background, #fff);
-    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.06);
-    transition: border-color 120ms ease, box-shadow 120ms ease;
+    box-shadow: none;
+    overflow: hidden;
+    transition: border-color 120ms ease;
 }
 
 .sunaq-composer-box:focus-within {
-    border-color: var(--color-primary, #0082c9);
-    box-shadow: 0 5px 22px rgba(0, 0, 0, 0.09);
+    border-color: var(--color-primary-element, var(--color-primary, #0082c9));
+    box-shadow: none;
 }
 
 .sunaq-composer textarea {
     box-sizing: border-box;
     display: block;
     width: 100%;
-    min-height: 82px;
-    max-height: 260px;
+    min-height: 58px;
+    max-height: 220px;
     margin: 0;
-    padding: 14px 16px 8px;
+    padding: 13px 16px 7px;
     resize: vertical;
     border: 0 !important;
     outline: 0 !important;

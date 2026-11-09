@@ -29,7 +29,7 @@ def test_nextcloud_app_version_tracks_chatarchive_taxonomy_change():
     info = (
         ROOT / "clients" / "nextcloud" / "sunaq" / "appinfo" / "info.xml"
     ).read_text(encoding="utf-8")
-    assert "<version>0.3.16</version>" in info
+    assert "<version>0.3.21</version>" in info
 
 
 def test_admin_uses_central_architecture_tier_compatibility_policy():

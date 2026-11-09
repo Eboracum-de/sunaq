@@ -36,6 +36,9 @@ MULTI_USER=1
 ACL_OFF=0
 ACL_MODE_EXPLICIT=0
 PROXY_FROM_STATE=0
+PROXY_AUTO_SELECTED=0
+PROXY_AUTO_SKIPPED=0
+PROXY_AUTO_SKIP_REASON=""
 PROXY_HTTP_PORT=80
 PROXY_HTTPS_PORT=443
 PROXY_HTTP_PORT_EXPLICIT=0
@@ -160,7 +163,7 @@ while [[ $# -gt 0 ]]; do
     --with-openwebui) WITH_OPENWEBUI=1; OPENWEBUI_EXPLICIT=1; shift ;;
     --no-openwebui) WITH_OPENWEBUI=0; OPENWEBUI_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; shift ;;
     --with-proxy) WITH_PROXY=1; PROXY_EXPLICIT=1; shift ;;
-    --no-proxy) WITH_PROXY=0; PROXY_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; shift ;;
+    --no-proxy) WITH_PROXY=0; PROXY_EXPLICIT=1; shift ;;
     --with-playwright) WITH_PLAYWRIGHT=1; PLAYWRIGHT_EXPLICIT=1; shift ;;
     --no-playwright) WITH_PLAYWRIGHT=0; PLAYWRIGHT_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1; shift ;;
     --with-neo4j) WITH_NEO4J=1; NEO4J_EXPLICIT=1; shift ;;
@@ -310,6 +313,75 @@ load_install_state() {
 }
 
 load_install_state
+
+proxy_port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltn 2>/dev/null | awk -v suffix=":""$port" '$4 ~ (suffix "$") { found=1 } END { exit(found ? 0 : 1) }'
+    return $?
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk -v suffix=":""$port" '$4 ~ (suffix "$") { found=1 } END { exit(found ? 0 : 1) }'
+    return $?
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$port" <<'PYPORT'
+import socket, sys
+port = int(sys.argv[1])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind(("0.0.0.0", port))
+except OSError:
+    raise SystemExit(0)
+finally:
+    sock.close()
+raise SystemExit(1)
+PYPORT
+    return $?
+  fi
+  return 2
+}
+
+auto_select_proxy_for_fresh_install() {
+  [[ $PREFIX_RECOGNIZED_SUNAQ -eq 0 && $PROXY_EXPLICIT -eq 0 ]] || return 0
+  local status
+  for port in "$PROXY_HTTP_PORT" "$PROXY_HTTPS_PORT"; do
+    if proxy_port_in_use "$port"; then
+      WITH_PROXY=0
+      PROXY_AUTO_SKIPPED=1
+      PROXY_AUTO_SKIP_REASON="port $port is already in use"
+      return 0
+    else
+      status=$?
+      if [[ $status -eq 2 ]]; then
+        WITH_PROXY=0
+        PROXY_AUTO_SKIPPED=1
+        PROXY_AUTO_SKIP_REASON="port availability could not be checked safely"
+        return 0
+      fi
+    fi
+  done
+  WITH_PROXY=1
+  PROXY_AUTO_SELECTED=1
+}
+
+auto_select_proxy_for_fresh_install
+
+proxy_plan_status() {
+  if [[ $WITH_PROXY -eq 1 ]]; then
+    if [[ $PROXY_FROM_STATE -eq 1 ]]; then
+      printf 'bundled/start on %s/%s (retained from existing install; use --no-proxy to disable)' "$PROXY_HTTP_PORT" "$PROXY_HTTPS_PORT"
+    elif [[ $PROXY_AUTO_SELECTED -eq 1 ]]; then
+      printf 'bundled/start on %s/%s (fresh default; ports free)' "$PROXY_HTTP_PORT" "$PROXY_HTTPS_PORT"
+    else
+      printf 'bundled/start on %s/%s' "$PROXY_HTTP_PORT" "$PROXY_HTTPS_PORT"
+    fi
+  elif [[ $PROXY_AUTO_SKIPPED -eq 1 ]]; then
+    printf 'disabled (fresh default not possible: %s)' "$PROXY_AUTO_SKIP_REASON"
+  else
+    printf 'disabled'
+  fi
+}
 
 # Fresh installations start from the conservative core capability baseline.
 # --architecture-tier may widen only the policy envelope; it does not
@@ -552,6 +624,59 @@ validate_requested_architecture_capabilities() {
 }
 
 validate_requested_architecture_capabilities
+
+component_plan_status() {
+  local component="$1"
+  local tier
+  tier="$(requested_architecture_tier)"
+  case "$component:$tier" in
+    qdrant:src|neo4j:src|resolver:src|playwright:src|playwright:erg_internal)
+      printf 'disabled by architecture tier'
+      return 0
+      ;;
+  esac
+  case "$component" in
+    qdrant)
+      [[ $WITH_QDRANT -eq 1 ]] && printf "install/start$([[ $QDRANT_FROM_STATE -eq 1 ]] && echo ' (retained from existing install)')" || printf 'disabled/not installed'
+      ;;
+    neo4j)
+      [[ $WITH_NEO4J -eq 1 ]] && printf "install/start$([[ $NEO4J_FROM_STATE -eq 1 ]] && echo ' (retained from existing install)')" || printf 'disabled/not installed'
+      ;;
+    resolver)
+      [[ $WITH_RESOLVER -eq 1 ]] && printf "install/start$([[ $RESOLVER_FROM_STATE -eq 1 ]] && echo ' (retained from existing install)')" || printf 'disabled/not installed'
+      ;;
+    playwright)
+      [[ $WITH_PLAYWRIGHT -eq 1 ]] && printf "install/start$([[ $PLAYWRIGHT_FROM_STATE -eq 1 ]] && echo ' (retained from existing install; use --no-playwright to disable)')" || printf 'disabled/not installed'
+      ;;
+  esac
+}
+
+component_summary_status() {
+  local component="$1"
+  local tier
+  tier="$(requested_architecture_tier)"
+  case "$component:$tier" in
+    qdrant:src|neo4j:src|resolver:src|playwright:src|playwright:erg_internal)
+      printf 'disabled by architecture tier'
+      return 0
+      ;;
+  esac
+  case "$component" in
+    qdrant)
+      [[ $WITH_QDRANT -eq 1 ]] && printf 'prepared; starts after maintenance mode is disabled' || printf 'disabled/not installed'
+      ;;
+    neo4j)
+      [[ $NEO4J_ACTIVE -eq 1 ]] && printf 'prepared; starts after maintenance mode is disabled' || printf 'disabled/not installed'
+      ;;
+    resolver)
+      [[ $RESOLVER_ACTIVE -eq 1 ]] && printf 'prepared; starts after maintenance mode is disabled' || printf 'disabled/not installed'
+      ;;
+    playwright)
+      [[ $WITH_PLAYWRIGHT -eq 1 ]] && printf 'prepared; normal stack start after configuration' || printf 'disabled/not installed'
+      ;;
+  esac
+}
+
 print_plan() {
   # Conservative image/layer estimate only. Site/user data are additional.
   # OpenWebUI is deliberately expensive and is
@@ -564,23 +689,23 @@ print_plan() {
   fi
 
   cat <<PLAN
-SunaQ / Eboracum Research Gateway 0.8.7-rc1 - dockerized deployment
+SunaQ / Eboracum Research Gateway 0.8.8-dev - dockerized deployment
 ----------------------------------------------
 Install prefix:          $PREFIX
 Deployment mode:         dockerized
 Host Python required:    no
 Document retrieval:      Elasticsearch$([[ $WITH_QDRANT -eq 1 ]] && echo ' + Qdrant/vector' || true)
-Neo4j state:             $([[ $WITH_NEO4J -eq 1 ]] && echo "install/start$([[ $NEO4J_FROM_STATE -eq 1 ]] && echo ' (retained from existing install)')" || echo disabled/not installed)
-Vector/Qdrant state:      $([[ $WITH_QDRANT -eq 1 ]] && echo "install/start$([[ $QDRANT_FROM_STATE -eq 1 ]] && echo ' (retained from existing install)')" || echo disabled/not installed)
-ERG resolver:             $([[ $WITH_RESOLVER -eq 1 ]] && echo "install/start$([[ $RESOLVER_FROM_STATE -eq 1 ]] && echo ' (retained from existing install)')" || echo disabled/not installed)
+Neo4j state:             $(component_plan_status neo4j)
+Vector/Qdrant state:      $(component_plan_status qdrant)
+ERG resolver:             $(component_plan_status resolver)
 Graph document arm:      architecture/config controlled
 Graph extraction worker: architecture/config controlled
 Qdrant/embeddings:       $([[ $WITH_QDRANT -eq 1 ]] && echo enabled/local-qdrant || echo disabled/not-installed)
 Vector sync worker:       $([[ $WITH_QDRANT -eq 1 ]] && echo enabled || echo config-controlled/external)
 Reranker/TEI:            model/config controlled (local ML packages not bundled)
-Playwright archive:      $([[ $WITH_PLAYWRIGHT -eq 1 ]] && echo "install/start$([[ $PLAYWRIGHT_FROM_STATE -eq 1 ]] && echo ' (retained from existing install; use --no-playwright to disable)')" || echo disabled/not installed)
+Playwright archive:      $(component_plan_status playwright)
 OpenWebUI:               $([[ $WITH_OPENWEBUI -eq 1 ]] && echo "pull/start$([[ $OPENWEBUI_FROM_STATE -eq 1 ]] && echo ' (retained from existing install; use --no-openwebui to disable)')" || echo not pulled/not started)
-Reverse proxy:           $([[ $WITH_PROXY -eq 1 ]] && echo "bundled/start on ${PROXY_HTTP_PORT}/${PROXY_HTTPS_PORT}$([[ $PROXY_FROM_STATE -eq 1 ]] && echo ' (retained from existing install; use --no-proxy to disable)')" || echo disabled)
+Reverse proxy:           $(proxy_plan_status)
 Nextcloud URL:           ${NEXTCLOUD_URL:-<required before start>}
 Insecure Nextcloud HTTP: $([[ $ALLOW_INSECURE_NEXTCLOUD -eq 1 ]] && echo "explicitly allowed (LAB ONLY)" || echo "blocked")
 Elasticsearch URL:       ${ELASTICSEARCH_URL:-<required before start>}
@@ -1199,7 +1324,7 @@ fi
 cat > "$PREFIX/install/dockerized/.env" <<ENV
 OPENWEBUI_IMAGE=ghcr.io/open-webui/open-webui:v0.11.4-slim@sha256:0487ad4a5a4b986062dedace806c3ef1e88fec38c10d1e64d6a5501c66671e5e
 NGINX_IMAGE=nginx:1.30.4-alpine3.24@sha256:97d490c12ba55b4946b01546d1c3ed324e8d41ab1c9fcb2a616aa470620e5b46
-QDRANT_IMAGE=qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc
+QDRANT_IMAGE=qdrant/qdrant:v1.19.2@sha256:b7b0444c4c351c970b98e90a6f89c2ee4287c65b44e52b4cb503fa5b2aa927ad
 NEO4J_IMAGE=neo4j:5.26.29-community@sha256:d9dd3dc7d1c78fa959191ff02dbdcbefadceaf83eee23428fb92a58cac8ad3fe
 OPENWEBUI_PROVIDER_API_KEY=${PROVIDER_API_KEY}
 PLAYWRIGHT_PORT=8090
@@ -1550,7 +1675,7 @@ EOFOVR
   if [[ $WITH_QDRANT -eq 1 ]]; then
     cat >> "$OVERRIDE_TMP" <<'EOFOVR'
   qdrant:
-    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.19.0@sha256:057ee3a8da769fe7310dd3537b4dc7583bf87a95ce8ac43c0af5a46bc580d1fc}
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.19.2@sha256:b7b0444c4c351c970b98e90a6f89c2ee4287c65b44e52b4cb503fa5b2aa927ad}
     restart: unless-stopped
     ports:
       - "127.0.0.1:${QDRANT_PORT:-6333}:6333"
@@ -1807,10 +1932,10 @@ Local services:
   API:        stopped until maintenance mode is disabled
   Provider:   http://127.0.0.1:8766 (maintenance)
   Architecture: $EFFECTIVE_ARCHITECTURE_TIER
-  Neo4j:      $([[ $NEO4J_ACTIVE -eq 1 ]] && echo "prepared; starts after maintenance mode is disabled" || echo disabled)
-  Qdrant:     $([[ $WITH_QDRANT -eq 1 ]] && echo "prepared; starts after maintenance mode is disabled" || echo disabled)
-  ERG resolver: $([[ $RESOLVER_ACTIVE -eq 1 ]] && echo "prepared; starts after maintenance mode is disabled" || echo disabled)
-  Playwright: $([[ $WITH_PLAYWRIGHT -eq 1 ]] && echo "prepared; normal stack start after configuration" || echo "disabled/not installed")
+  Neo4j:      $(component_summary_status neo4j)
+  Qdrant:     $(component_summary_status qdrant)
+  ERG resolver: $(component_summary_status resolver)
+  Playwright: $(component_summary_status playwright)
   OpenWebUI:  $([[ $WITH_OPENWEBUI -eq 1 ]] && echo http://127.0.0.1:3000 || echo disabled)
   nginx:      $([[ $WITH_PROXY -eq 1 ]] && echo "enabled on ${PROXY_HTTP_PORT}/${PROXY_HTTPS_PORT}" || echo disabled)
   CA trust:   $([[ -d "$PREFIX/runtime/ca" ]] && find "$PREFIX/runtime/ca" -maxdepth 1 -name "*.crt" -type f 2>/dev/null | wc -l || echo 0) private certificate(s) baked into API/provider image

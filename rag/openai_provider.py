@@ -39,6 +39,7 @@ v0.2 changes:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -244,6 +245,9 @@ LLM_API_KEY = secret_env("LLM_API_KEY", "")
 LLM_VERIFY_TLS = os.getenv("LLM_VERIFY_TLS", "true").lower() in {
     "1", "true", "yes", "on"
 }
+ALLOW_INSECURE_LLM = os.getenv("ALLOW_INSECURE_LLM", "false").lower() in {
+    "1", "true", "yes", "on"
+}
 LLM_CA_FILE = os.getenv("LLM_CA_FILE", "").strip() or None
 
 # Deprecated aliases kept inside this file so old diagnostics/config remain
@@ -301,7 +305,7 @@ def _provider_client_store() -> CredentialStore:
     if _PROVIDER_CLIENT_STORE is None:
         _PROVIDER_CLIENT_STORE = CredentialStore(_provider_credential_store_path())
     return _PROVIDER_CLIENT_STORE
-SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "20"))
+SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "15"))
 CONTEXT_MAX_CHARS = int(os.getenv("CONTEXT_MAX_CHARS", "40000"))
 PER_RESULT_MAX_CHARS = int(os.getenv("PER_RESULT_MAX_CHARS", "6000"))
 USE_PER_RESULT_MAX_CHARS = int(os.getenv("USE_PER_RESULT_MAX_CHARS", "24000"))
@@ -731,6 +735,7 @@ def _build_provider_runtime_model(model: RuntimeModel) -> ProviderRuntimeModel:
         default_api_key=LLM_API_KEY,
         default_verify_tls=LLM_VERIFY_TLS,
         default_ca_file=LLM_CA_FILE,
+        default_allow_insecure_http=ALLOW_INSECURE_LLM,
         models={
             "default": LLM_MODEL,
             "planner": planner.model or FOLLOWUP_MODEL or LLM_MODEL,
@@ -925,6 +930,16 @@ def _set_progress(
         }
         if isinstance(previous.get("retrieval_decision"), dict):
             next_state["retrieval_decision"] = dict(previous["retrieval_decision"])
+        if isinstance(previous.get("diagnostics"), dict):
+            diagnostics = dict(previous["diagnostics"])
+            diagnostics["timings_ms"] = dict(diagnostics.get("timings_ms") or {})
+            diagnostics["roles"] = dict(diagnostics.get("roles") or {})
+            if str(stage or "").strip() == "complete":
+                diagnostics["timings_ms"]["total"] = round(
+                    max(0.0, now - float(next_state["created_at"])) * 1000.0,
+                    1,
+                )
+            next_state["diagnostics"] = diagnostics
         _PROGRESS_STATES[request_id] = next_state
 
 
@@ -951,6 +966,82 @@ def _set_progress_retrieval_decision(
             "created_at": float(state.get("created_at") or now),
             "updated_at": now,
             "retrieval_decision": dict(decision),
+        })
+        _PROGRESS_STATES[request_id] = state
+
+
+_PROGRESS_TIMING_KEYS = {
+    "auth_preflight",
+    "query_context",
+    "query_rewrite",
+    "retrieval",
+    "retrieval_core",
+    "acl",
+    "middleware_total",
+    "answer_model",
+    "answer_stage",
+    "total",
+}
+_PROGRESS_ROLE_KEYS = {"planner", "answer"}
+
+
+def _set_progress_diagnostics(
+    request_id: str,
+    owner: str,
+    *,
+    timings_ms: dict[str, Any] | None = None,
+    authorized_candidates: int | None = None,
+    roles: dict[str, Any] | None = None,
+) -> None:
+    """Attach only non-sensitive performance diagnostics to request status."""
+    request_id = str(request_id or "").strip()
+    if not request_id or not _PROGRESS_ID_RE.fullmatch(request_id):
+        return
+    now = time.time()
+    with _PROGRESS_LOCK:
+        _cleanup_progress_locked(now)
+        previous = _PROGRESS_STATES.get(request_id) or {}
+        if previous and str(previous.get("owner") or "") != str(owner or ""):
+            return
+
+        diagnostics = dict(previous.get("diagnostics") or {})
+        timing_state = dict(diagnostics.get("timings_ms") or {})
+        for key, raw_value in (timings_ms or {}).items():
+            if key not in _PROGRESS_TIMING_KEYS:
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if value >= 0:
+                timing_state[key] = round(value, 1)
+        if timing_state:
+            diagnostics["timings_ms"] = timing_state
+
+        if authorized_candidates is not None:
+            try:
+                diagnostics["authorized_candidates"] = max(0, int(authorized_candidates))
+            except (TypeError, ValueError):
+                pass
+
+        role_state = dict(diagnostics.get("roles") or {})
+        for key, raw_value in (roles or {}).items():
+            if key not in _PROGRESS_ROLE_KEYS:
+                continue
+            value = str(raw_value or "").strip()
+            if value:
+                role_state[key] = value[:200]
+        if role_state:
+            diagnostics["roles"] = role_state
+
+        state = dict(previous)
+        state.update({
+            "request_id": request_id,
+            "owner": str(owner or ""),
+            "model": str(state.get("model") or _active_model_id()),
+            "created_at": float(state.get("created_at") or now),
+            "updated_at": now,
+            "diagnostics": diagnostics,
         })
         _PROGRESS_STATES[request_id] = state
 
@@ -1345,7 +1436,51 @@ SEARCH_SPEC_RESPONSE_SCHEMA: dict[str, Any] = {
     "properties": {
         "stop": {"type": "boolean"},
         "reason": {"type": "string"},
+        "retrieval_intent": {
+            "type": "string",
+            "enum": ["direct_lexical", "planned_semantic", "ambiguous"],
+        },
+        "lexical_sufficiency": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+        },
+        "lexical_query": {"type": "string"},
+        "term_interpretations": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "original": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": [
+                            "probable_typo", "normalization", "preserved",
+                            "ambiguous", "unrecognized",
+                        ],
+                    },
+                    "alternatives": {
+                        "type": "array", "maxItems": 4, "items": {"type": "string"}
+                    },
+                },
+                "required": ["original", "status", "alternatives"],
+                "additionalProperties": False,
+            },
+        },
         "semantic_query": {"type": "string"},
+        "alternative_interpretations": {
+            "type": "array",
+            "maxItems": 2,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "meaning": {"type": "string"},
+                    "query": {"type": "string"},
+                },
+                "required": ["meaning", "query"],
+                "additionalProperties": False,
+            },
+        },
         "entities": {"type": "array", "maxItems": 16, "items": {"type": "string"}},
         "entity_hints": {
             "type": "array",
@@ -1371,14 +1506,16 @@ SEARCH_SPEC_RESPONSE_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "properties": {
                     "required": {"type": "boolean"},
-                    "terms": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 12,
+                    "primary_terms": {
+                        "type": "array", "minItems": 1, "maxItems": 6,
+                        "items": {"type": "string"},
+                    },
+                    "expansion_terms": {
+                        "type": "array", "maxItems": 12,
                         "items": {"type": "string"},
                     },
                 },
-                "required": ["required", "terms"],
+                "required": ["required", "primary_terms", "expansion_terms"],
                 "additionalProperties": False,
             },
         },
@@ -1398,10 +1535,16 @@ SEARCH_SPEC_RESPONSE_SCHEMA: dict[str, Any] = {
         "verification_requirements": {
             "type": "array", "maxItems": 16, "items": {"type": "string"}
         },
+        "answer_requirements": {
+            "type": "array", "maxItems": 16, "items": {"type": "string"}
+        },
     },
     "required": [
-        "stop", "reason", "semantic_query", "entities", "concepts",
-        "concept_groups", "constraints", "verification_requirements"
+        "stop", "reason", "retrieval_intent", "lexical_sufficiency",
+        "lexical_query", "term_interpretations", "semantic_query",
+        "alternative_interpretations", "entities", "entity_hints", "concepts",
+        "concept_groups", "constraints", "verification_requirements",
+        "answer_requirements",
     ],
     "additionalProperties": False,
 }
@@ -1963,14 +2106,76 @@ def _retrieval_execution_payload(
     }
 
 
-def _cited_numbers(answer: str, results: list[SearchResult]) -> set[int]:
-    """Return document numbers explicitly referenced by the answer.
+def _evidence_id_for_result(result: SearchResult) -> str:
+    """Stable non-ordinal identifier exposed to the answer model."""
+    raw = result.raw or {}
+    document_id = str(raw.get("document_id") or "").strip()
+    file_match = re.fullmatch(r"files:([A-Za-z0-9._-]+)", document_id)
+    if file_match:
+        return "file-" + file_match.group(1)
 
-    Canonical citations use ``[n]``.  Small/local answer models occasionally
-    spell the same reference as ``Dokument 5`` or ``Dokumente 5, 6 und 7``
-    despite the prompt.  Those phrases are still explicit document references
-    and therefore count as answer evidence.  Bare numbers never count.
-    """
+    seed = (
+        document_id
+        or str(raw.get("path") or raw.get("file_path") or "").strip()
+        or str(result.title or "").strip()
+        or "untitled-evidence"
+    )
+    digest = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return "evidence-" + digest
+
+
+def _evidence_marker(result: SearchResult) -> str:
+    return f"[[{_evidence_id_for_result(result)}]]"
+
+
+def _evidence_marker_map(results: list[SearchResult]) -> dict[str, int]:
+    return {_evidence_marker(result): result.index for result in results}
+
+
+def _render_display_citations(answer: str, results: list[SearchResult]) -> str:
+    """Translate exact model-facing evidence IDs to the existing [n] UI markers."""
+    rendered = str(answer or "")
+    for marker, index in _evidence_marker_map(results).items():
+        rendered = rendered.replace(marker, f"[{index}]")
+    return rendered
+
+
+class _EvidenceCitationStream:
+    """Translate stable evidence markers across arbitrary stream chunk boundaries."""
+
+    def __init__(self, results: list[SearchResult]):
+        self._mapping = _evidence_marker_map(results)
+        self._markers = tuple(self._mapping)
+        self._buffer = ""
+
+    def _replace_complete(self, text: str) -> str:
+        for marker, index in self._mapping.items():
+            text = text.replace(marker, f"[{index}]")
+        return text
+
+    def feed(self, chunk: str) -> str:
+        text = self._replace_complete(self._buffer + str(chunk or ""))
+        keep = 0
+        for marker in self._markers:
+            maximum = min(len(marker) - 1, len(text))
+            for length in range(maximum, 0, -1):
+                if text.endswith(marker[:length]):
+                    keep = max(keep, length)
+                    break
+        if keep:
+            self._buffer = text[-keep:]
+            return text[:-keep]
+        self._buffer = ""
+        return text
+
+    def flush(self) -> str:
+        text = self._replace_complete(self._buffer)
+        self._buffer = ""
+        return text
+
+
+def _cited_numbers(answer: str, results: list[SearchResult]) -> set[int]:
+    """Return internal result numbers referenced by stable IDs or legacy [n]."""
     valid = {result.index for result in results}
     cited = {
         int(match.group(1))
@@ -1978,6 +2183,12 @@ def _cited_numbers(answer: str, results: list[SearchResult]) -> set[int]:
         if int(match.group(1)) in valid
     }
 
+    for marker, index in _evidence_marker_map(results).items():
+        if marker in answer:
+            cited.add(index)
+
+    # Backward compatibility for local/small models and server-generated repair
+    # text from the 0.8.7 path. Bare numbers never count.
     document_list_pattern = re.compile(
         r"\bDokument(?:e|en)?\s+"
         r"((?:\[?\d+\]?)(?:\s*(?:,|und|&)\s*\[?\d+\]?)+|\[?\d+\]?)",
@@ -3382,6 +3593,33 @@ def _execution_search_spec(
     return search_spec
 
 
+def _query_retrieval_languages() -> list[str]:
+    """Return normalized corpus languages for lexical query expansion.
+
+    This mirrors the retrieval-language concept used by SunaQ Find. The shipped
+    default is German corpus vocabulary; interaction/answer language remains
+    independent.
+    """
+    raw = PROVIDER_CONFIG.get("retrieval_languages", ["de"])
+    if isinstance(raw, str):
+        values = re.split(r"[\\s,;]+", raw.strip())
+    elif isinstance(raw, (list, tuple, set)):
+        values = list(raw)
+    else:
+        values = []
+
+    normalized: list[str] = []
+    for value in values:
+        language = str(value or "").strip().lower().replace("_", "-")
+        if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", language):
+            continue
+        if language not in normalized:
+            normalized.append(language)
+        if len(normalized) >= 8:
+            break
+    return normalized or ["de"]
+
+
 async def _rewrite_search_spec(
     *,
     question: str,
@@ -3399,19 +3637,30 @@ async def _rewrite_search_spec(
     """
     files_requested = "files" in retrieval_arms
     vector_requested = "vector" in retrieval_arms
-    prior = _planner_result_context(results) if results else "(erste Retrieval-Runde)"
-    previous_text = json.dumps(previous_spec or {}, ensure_ascii=False)
+    prior = _planner_result_context(results) if results else "[]"
+    query_payload = {
+        "original_request": question,
+        "interaction_language": "auto",
+        "retrieval_languages": _query_retrieval_languages(),
+    }
+    retrieval_context = {
+        "round": round_no,
+        "active_arms": {
+            "files": files_requested,
+            "vector": vector_requested,
+        },
+        "neo4j_seed_hints": _compact_query_seed_context(seed_context),
+        "previous_search_spec": previous_spec or {},
+        "visible_hit_picture": prior,
+    }
     prompt = (
-        f"ORIGINALFRAGE:\n{question}\n\n"
-        f"RETRIEVAL-RUNDE: {round_no}\n"
-        f"AKTIVE ARME: files={str(files_requested).lower()} vector={str(vector_requested).lower()}\n\n"
-        f"NEO4J-SEEDS (nur bekannte Namens-/Alias-Hinweise):\n"
-        f"{json.dumps(_compact_query_seed_context(seed_context), ensure_ascii=False)}\n\n"
-        f"VORHERIGER SEARCHSPEC:\n{previous_text}\n\n"
-        f"BISHERIGES SICHTBARES TREFFERBILD:\n{prior}\n\n"
-        "Erzeuge den SearchSpec für diese Runde. In Runde 1 ist stop=false. "
-        "Beschreibe für den Files-Arm nur strukturierte Suchintention; erzeuge keine Backend-Syntax. "
-        "Explizite unterscheidende Namen/Kennungen nicht verlieren."
+        "USER_QUERY_JSON: "
+        + json.dumps(query_payload, ensure_ascii=False, separators=(",", ":"))
+        + "\n\nSUNAQ_RETRIEVAL_CONTEXT_JSON: "
+        + json.dumps(retrieval_context, ensure_ascii=False, separators=(",", ":"))
+        + "\n\nGenerate the SearchSpec for this retrieval round. "
+          "Keep the user's information interest and answer requirements unchanged. "
+          "Never emit backend query syntax."
     )
     model = _retrieval_planner().model or ANSWER_MODEL
 
@@ -3502,11 +3751,12 @@ async def _rewrite_search_spec(
         )
         try:
             return await run_once(
-                "\n\nFEHLERHINWEIS: Die vorige Ausgabe war unbrauchbar. "
-                "Behalte alle expliziten Suchanker und liefere ausschließlich gültiges JSON. "
-                "Beschreibe Entities und Concept-Gruppen strukturiert; erzeuge keine Elasticsearch- "
-                "oder Nextcloud-Abfragesyntax. Wenn concepts nicht leer ist, muss concept_groups "
-                "mindestens eine passende Gruppe enthalten. semantic_query muss ein JSON-String sein."
+                "\n\nREPAIR: The previous output was unusable. "
+                "Preserve all explicit search anchors and return valid JSON only. "
+                "Describe entities and concept groups structurally; never emit Elasticsearch "
+                "or Nextcloud query syntax. If concepts is non-empty, concept_groups must "
+                "contain at least one matching group. Every concept group needs primary_terms "
+                "and expansion_terms. semantic_query must be a JSON string."
             )
         except Exception as second_exc:
             log.warning(
@@ -3839,13 +4089,13 @@ async def _retrieval_planner_decision(
     selected = sorted(retrieval_arms or {"files", "vector", "graph"})
     prior = _planner_result_context(results)
     prompt = (
-        f"ORIGINALFRAGE:\n{question}\n\n"
-        f"RETRIEVAL-RUNDE: {round_no} von {_retrieval_planner().max_retrieval_rounds}\n"
-        f"ERLAUBTE ARME (verbindlich): {', '.join(selected)}\n"
-        f"SPRACHNEUTRALE SICHERE CONSTRAINTS: {safe_constraint_summary(question)}\n"
-        f"BEREITS VERWENDETE PROBES:\n" + ("\n".join(seen_probe_queries) or "(nur Originalfrage)") + "\n\n"
-        f"BISHERIGES SICHTBARES TREFFERBILD:\n{prior}\n\n"
-        "Erzeuge nur zusaetzliche Probes. Die Originalfrage wird vom System immer beibehalten."
+        f"ORIGINAL USER QUESTION:\n{question}\n\n"
+        f"RETRIEVAL ROUND: {round_no} of {_retrieval_planner().max_retrieval_rounds}\n"
+        f"ALLOWED ARMS (binding): {', '.join(selected)}\n"
+        f"LANGUAGE-NEUTRAL SAFE CONSTRAINTS: {safe_constraint_summary(question)}\n"
+        f"ALREADY USED PROBES:\n" + ("\n".join(seen_probe_queries) or "(original question only)") + "\n\n"
+        f"CURRENT VISIBLE RESULT PICTURE:\n{prior}\n\n"
+        "Generate only additional probes. The host always retains the original question."
     )
     planner_messages = [
         {"role": "system", "content": guarded_evidence_prompt(_prompt("planner", RETRIEVAL_PLANNER_SYSTEM_PROMPT))},
@@ -4248,22 +4498,22 @@ async def _verify_exhaustive_candidates(
         compact_instruction = ""
         if compact:
             compact_instruction = (
-                "\n\nKOMPAKTER NORMALMODUS:\n"
-                "Gib pro Dokument nur index, status, reason, relation_binding, relations, constraints "
-                "und mentioned_entities zurück. reason ist eine kurze, konkrete Begründung der Einstufung; "
-                "keine separaten entities- oder concepts-Listen. relations enthält nur unmittelbar im "
-                "Dokument belegte Beziehungen; mentioned_entities nur bloße Erwähnungen/Referenzen."
+                "\n\nCOMPACT NORMAL MODE:\n"
+                "For each document return only index, status, reason, relation_binding, relations, constraints "
+                "and mentioned_entities. reason is a short concrete justification for the classification; "
+                "do not return separate entities or concepts lists. relations contains only relationships "
+                "directly supported by the document; mentioned_entities contains only mentions/references."
             )
         prompt = (
-            f"BENUTZERANFRAGE:\n{question}\n\n"
-            f"QUERY-FRAME (Suchhypothese; keine behauptete Tatsache):\n"
+            f"USER REQUEST:\n{question}\n\n"
+            f"QUERY FRAME (search hypothesis; not a claimed fact):\n"
             f"{json.dumps(normalize_query_frame(query_frame), ensure_ascii=False)}\n\n"
-            f"SICHERE EXPLIZITE CONSTRAINTS (bei match verbindlich):\n"
+            f"SAFE EXPLICIT CONSTRAINTS (binding for match):\n"
             f"{safe_constraint_summary(question)}\n\n"
-            f"VERIFIKATIONSANFORDERUNGEN AUS DEM QUERY-REWRITE:\n"
+            f"VERIFICATION REQUIREMENTS FROM QUERY REWRITE:\n"
             f"{json.dumps(list(verification_requirements or []), ensure_ascii=False)}"
             f"{compact_instruction}\n\n"
-            f"KANDIDATEN (bereits Live-ACL-geprueft):\n{context}"
+            f"CANDIDATES (already checked by live ACL):\n{context}"
         )
         messages = [
             {"role": "system", "content": guarded_evidence_prompt(_candidate_verifier_prompt())},
@@ -5162,7 +5412,7 @@ async def _graph_enqueue_evidence(
     rag_user_id: str = "",
 ) -> None:
     """Fail-open hook: enqueue selected/cited answer evidence for graph construction."""
-    if not GRAPH_EVIDENCE_HOOK_ENABLED or not results:
+    if is_src(PROVIDER_CONFIG) or not GRAPH_EVIDENCE_HOOK_ENABLED or not results:
         return
 
     documents: list[dict[str, Any]] = []
@@ -5531,7 +5781,7 @@ def _build_context(
     for result in effective_results:
         raw = result.raw or {}
         record: dict[str, Any] = {
-            "citation": f"[{result.index}]",
+            "evidence_id": _evidence_id_for_result(result),
             "title": str(result.title or "")[:512],
             "text": str(result.text or ""),
         }
@@ -5677,25 +5927,24 @@ async def _evidence_decision(
     force_instruction = ""
     if force_broad:
         force_instruction = (
-            "\n\nFORCE-HINWEIS (verbindlich): Der Benutzer hat /force gesetzt. "
-            "Ein breites, heterogenes oder umfangreiches Trefferbild ist FUER SICH ALLEIN "
-            "kein Grund fuer retry, clarify oder insufficient. Pruefe, ob die konkrete "
-            "Frage aus einzelnen oder mehreren der gelieferten Treffer beantwortbar ist, "
-            "und waehle dann gezielt answer_sources. Wenn die verlangte Information in den "
-            "Treffern tatsaechlich nicht belegt ist, bleibt insufficient weiterhin erlaubt."
+            "\n\nFORCE NOTE (binding): the user set /force. A broad, heterogeneous, or "
+            "large result set is NOT by itself a reason for retry, clarify, or insufficient. "
+            "Check whether the concrete question can be answered from one or more supplied "
+            "results and then select answer_sources deliberately. If the requested information "
+            "is genuinely unsupported by the supplied results, insufficient remains allowed."
         )
 
     prompt = (
-        "Prüfe ausschließlich die Qualität des Trefferbilds. Beantworte die Sachfrage NICHT "
-        "und fasse die Dokumente NICHT zusammen.\n\n"
-        "AKTUELLE BENUTZERFRAGE:\n"
+        "Evaluate only the quality and sufficiency of the result set. Do NOT answer the factual "
+        "question and do NOT summarize the documents.\n\n"
+        "CURRENT USER QUESTION:\n"
         f"{question}\n\n"
-        "AKTUELLE SUCHANFRAGE:\n"
+        "CURRENT RETRIEVAL QUERY:\n"
         f"{retrieval_query}\n\n"
-        "DOKUMENTTREFFER:\n"
+        "DOCUMENT RESULTS:\n"
         f"{context}"
         f"{force_instruction}\n\n"
-        "Gib ausschließlich das verlangte Kontroll-JSON aus."
+        "Return only the requested control JSON."
     )
 
     async def run_once(
@@ -5743,9 +5992,9 @@ async def _evidence_decision(
         )
         retry_prompt = (
             prompt
-            + "\n\nFEHLERHINWEIS: Deine vorige Ausgabe entsprach nicht dem Schema. "
-              "Keine Zusammenfassung, keine neue Aufgabe, kein Feld 'input'. "
-              "Beginne direkt mit {\\\"action\\\": ...}.\n/no_think"
+            + "\n\nREPAIR: Your previous output did not match the schema. "
+              "No summary, no new task, no 'input' field. "
+              "Start directly with {\\\"action\\\": ...}.\n/no_think"
         )
         value = await run_once(
             retry_prompt,
@@ -5888,7 +6137,7 @@ ZUSÄTZLICHE REGELN FÜR AUSSCHLIESSLICH UNSICHERE INTERNE TREFFER (verbindlich)
   Tatsache.
 - Du darfst konkrete Tatsachen aus den internen Dokumenten als hilfreiche
   Suchhinweise wiedergeben, sofern genau diese Tatsachen im Dokumenttext belegt
-  sind. Zitiere solche Angaben mit [n].
+  sind. Zitiere solche Angaben ausschließlich mit dem exakten Marker [[evidence_id]] des betreffenden Records.
 - Trenne strikt zwischen sicher belegtem Dokumentinhalt und der unsicheren
   Zuordnung zur Nutzeranfrage. Formulierungen wie "könnte entsprechen", "weist
   einen Bezug auf" oder "die Unterlagen nennen ..." sind hierfür geeignet.
@@ -6617,17 +6866,17 @@ async def _repair_incomplete_explicit_selection(
     if len(cited) >= len(results):
         return answer
 
-    expected = ", ".join(f"[{result.index}]" for result in results)
-    missing = [result.index for result in results if result not in cited]
+    expected = ", ".join(_evidence_marker(result) for result in results)
+    missing = [_evidence_marker(result) for result in results if result not in cited]
     instruction = f"""Die vorige Antwort ist für den explizit ausgewählten Dokumentensatz unvollständig.
 Es wurden genau {len(results)} Dokumente ausgewählt ({expected}), aber die Antwort deckt nur {len(cited)} davon ab.
-Fehlende Quellenmarker: {', '.join(f'[{index}]' for index in missing)}.
+Fehlende Evidence-Marker: {', '.join(missing)}.
 
 Erstelle die Antwort vollständig neu. Für diese dokumentweise Aufgabe gilt zwingend:
 - Verarbeite alle {len(results)} ausgewählten Dokumente genau einmal.
 - Bei Tabelle/Liste/Sortierung: genau eine Zeile bzw. ein Eintrag pro Dokument.
 - Wenn Datum, Betrag oder ein anderes verlangtes Feld nicht sicher erkennbar ist, schreibe "nicht eindeutig erkennbar" statt das Dokument wegzulassen.
-- Zitiere jeden Dokumenteintrag mit seinem Quellenmarker [n].
+- Zitiere jeden Dokumenteintrag mit seinem exakten [[evidence_id]]-Marker.
 - Füge keine anderen Dokumente hinzu und führe keine neue Suche durch."""
     try:
         repaired = await _ollama_complete(
@@ -7469,7 +7718,9 @@ async def list_models(
     return {
         "object": "list",
         "data": data,
+        "version": VERSION,
         "architecture_tier": architecture_tier(PROVIDER_CONFIG),
+        "configured_model_count": len(SUNAQ_MODEL_REGISTRY.list()),
         "capabilities": {
             "source_scopes": [
                 name for name, enabled in capabilities.items() if enabled
@@ -7615,6 +7866,14 @@ async def chat_completions(
     _ACTIVE_PROGRESS_ID.set(progress_id)
     _ACTIVE_PROGRESS_OWNER.set(progress_owner)
     _progress("received", "Anfrage wird vorbereitet …")
+    _set_progress_diagnostics(
+        progress_id,
+        progress_owner,
+        roles={
+            "planner": _role_backend("planner").model,
+            "answer": _role_backend("answer").model,
+        },
+    )
 
     log.info(
         "SunaQ model: requested=%r selected=%s",
@@ -7819,10 +8078,16 @@ async def chat_completions(
                 completion_id,
                 body.stream,
             )
+        auth_preflight_ms = (time.perf_counter() - auth_preflight_started) * 1000.0
         log.info(
             "Request %s timing: auth_preflight_ms=%.1f",
             completion_id,
-            (time.perf_counter() - auth_preflight_started) * 1000.0,
+            auth_preflight_ms,
+        )
+        _set_progress_diagnostics(
+            progress_id,
+            progress_owner,
+            timings_ms={"auth_preflight": auth_preflight_ms},
         )
 
         auth_status = str(auth_state.get("status") or "").strip().lower()
@@ -9027,10 +9292,16 @@ async def chat_completions(
                 retrieval_query,
                 request_id=completion_id,
             )
+            query_context_ms = (time.perf_counter() - query_context_started) * 1000.0
             log.info(
                 "Request %s timing: query_context_ms=%.1f",
                 completion_id,
-                (time.perf_counter() - query_context_started) * 1000.0,
+                query_context_ms,
+            )
+            _set_progress_diagnostics(
+                progress_id,
+                progress_owner,
+                timings_ms={"query_context": query_context_ms},
             )
             query_rewrite_started = time.perf_counter()
             initial_rewrite = await _rewrite_search_spec(
@@ -9042,10 +9313,16 @@ async def chat_completions(
                 seed_context=query_seed_context,
                 require_entity_hints=resolver_research_enabled,
             )
+            query_rewrite_ms = (time.perf_counter() - query_rewrite_started) * 1000.0
             log.info(
                 "Request %s timing: query_rewrite_ms=%.1f",
                 completion_id,
-                (time.perf_counter() - query_rewrite_started) * 1000.0,
+                query_rewrite_ms,
+            )
+            _set_progress_diagnostics(
+                progress_id,
+                progress_owner,
+                timings_ms={"query_rewrite": query_rewrite_ms},
             )
             if not bool(initial_rewrite.get("valid")):
                 verification_limit = (
@@ -9660,8 +9937,13 @@ async def chat_completions(
             if (use_references or implicit_filename_use or elastic_mode)
             else range(1, _retrieval_planner().max_retrieval_rounds + 1)
         )
+        retrieval_total_ms = 0.0
+        retrieval_core_total_ms = 0.0
+        acl_total_ms = 0.0
+        middleware_total_ms = 0.0
 
         for round_no in retrieval_rounds:
+            retrieval_round_started = time.perf_counter()
             try:
                 if planner_enabled_task:
                     if planner_exhaustive:
@@ -9747,6 +10029,47 @@ async def chat_completions(
                     final_retrieval_query=retrieval_query,
                 )
                 raise HTTPException(status_code=502, detail=f"RAG middleware error: {exc}") from exc
+
+            retrieval_total_ms += (time.perf_counter() - retrieval_round_started) * 1000.0
+            middleware_diagnostics = (
+                dict(payload.get("diagnostics") or {})
+                if isinstance(payload.get("diagnostics"), dict)
+                else {}
+            )
+            middleware_timings = (
+                dict(middleware_diagnostics.get("timings_ms") or {})
+                if isinstance(middleware_diagnostics.get("timings_ms"), dict)
+                else {}
+            )
+            for key, accumulator_name in (
+                ("retrieval_core", "retrieval_core_total_ms"),
+                ("acl", "acl_total_ms"),
+                ("middleware_total", "middleware_total_ms"),
+            ):
+                try:
+                    value = max(0.0, float(middleware_timings.get(key) or 0.0))
+                except (TypeError, ValueError):
+                    value = 0.0
+                if accumulator_name == "retrieval_core_total_ms":
+                    retrieval_core_total_ms += value
+                elif accumulator_name == "acl_total_ms":
+                    acl_total_ms += value
+                else:
+                    middleware_total_ms += value
+            _set_progress_diagnostics(
+                progress_id,
+                progress_owner,
+                timings_ms={
+                    "retrieval": retrieval_total_ms,
+                    "retrieval_core": retrieval_core_total_ms,
+                    "acl": acl_total_ms,
+                    "middleware_total": middleware_total_ms,
+                },
+                authorized_candidates=middleware_diagnostics.get(
+                    "authorized_candidates",
+                    len(ranked_results),
+                ),
+            )
 
             # The middleware response has already crossed live ACL. Re-rank
             # the visible candidates from 1..n and persist no backend rank/score
@@ -9861,7 +10184,12 @@ async def chat_completions(
                     )
                 planner_previous_doc_ids = current_doc_ids
 
-            if planner_enabled_task and ranked_results and list_mode is None:
+            if (
+                planner_enabled_task
+                and _retrieval_planner().verification_enabled
+                and ranked_results
+                and list_mode is None
+            ):
                 if planner_exhaustive:
                     verification_limit = _retrieval_planner().exhaustive_verification_candidate_limit
                 elif planner_bounded_document_set:
@@ -10598,7 +10926,9 @@ async def chat_completions(
             return _static_response(content, completion_id, body.stream)
 
     _progress("answering", "Antwort wird erstellt …")
+    answer_stage_started = time.perf_counter()
     if not body.stream:
+        answer_model_started = time.perf_counter()
         try:
             answer = await _ollama_complete(
                 messages,
@@ -10626,6 +10956,13 @@ async def chat_completions(
             )
             log.warning("Request %s LLM unavailable: %s", completion_id, exc)
             return _static_response(content, completion_id, body.stream)
+
+        answer_model_ms = (time.perf_counter() - answer_model_started) * 1000.0
+        _set_progress_diagnostics(
+            progress_id,
+            progress_owner,
+            timings_ms={"answer_model": answer_model_ms},
+        )
 
         if not answer and not auxiliary:
             if direct_kind:
@@ -10668,6 +11005,7 @@ async def chat_completions(
                     rag_user_id=user_id,
                 )
             cited_results = explicit_cited_results
+            answer = _render_display_citations(answer, results)
             _research_call(
                 "log_documents",
                 round_id=final_round_id,
@@ -10714,6 +11052,13 @@ async def chat_completions(
         log.info("Request %s finished: status=answered answer_chars=%d", completion_id, len(content))
         if deferred_use_findings is not None:
             _schedule_use_research_findings(**deferred_use_findings)
+        _set_progress_diagnostics(
+            progress_id,
+            progress_owner,
+            timings_ms={
+                "answer_stage": (time.perf_counter() - answer_stage_started) * 1000.0,
+            },
+        )
         return _completion_response(content, completion_id)
 
     async def event_stream() -> AsyncIterator[str]:
@@ -10732,7 +11077,9 @@ async def chat_completions(
         reasoning_chunks = 0
         reasoning_chars = 0
         content_chunks = 0
+        citation_stream = _EvidenceCitationStream(results) if (results and not auxiliary) else None
 
+        answer_model_started = time.perf_counter()
         try:
             async for event in _ollama_stream(
                 messages,
@@ -10768,7 +11115,13 @@ async def chat_completions(
 
                     content_chunks += 1
                     accumulated.append(content_token)
-                    yield _sse_chunk(completion_id, content_token)
+                    visible_token = (
+                        citation_stream.feed(content_token)
+                        if citation_stream is not None
+                        else content_token
+                    )
+                    if visible_token:
+                        yield _sse_chunk(completion_id, visible_token)
 
         except Exception as exc:
             status = "stream_error"
@@ -10786,9 +11139,21 @@ async def chat_completions(
                 yield _sse_chunk(completion_id, note)
                 log.warning("Request %s LLM stream interrupted: %s", completion_id, exc)
 
+        answer_model_ms = (time.perf_counter() - answer_model_started) * 1000.0
+        _set_progress_diagnostics(
+            progress_id,
+            progress_owner,
+            timings_ms={"answer_model": answer_model_ms},
+        )
+
         if reasoning_open:
             yield _sse_chunk(completion_id, "\n</think>\n")
             reasoning_open = False
+
+        if citation_stream is not None:
+            pending_citation_text = citation_stream.flush()
+            if pending_citation_text:
+                yield _sse_chunk(completion_id, pending_citation_text)
 
         log.info(
             "Request %s stream stats: reasoning_chunks=%d reasoning_chars=%d "
@@ -10819,7 +11184,8 @@ async def chat_completions(
             if fallback:
                 accumulated.append(fallback)
                 answer = fallback
-                yield _sse_chunk(completion_id, fallback)
+                visible_fallback = _render_display_citations(fallback, results)
+                yield _sse_chunk(completion_id, visible_fallback)
             else:
                 if direct_kind:
                     answer = (
@@ -10854,6 +11220,7 @@ async def chat_completions(
                     rag_user_id=user_id,
                 )
             cited_results = explicit_cited_results
+            answer = _render_display_citations(answer, results)
             _research_call(
                 "log_documents",
                 round_id=final_round_id,
@@ -10902,6 +11269,14 @@ async def chat_completions(
         log.info("Request %s finished: status=%s answer_chars=%d", completion_id, status, len(answer))
         if deferred_use_findings is not None and status == "answered":
             _schedule_use_research_findings(**deferred_use_findings)
+        _set_progress_diagnostics(
+            progress_id,
+            progress_owner,
+            timings_ms={
+                "answer_stage": (time.perf_counter() - answer_stage_started) * 1000.0,
+            },
+        )
+        _progress("complete", "Fertig.")
 
         yield _sse_chunk(completion_id, finish_reason="stop")
         yield "data: [DONE]\n\n"

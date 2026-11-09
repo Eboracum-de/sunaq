@@ -22,6 +22,7 @@ retrieval_planner:
   context_max_chars: 26000
   max_complete_documents: 50
   overflow_acl_scan_limit: 180
+  verification_enabled: true
   verification_candidate_limit: 50
   bounded_verification_candidate_limit: 50
   exhaustive_verification_candidate_limit: 50

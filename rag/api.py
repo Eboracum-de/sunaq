@@ -502,16 +502,22 @@ class ElasticSearchRequest(BaseModel):
 
 
 class SearchSpecRequest(BaseModel):
+    retrieval_intent: str = Field(default="unknown", max_length=64)
+    lexical_sufficiency: str = Field(default="unknown", max_length=64)
+    lexical_query: str = Field(default="", max_length=1200)
+    term_interpretations: list[dict[str, Any]] = Field(default_factory=list, max_length=8)
     elastic_query: str = Field(default="", max_length=1200)
     semantic_query: str = Field(default="", max_length=1200)
+    alternative_interpretations: list[dict[str, str]] = Field(default_factory=list, max_length=2)
     entities: list[str] = Field(default_factory=list, max_length=16)
     entity_hints: list[dict[str, str]] = Field(default_factory=list, max_length=16)
     concepts: list[str] = Field(default_factory=list, max_length=16)
     concept_groups: list[dict[str, Any]] = Field(default_factory=list, max_length=12)
     constraints: list[dict[str, str]] = Field(default_factory=list, max_length=12)
     verification_requirements: list[str] = Field(default_factory=list, max_length=16)
-    # Legacy rc2 fields remain accepted for compatibility with stored records
-    # and external callers; the rc3 provider no longer emits them.
+    answer_requirements: list[str] = Field(default_factory=list, max_length=16)
+    # Legacy 0.8.7 fields remain accepted for compatibility with stored records
+    # and external callers; the 0.8.8 provider no longer emits them.
     must: list[str] = Field(default_factory=list, max_length=24)
     should: list[str] = Field(default_factory=list, max_length=24)
     must_not: list[str] = Field(default_factory=list, max_length=24)
@@ -2352,6 +2358,7 @@ def search(
     http_request: Request,
 ):
 
+    request_started = time.perf_counter()
     try:
 
         effective_arms = _enforce_architecture_request(
@@ -2375,6 +2382,7 @@ def search(
         )
 
         prefilter_user, prefilter_groups = _acl_prefilter_context(http_request)
+        retrieval_started = time.perf_counter()
         with use_runtime_model_config(runtime_model.config):
             search_result = perform_search(
                 question=body.query,
@@ -2393,16 +2401,24 @@ def search(
                 acl_prefilter_user=prefilter_user,
                 acl_prefilter_groups=prefilter_groups,
             )
+        retrieval_core_ms = round((time.perf_counter() - retrieval_started) * 1000.0, 1)
 
         # Security boundary: authorization is deliberately applied only after
         # the retrieval/ranking decision.  Denied results are removed; lower
         # ranked candidates are never pulled in as replacements.
+        acl_started = time.perf_counter()
         acl = live_acl.authorize(
             list(search_result["results"]),
             rag_user_id=http_request.headers.get("x-rag-user-id"),
         )
+        acl_ms = round((time.perf_counter() - acl_started) * 1000.0, 1)
         if acl.enabled:
-            log.info("live_acl search: checked=%d authorized=%d", acl.checked, acl.authorized)
+            log.info(
+                "live_acl search: checked=%d authorized=%d elapsed_ms=%.1f",
+                acl.checked,
+                acl.authorized,
+                acl_ms,
+            )
 
         results = [result_to_dict(item) for item in acl.results]
 
@@ -2455,6 +2471,8 @@ def search(
                     orientation_acl.checked, orientation_acl.authorized,
                 )
 
+        request_total_ms = round((time.perf_counter() - request_started) * 1000.0, 1)
+
         return {
 
             "query":
@@ -2501,6 +2519,18 @@ def search(
 
             "raw_results":
                 bool(search_result.get("raw_results", body.raw_results)),
+
+            # Timing diagnostics contain no document identities or denied-result
+            # counts. They are safe to forward through the identity-scoped
+            # provider status channel for performance analysis.
+            "diagnostics": {
+                "timings_ms": {
+                    "retrieval_core": retrieval_core_ms,
+                    "acl": acl_ms,
+                    "middleware_total": request_total_ms,
+                },
+                "authorized_candidates": int(acl.authorized),
+            },
 
             # Query provenance is safe to expose after the ACL boundary because
             # it contains no candidate identities/counts. Result provenance below

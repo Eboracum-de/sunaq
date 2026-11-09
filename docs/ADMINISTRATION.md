@@ -4,7 +4,7 @@ This document covers the administrator-owned runtime state introduced for the
 multi-user beta. Normal administration should use the Admin UI or CLI. Direct
 SQLite changes are a diagnostic/emergency tool only.
 
-Fresh 0.8.7-rc1 installations use `/opt/sunaq` in the command examples below. A recognized legacy installation retains its existing installation prefix (for example `/opt/nextcloud-rag`); substitute that retained prefix consistently in commands and paths.
+Fresh 0.8.8-rc1 installations use `/opt/sunaq` in the command examples below. A recognized legacy installation retains its existing installation prefix (for example `/opt/nextcloud-rag`); substitute that retained prefix consistently in commands and paths.
 
 ## 1. SunaQ Admin and user UI paths
 
@@ -466,7 +466,7 @@ The beta installer manages only nginx plus optional Qdrant, Neo4j and OpenWebUI.
 
 ## Qdrant sync lifecycle
 
-Normal Elasticsearch -> Qdrant synchronization does not use payload-filter deletion. Stable UUIDv5 point IDs plus the committed SQLite `chunk_count` are used to overwrite and remove chunks deterministically. When a document shrinks, new chunks are upserted first and only the obsolete tail IDs are deleted afterward. A stale document is removed by its known explicit point IDs.
+Normal Elasticsearch -> Qdrant synchronization uses Elasticsearch as desired state and a compact companion Qdrant sync-inventory collection as reconciliation state. Each Elasticsearch document has one inventory record containing its content fingerprint/disposition and current chunk count; normal sync no longer uses `state.sqlite` as the runtime authority. Complete runs compare lightweight Elasticsearch `_id` plus `hash`/document-version metadata with that inventory, hydrate full `_source` only for new or changed documents through batched `_mget`, and remove vector chunks plus the inventory record for IDs that disappeared from Elasticsearch. Stable UUIDv5 chunk point IDs keep overwrite/shrink/delete operations deterministic. Existing vectorized `state.sqlite` rows may be imported once when an older installation has no Qdrant inventory yet.
 
 Recommended existing-installation sync settings for large/heterogeneous corpora are `elasticsearch.page_size: 50` and `sync.embedding_batch_size: 8`. They affect peak memory/HTTP batch size, not semantic chunk boundaries.
 
@@ -715,7 +715,7 @@ retrieval arm. An ERG deployment can therefore use Neo4j entity resolution/query
 while `retrieval_policy.internal.graph: disabled` and
 `graph_retrieval.enabled: false`.
 
-## SunaQ Recherche 0.3.16
+## SunaQ Recherche 0.3.21
 
 The Nextcloud client is under `clients/nextcloud/sunaq`. It is intentionally a
 thin search frontend: Nextcloud session → server-side proxy → OpenAI-compatible

@@ -1,6 +1,6 @@
 # Dockerized deployment
 
-**Reference:** `0.8.7-rc1`
+**Reference:** `0.8.8-rc1`
 
 Dockerized is a packaging/deployment mechanism of the common SunaQ middleware.
 It is not a separate architecture tier and is not a reduced fork. Select the
@@ -123,7 +123,7 @@ Their model/profile configuration lives below `models/`, which is mounted
 read-only into the runtime containers and is treated as administrator-owned
 configuration after installation.
 
-The shipped 0.8.7-rc1 profiles use one retrieval round and no reranker by
+The shipped 0.8.8-rc1 profiles use one retrieval round and no reranker by
 default. Vector retrieval is available only when Qdrant is both permitted by the
 selected architecture/capability policy and actually configured/available.
 

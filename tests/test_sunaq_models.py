@@ -254,22 +254,24 @@ def test_shipped_sunaq_profiles_own_request_local_settings_and_core_prompts():
     assert request_sections.issubset(thorough)
     assert request_sections.issubset(deep)
 
-    assert standard["search"]["es_limit"] == 50
-    assert standard["search"]["vector_limit"] == 80
-    assert standard["search"]["rerank_candidates"] == 10
-    assert standard["search"]["final_limit"] == 10
+    assert standard["search"]["es_limit"] == 15
+    assert standard["search"]["vector_limit"] == 15
+    assert standard["search"]["rerank_candidates"] == 15
+    assert standard["search"]["final_limit"] == 15
     assert standard["retrieval_planner"]["max_retrieval_rounds"] == 1
-    assert standard["retrieval_planner"]["verification_candidate_limit"] == 10
+    assert standard["retrieval_planner"]["verification_enabled"] is False
+    assert standard["retrieval_planner"]["verification_candidate_limit"] == 15
     assert standard["evidence_control"]["mode"] == "off"
     assert standard["answer_context"] == {
-        "max_documents": 10,
-        "max_chars_per_document": 2500,
-        "max_total_chars": 25000,
+        "max_documents": 12,
+        "max_chars_per_document": 1000,
+        "max_total_chars": 16000,
     }
 
     assert thorough["search"]["rerank_candidates"] == 30
     assert thorough["search"]["final_limit"] == 30
     assert thorough["retrieval_planner"]["max_retrieval_rounds"] == 1
+    assert thorough["retrieval_planner"]["verification_enabled"] is True
     assert thorough["retrieval_planner"]["verification_candidate_limit"] == 30
     assert thorough["evidence_control"]["mode"] == "off"
     assert thorough["answer_context"]["max_documents"] == 30
@@ -277,6 +279,7 @@ def test_shipped_sunaq_profiles_own_request_local_settings_and_core_prompts():
 
     assert deep["search"]["final_limit"] == 50
     assert deep["retrieval_planner"]["max_retrieval_rounds"] == 1
+    assert deep["retrieval_planner"]["verification_enabled"] is True
     assert deep["retrieval_planner"]["verification_candidate_limit"] == 50
     assert deep["evidence_control"]["mode"] == "off"
     assert deep["answer_context"]["max_documents"] == 50
@@ -320,8 +323,8 @@ def test_standard_prompt_pack_preserves_rc5_prompt_semantics_and_thorough_is_exp
         ).read_text(encoding="utf-8").strip()
 
         assert standard == baseline
-        assert 'SUNAQ-PROFIL "GRÜNDLICH"' in thorough
-        assert 'SUNAQ-PROFIL "TIEF"' in deep
+        assert 'SUNAQ PROFILE "THOROUGH"' in thorough
+        assert 'SUNAQ PROFILE "DEEP"' in deep
         assert baseline in thorough
         assert baseline in deep
 
@@ -660,3 +663,94 @@ deployment_overrides:
     cfg["deployment"]["profile"] = "super-light"
     model = load_model_registry(cfg, models_dir=models_dir).get()
     assert model.section("graph_retrieval")["enabled"] is False
+
+
+
+def test_query_rewriter_uses_find_compatible_language_contract():
+    root = Path(__file__).resolve().parent.parent
+    config = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8"))
+    assert config["retrieval_languages"] == ["de"]
+
+    provider = (root / "rag" / "openai_provider.py").read_text(encoding="utf-8")
+    assert '"interaction_language": "auto"' in provider
+    assert '"retrieval_languages": _query_retrieval_languages()' in provider
+    assert "USER_QUERY_JSON:" in provider
+    assert "SUNAQ_RETRIEVAL_CONTEXT_JSON:" in provider
+
+    for directory in ("standard", "thorough", "deep"):
+        prompt = (
+            root / "models" / directory / "prompts" / "query_rewriter.txt"
+        ).read_text(encoding="utf-8")
+        assert "interaction_language" in prompt
+        assert "retrieval_languages" in prompt
+        assert "information_interest" in prompt
+        assert "answer_requirements" in prompt
+        assert "SUNAQ RETRIEVAL CONTEXT" in prompt
+        assert "In round 1 output stop=false." in prompt
+
+
+
+def test_core_model_prompts_use_one_english_contract():
+    root = Path(__file__).resolve().parent.parent
+    base_names = (
+        "retrieval_planner.txt",
+        "candidate_verifier.txt",
+        "evidence_decision.txt",
+        "rag_answer.txt",
+    )
+    for name in base_names:
+        global_prompt = (root / "prompts" / name).read_text(encoding="utf-8").strip()
+        standard = (root / "models" / "standard" / "prompts" / name).read_text(
+            encoding="utf-8"
+        ).strip()
+        thorough = (root / "models" / "thorough" / "prompts" / name).read_text(
+            encoding="utf-8"
+        ).strip()
+        deep = (root / "models" / "deep" / "prompts" / name).read_text(
+            encoding="utf-8"
+        ).strip()
+
+        assert standard == global_prompt
+        assert global_prompt.startswith(("You ", "COMMON "))
+        assert 'SUNAQ PROFILE "THOROUGH"' in thorough
+        assert 'SUNAQ PROFILE "DEEP"' in deep
+        assert global_prompt in thorough
+        assert global_prompt in deep
+
+    query_prompt = (root / "prompts" / "query_rewriter.txt").read_text(encoding="utf-8")
+    assert "Prefer terms in retrieval_languages." in query_prompt
+    assert "A foreign-language term is appropriate only if it already occurs in the" in query_prompt
+
+    provider = (root / "rag" / "openai_provider.py").read_text(encoding="utf-8")
+    assert 'PROVIDER_CONFIG.get("retrieval_languages", ["de"])' in provider
+    assert 'return normalized or ["de"]' in provider
+    assert "ORIGINAL USER QUESTION:" in provider
+    assert "SAFE EXPLICIT CONSTRAINTS (binding for match):" in provider
+    assert "CURRENT USER QUESTION:" in provider
+
+
+
+def test_standard_profile_is_sunaq_find_budget_baseline():
+    root = Path(__file__).resolve().parent.parent
+    profile = yaml.safe_load(
+        (root / "models" / "standard" / "profile.yaml").read_text(encoding="utf-8")
+    )
+
+    assert profile["search"]["es_limit"] == 15
+    assert profile["search"]["vector_limit"] == 15
+    assert profile["search"]["rerank_candidates"] == 15
+    assert profile["search"]["final_limit"] == 15
+    assert profile["retrieval_planner"]["verification_enabled"] is False
+    assert profile["retrieval_planner"]["verification_candidate_limit"] == 15
+    assert profile["retrieval_planner"]["max_complete_documents"] == 15
+    assert profile["retrieval_signal"]["enabled"] is False
+    assert profile["reranker"]["backend"] == "none"
+    assert profile["context_enrichment"]["enabled"] is False
+    assert profile["answer_context"] == {
+        "max_documents": 12,
+        "max_chars_per_document": 1000,
+        "max_total_chars": 16000,
+    }
+
+    provider = (root / "rag" / "openai_provider.py").read_text(encoding="utf-8")
+    assert 'SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "15"))' in provider
