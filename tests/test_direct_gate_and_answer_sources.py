@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 from fastapi import BackgroundTasks
 
@@ -221,3 +222,43 @@ def test_conversation_id_does_not_reuse_openai_user_field():
         user="user-identity",
     )
     assert provider._conversation_id(_request(), body) is None
+
+
+def test_stable_evidence_id_maps_to_existing_display_source_number():
+    results = [
+        provider.SearchResult(index=1, title="a.pdf", text="A", raw={"document_id": "files:8430"}),
+        provider.SearchResult(index=2, title="b.pdf", text="B", raw={"document_id": "files:9911"}),
+    ]
+    raw = "Aussage [[file-9911]]."
+    assert provider._cited_results(raw, results) == [results[1]]
+    assert provider._render_display_citations(raw, results) == "Aussage [2]."
+    rendered = provider._source_suffix(raw, results)
+    assert "- [2]" in rendered
+    assert "- [1]" not in rendered
+
+
+def test_evidence_id_is_stable_across_result_renumbering():
+    a = provider.SearchResult(index=1, title="x.pdf", text="X", raw={"document_id": "files:8430"})
+    b = provider.SearchResult(index=17, title="x.pdf", text="X", raw={"document_id": "files:8430"})
+    assert provider._evidence_id_for_result(a) == "file-8430"
+    assert provider._evidence_id_for_result(b) == "file-8430"
+
+
+def test_streaming_evidence_marker_translation_survives_chunk_boundaries():
+    result = provider.SearchResult(index=3, title="x.pdf", text="X", raw={"document_id": "files:8430"})
+    stream = provider._EvidenceCitationStream([result])
+    chunks = ["Beleg ", "[[fi", "le-84", "30]]", " Ende"]
+    visible = "".join(stream.feed(chunk) for chunk in chunks) + stream.flush()
+    assert visible == "Beleg [3] Ende"
+
+
+def test_answer_prompt_uses_stable_ids_and_original_question_language():
+    root = Path(__file__).resolve().parent.parent
+    for path in [root / "prompts" / "rag_answer.txt"] + [
+        root / "models" / model / "prompts" / "rag_answer.txt"
+        for model in ("standard", "thorough", "deep")
+    ]:
+        text = path.read_text(encoding="utf-8")
+        assert "[[evidence_id]]" in text
+        assert "Never renumber, translate, replace, or invent them." in text
+        assert "language of the CURRENT ORIGINAL USER QUESTION" in text

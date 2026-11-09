@@ -5,3 +5,85 @@
 .sunaq-admin-status {
     margin-left: 10px;
 }
+
+
+.sunaq-admin-card {
+    box-sizing: border-box;
+    width: min(720px, 95%);
+    margin: 14px 0 20px;
+    padding: 14px 16px;
+    border: 1px solid var(--color-border, #ddd);
+    border-radius: 10px;
+    background: var(--color-main-background, #fff);
+}
+
+.sunaq-admin-card,
+.sunaq-admin-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.sunaq-admin-actions {
+    flex: 0 0 auto;
+}
+
+.sunaq-admin-muted,
+.sunaq-admin-details {
+    margin-top: 4px;
+    color: var(--color-text-maxcontrast, #666);
+}
+
+.sunaq-admin-ok {
+    color: var(--color-success, #2d7d46);
+}
+
+.sunaq-admin-error {
+    color: var(--color-error, #c00);
+}
+
+@media (max-width: 700px) {
+    .sunaq-admin-card {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .sunaq-admin-actions {
+        justify-content: flex-start;
+        flex-wrap: wrap;
+    }
+}
+
+.sunaq-admin-card-main {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.sunaq-runtime-info {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 8px 14px;
+    margin: 14px 0 0;
+    padding-top: 12px;
+    border-top: 1px solid var(--color-border, #ddd);
+}
+
+.sunaq-runtime-info[hidden] {
+    display: none;
+}
+
+.sunaq-runtime-info div {
+    min-width: 0;
+}
+
+.sunaq-runtime-info dt {
+    color: var(--color-text-maxcontrast, #666);
+    font-size: 0.82em;
+}
+
+.sunaq-runtime-info dd {
+    margin: 2px 0 0;
+    overflow-wrap: anywhere;
+    font-weight: 600;
+}

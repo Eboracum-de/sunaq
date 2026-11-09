@@ -6,13 +6,19 @@ from rag.version import VERSION
 
 
 def test_public_release_identity_is_consistent() -> None:
-    assert VERSION == "0.8.7-rc1"
+    assert VERSION == "0.8.8-rc1"
 
     root = Path(".")
-    assert f"release: {VERSION}" in (root / "versions.lock.yaml").read_text(encoding="utf-8")
     assert f"SunaQ / Eboracum Research Gateway - {VERSION}" in (
         root / "config.yaml"
     ).read_text(encoding="utf-8")
+
+    # Development branches deliberately keep the last public release contract
+    # in versions.lock/README/release notes until an RC is cut.
+    if VERSION.endswith("-dev"):
+        return
+
+    assert f"release: {VERSION}" in (root / "versions.lock.yaml").read_text(encoding="utf-8")
     assert f"## {VERSION} " in (root / "CHANGELOG.md").read_text(encoding="utf-8")
 
     notes = root / f"RELEASE-NOTES-{VERSION}.md"

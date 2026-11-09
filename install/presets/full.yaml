@@ -45,3 +45,11 @@ mail:
     enabled: true
 chat_archive:
   enabled: true
+
+research_backends:
+  brave-search:
+    enabled: true
+  openai-research:
+    enabled: false
+dossier_writer:
+  enabled: true

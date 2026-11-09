@@ -1,6 +1,6 @@
 # Data lifecycle, deletion, backup and restore
 
-**Reference:** `0.8.7-rc1` release candidate
+**Reference:** `0.8.8-rc1` release candidate
 
 SunaQ deliberately reuses Nextcloud and its FullTextSearch infrastructure, but it also creates derived state. Operators therefore need to distinguish **authoritative source data**, **rebuildable indexes** and **state that contains manual work or credentials**.
 

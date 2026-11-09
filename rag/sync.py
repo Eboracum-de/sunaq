@@ -23,6 +23,7 @@ user's Nextcloud, ?openfile=<n> resolves correctly to the current file.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import sqlite3
@@ -30,6 +31,7 @@ import logging
 import sys
 import uuid
 from datetime import datetime, timezone
+from time import perf_counter
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
@@ -238,6 +240,13 @@ def content_hash(hit: dict[str, Any]) -> str:
     es_hash = src.get("hash")
     if es_hash:
         return str(es_hash)
+    # Nextcloud FullTextSearch does not populate _source.hash for every
+    # document class (notably many empty/semantically excluded records).
+    # Ask ES for the cheap per-document version and use it as the change
+    # fingerprint rather than transferring full _source on every run.
+    es_version = hit.get("_version")
+    if es_version is not None:
+        return f"es-version:{es_version}"
     raw = json.dumps(
         {
             "_id": hit.get("_id"),
@@ -499,7 +508,19 @@ class StateDB:
             """
         )
         self._ensure_column("documents", "index_signature", "TEXT")
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS es_inventory (
+                document_id TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
+                disposition TEXT NOT NULL,
+                index_signature TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         self.conn.commit()
+        self._inventory_pending = 0
 
     def _ensure_column(self, table: str, column: str, column_type: str):
         columns = {str(row[1]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -511,6 +532,14 @@ class StateDB:
             "SELECT content_hash, chunk_count, title, index_signature FROM documents WHERE document_id=?",
             (document_id,),
         ).fetchone()
+
+    def snapshot(self) -> dict[str, tuple]:
+        return {
+            str(row[0]): (row[1], row[2], row[3], row[4])
+            for row in self.conn.execute(
+                "SELECT document_id, content_hash, chunk_count, title, index_signature FROM documents"
+            )
+        }
 
     def put(
         self,
@@ -560,17 +589,106 @@ class StateDB:
         self.conn.execute("DELETE FROM documents WHERE document_id=?", (document_id,))
         self.conn.commit()
 
+    def inventory_get(self, document_id: str):
+        return self.conn.execute(
+            "SELECT content_hash, disposition, index_signature FROM es_inventory WHERE document_id=?",
+            (document_id,),
+        ).fetchone()
+
+    def inventory_put(
+        self,
+        document_id: str,
+        digest: str,
+        disposition: str,
+        index_signature: str,
+    ):
+        self.conn.execute(
+            """
+            INSERT INTO es_inventory(document_id, content_hash, disposition, index_signature, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(document_id) DO UPDATE SET
+                content_hash=excluded.content_hash,
+                disposition=excluded.disposition,
+                index_signature=excluded.index_signature,
+                updated_at=excluded.updated_at
+            """,
+            (document_id, digest, disposition, index_signature, utc_now()),
+        )
+        self._inventory_pending += 1
+        if self._inventory_pending >= 500:
+            self.conn.commit()
+            self._inventory_pending = 0
+
+    def inventory_snapshot(self) -> dict[str, tuple]:
+        return {
+            str(row[0]): (row[1], row[2], row[3])
+            for row in self.conn.execute(
+                "SELECT document_id, content_hash, disposition, index_signature FROM es_inventory"
+            )
+        }
+
+    def inventory_ids(self) -> set[str]:
+        return {row[0] for row in self.conn.execute("SELECT document_id FROM es_inventory")}
+
+    def inventory_delete(self, document_id: str):
+        self.conn.execute("DELETE FROM es_inventory WHERE document_id=?", (document_id,))
+        self._inventory_pending += 1
+        if self._inventory_pending >= 500:
+            self.conn.commit()
+            self._inventory_pending = 0
+
     def close(self):
+        self.conn.commit()
+        self._inventory_pending = 0
         self.conn.close()
 
 
-def es_scroll(es_url: str, index: str, page_size: int, scroll: str,
-              request_options: dict[str, Any] | None = None) -> Iterable[dict[str, Any]]:
+def es_scroll(
+    es_url: str,
+    index: str,
+    page_size: int,
+    scroll: str,
+    request_options: dict[str, Any] | None = None,
+    *,
+    full_source_predicate=None,
+    inventory_only: bool = False,
+) -> Iterable[dict[str, Any]]:
+    """Scroll ES cheaply and hydrate only documents that need full content.
+
+    With a predicate, the first pass requests only fields needed to classify
+    scope/filter/state. For every scroll page, new/changed documents are then
+    hydrated in one _mget request. Unchanged documents therefore never transfer
+    their extracted content field.
+    """
     request_options = dict(request_options or {})
+    source_spec: bool | list[str] = True
+    if full_source_predicate is not None:
+        if inventory_only:
+            # Fast full-run inventory: equivalent to SELECT _id, hash.  All
+            # classification/content fields are fetched only for deltas via
+            # the batched _mget below.
+            source_spec = ["hash"]
+        else:
+            source_spec = [
+                "title",
+                "hash",
+                "source_origin",
+                "attachment.content_type",
+                "attachment.content_length",
+                "attachment.size",
+                "size",
+            ]
+
     r = requests.post(
         f"{es_url.rstrip('/')}/{index}/_search",
         params={"scroll": scroll},
-        json={"size": page_size, "sort": ["_doc"], "_source": True, "query": {"match_all": {}}},
+        json={
+            "size": page_size,
+            "sort": ["_doc"],
+            "_source": source_spec,
+            "version": True,
+            "query": {"match_all": {}},
+        },
         timeout=120, **request_options,
     )
     r.raise_for_status()
@@ -581,6 +699,46 @@ def es_scroll(es_url: str, index: str, page_size: int, scroll: str,
             hits = data.get("hits", {}).get("hits", [])
             if not hits:
                 break
+
+            if full_source_predicate is not None:
+                hydrate_ids = [
+                    str(hit.get("_id") or "")
+                    for hit in hits
+                    if str(hit.get("_id") or "") and full_source_predicate(hit)
+                ]
+                light_versions = {
+                    str(hit.get("_id") or ""): hit.get("_version")
+                    for hit in hits
+                    if str(hit.get("_id") or "")
+                }
+                if hydrate_ids:
+                    hydrated_response = requests.post(
+                        f"{es_url.rstrip('/')}/{index}/_mget",
+                        json={"ids": hydrate_ids},
+                        timeout=120,
+                        **request_options,
+                    )
+                    if not hydrated_response.ok:
+                        body = (hydrated_response.text or "").strip().replace("\n", " ")[:2000]
+                        raise RuntimeError(
+                            f"Elasticsearch _mget failed status={hydrated_response.status_code} "
+                            f"index={index!r} ids={len(hydrate_ids)} body={body!r}"
+                        )
+                    hydrated_docs = {
+                        str(doc.get("_id") or ""): doc
+                        for doc in (hydrated_response.json().get("docs") or [])
+                        if doc.get("found", True)
+                    }
+                    for hydrated_id, hydrated_doc in hydrated_docs.items():
+                        if hydrated_doc.get("_version") is None and light_versions.get(hydrated_id) is not None:
+                            hydrated_doc["_version"] = light_versions[hydrated_id]
+                    hits = [
+                        hydrated_docs.get(str(hit.get("_id") or ""), hit)
+                        if str(hit.get("_id") or "") in hydrate_ids
+                        else hit
+                        for hit in hits
+                    ]
+
             yield from hits
             r = requests.post(
                 f"{es_url.rstrip('/')}/_search/scroll",
@@ -600,8 +758,6 @@ def es_scroll(es_url: str, index: str, page_size: int, scroll: str,
                 )
             except requests.RequestException:
                 pass
-
-
 def qdrant_collection_exists(qdrant_url: str, collection: str) -> bool:
     r = requests.get(f"{qdrant_url.rstrip('/')}/collections/{collection}", timeout=30)
     if r.status_code == 404:
@@ -648,6 +804,124 @@ def point_id(document_id: str, chunk_no: int) -> str:
     return str(uuid.uuid5(UUID_NAMESPACE, f"nextcloud-rag:{document_id}:{chunk_no}"))
 
 
+def inventory_point_id(document_id: str) -> str:
+    return str(uuid.uuid5(UUID_NAMESPACE, f"nextcloud-rag-inventory:{document_id}"))
+
+
+def qdrant_inventory_collection_name(collection: str) -> str:
+    return f"{collection}__sync_inventory"
+
+
+def qdrant_load_inventory(
+    qdrant_url: str,
+    inventory_collection: str,
+    *,
+    page_size: int = 1000,
+) -> dict[str, dict[str, Any]]:
+    """Load one compact reconciliation record per ES document from Qdrant.
+
+    The inventory collection deliberately stores no semantic vectors: each point
+    uses a constant one-dimensional vector and only reconciliation metadata in
+    payload.  Scroll requests disable vectors and project only the small payload.
+    """
+    if not qdrant_collection_exists(qdrant_url, inventory_collection):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    offset = None
+    endpoint = f"{qdrant_url.rstrip('/')}/collections/{inventory_collection}/points/scroll"
+    while True:
+        body: dict[str, Any] = {
+            "limit": max(1, int(page_size)),
+            "with_vector": False,
+            "with_payload": {
+                "include": [
+                    "document_id",
+                    "content_hash",
+                    "disposition",
+                    "index_signature",
+                    "decision_signature",
+                    "chunk_count",
+                ]
+            },
+        }
+        if offset is not None:
+            body["offset"] = offset
+        r = requests.post(endpoint, json=body, timeout=120)
+        if r.status_code == 404:
+            return {}
+        r.raise_for_status()
+        payload = (r.json().get("result") or {})
+        points = payload.get("points") or []
+        for point in points:
+            meta = point.get("payload") or {}
+            document_id = str(meta.get("document_id") or "")
+            if not document_id:
+                continue
+            result[document_id] = {
+                "content_hash": str(meta.get("content_hash") or ""),
+                "disposition": str(meta.get("disposition") or ""),
+                "index_signature": str(meta.get("index_signature") or ""),
+                "decision_signature": str(meta.get("decision_signature") or ""),
+                "chunk_count": max(0, int(meta.get("chunk_count") or 0)),
+            }
+        offset = payload.get("next_page_offset")
+        if offset in (None, "") or not points:
+            break
+    return result
+
+
+def qdrant_inventory_upsert_many(
+    qdrant_url: str,
+    inventory_collection: str,
+    records: Iterable[tuple[str, str, str, str, str, int]],
+    *,
+    batch_size: int = 256,
+) -> int:
+    records = list(records)
+    if not records:
+        return 0
+    ensure_qdrant_collection(qdrant_url, inventory_collection, 1)
+    endpoint = f"{qdrant_url.rstrip('/')}/collections/{inventory_collection}/points"
+    written = 0
+    for group in batched(records, max(1, int(batch_size))):
+        points = [
+            {
+                "id": inventory_point_id(document_id),
+                "vector": [0.0],
+                "payload": {
+                    "document_id": document_id,
+                    "content_hash": digest,
+                    "disposition": disposition,
+                    "index_signature": index_signature,
+                    "decision_signature": decision_signature,
+                    "chunk_count": max(0, int(chunk_count)),
+                },
+            }
+            for document_id, digest, disposition, index_signature, decision_signature, chunk_count in group
+        ]
+        r = requests.put(endpoint, params={"wait": "true"}, json={"points": points}, timeout=120)
+        r.raise_for_status()
+        written += len(points)
+    return written
+
+
+def qdrant_inventory_delete(
+    qdrant_url: str,
+    inventory_collection: str,
+    document_id: str,
+) -> None:
+    if not qdrant_collection_exists(qdrant_url, inventory_collection):
+        return
+    r = requests.post(
+        f"{qdrant_url.rstrip('/')}/collections/{inventory_collection}/points/delete",
+        params={"wait": "true"},
+        json={"points": [inventory_point_id(document_id)]},
+        timeout=120,
+    )
+    if r.status_code != 404:
+        r.raise_for_status()
+
+
 QDRANT_DELETE_BATCH_SIZE = 256
 
 
@@ -664,7 +938,7 @@ def qdrant_delete_chunk_range(
 
     Qdrant point IDs are UUIDv5(document_id, chunk_no), so the sync already knows
     every point belonging to a previously committed document from ``chunk_count``
-    in StateDB. Deleting explicit IDs avoids the more expensive payload-filter
+    in the Qdrant sync inventory. Deleting explicit IDs avoids the more expensive payload-filter
     resolver and keeps lifecycle mutations deterministic.
 
     ``end_chunk`` is exclusive. A missing collection is treated as already clean.
@@ -731,7 +1005,7 @@ def main() -> int:
                     help="Exclude this Nextcloud path prefix; repeatable. CLI overrides sync.exclude_paths")
     ap.add_argument("--max-documents", type=int, default=None,
                     help="Override sync.max_documents for this run; 0=unlimited")
-    ap.add_argument("--dry-run", action="store_true", help="Scan scope and state only; do not change Qdrant/state/queue")
+    ap.add_argument("--dry-run", action="store_true", help="Scan scope and state only; do not change Qdrant inventory/queue")
     ap.add_argument(
         "--embedding-url",
         default=None,
@@ -772,6 +1046,10 @@ def main() -> int:
 
     qdrant_url = str(cfg_get(cfg, "qdrant.url", "qdrant_url", default="http://127.0.0.1:6333"))
     collection = str(cfg_get(cfg, "qdrant.collection", "qdrant.collection_name", "qdrant_collection", default="nextcloud_rag"))
+    inventory_collection = str(
+        cfg_get(cfg, "qdrant.inventory_collection", default=qdrant_inventory_collection_name(collection))
+        or qdrant_inventory_collection_name(collection)
+    )
     embedding_client = build_embedding_backend_from_config(cfg)
     embedding_backend = embedding_client.kind
     embedding_model = embedding_client.model
@@ -786,16 +1064,9 @@ def main() -> int:
     max_documents = int(cfg_get(cfg, "sync.max_documents", "max_documents", default=500))
     if args.max_documents is not None:
         max_documents = max(0, int(args.max_documents))
+    # Kept only as a one-time migration source from pre-Qdrant-inventory
+    # installations.  Normal reconciliation no longer depends on SQLite state.
     state_path = resolve_sync_state_path(cfg)
-    if (
-        cfg_get(cfg, "sync.state_db", default=None) in (None, "")
-        and str(cfg_get(cfg, "state_db", default="") or "").strip() == "state.sqlite"
-        and str(cfg_get(cfg, "deployment.mode", default="native") or "native").strip().lower() == "dockerized"
-    ):
-        log.warning(
-            "Ignoring legacy dockerized state_db=state.sqlite because it would be ephemeral; "
-            "using runtime/state.sqlite"
-        )
     embedding_deferred_file = str(
         cfg_get(cfg, "sync.embedding_deferred_file", default="runtime/embedding-deferred.jsonl")
         or "runtime/embedding-deferred.jsonl"
@@ -814,6 +1085,21 @@ def main() -> int:
         embedding_dimensions=embedding_dimensions,
         embedding_include_basename=embedding_include_basename,
     )
+    # The inventory also caches semantic eligibility. Invalidate that cache when
+    # document-filter configuration changes, while keeping the Qdrant index
+    # signature focused on settings that affect vectors/chunks.
+    inventory_signature = hashlib.sha256(
+        json.dumps(
+            {
+                "schema": "sunaq-es-inventory-v1",
+                "index_signature": index_signature,
+                "document_filter": cfg_get(cfg, "sync.document_filter", default={}) or {},
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
     include_paths = (list(args.include_path) if args.include_path is not None else config_path_list(cfg, "sync.include_paths"))
     exclude_paths = (list(args.exclude_path) if args.exclude_path is not None else config_path_list(cfg, "sync.exclude_paths"))
@@ -835,14 +1121,129 @@ def main() -> int:
         index_signature[:16], embedding_backend, embedding_model, embedding_profile, embedding_dimensions, CHUNKER_VERSION,
         chunk_size, chunk_overlap, embedding_include_basename, graph_enqueue_enabled,
     )
-    state = StateDB(state_path)
+    lock_path = Path(f"{status_file}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.warning("Another sync run is already active; exiting without changes")
+        lock_handle.close()
+        return 3
+
+    inventory_snapshot = qdrant_load_inventory(qdrant_url, inventory_collection)
+
+    # One-time migration bridge for installations that predate the Qdrant
+    # inventory collection.  Only vectorized rows are safe to seed directly:
+    # zero-chunk legacy rows may represent empty or semantically excluded
+    # documents and are deliberately reclassified once from ES.
+    if not inventory_snapshot and Path(state_path).exists():
+        legacy_state = StateDB(state_path)
+        try:
+            legacy_snapshot = legacy_state.snapshot()
+        finally:
+            legacy_state.close()
+        seed_records = [
+            (
+                document_id,
+                str(row[0] or ""),
+                "vectorized",
+                str(row[3] or ""),
+                inventory_signature,
+                _state_chunk_count(row),
+            )
+            for document_id, row in legacy_snapshot.items()
+            if _state_chunk_count(row) > 0 and str(row[0] or "")
+        ]
+        if seed_records:
+            qdrant_inventory_upsert_many(qdrant_url, inventory_collection, seed_records)
+            inventory_snapshot = qdrant_load_inventory(qdrant_url, inventory_collection)
+            log.info("Migrated %d vectorized sync records from legacy SQLite state into Qdrant inventory", len(seed_records))
+
+    run_started_at = utc_now()
+    run_started_perf = perf_counter()
     seen: set[str] = set()
+    es_seen: set[str] = set()
     scanned = in_scope = out_of_scope = excluded_semantic = 0
     new = updated = unchanged = empty = would_change = embedding_deferred = 0
+    full_source_fetched = deleted = 0
     graph_queued = graph_coalesced = 0
     source_origin_mirror_updates: list[tuple[str, str]] = []
     source_origin_mirrored = 0
     runtime_paused = False
+    progress_interval_seconds = max(
+        5,
+        int(cfg_get(cfg, "sync.progress_interval_seconds", default=30) or 30),
+    )
+    progress_last_report = run_started_perf
+
+    fast_inventory_mode = bool(max_documents == 0 and not scoped_run and not args.dry_run)
+    pending_inventory_records: list[tuple[str, str, str, str, str, int]] = []
+    inventory_write_batch_size = max(
+        32,
+        int(cfg_get(cfg, "sync.inventory_write_batch_size", default=256) or 256),
+    )
+
+    def flush_inventory_records() -> None:
+        if not pending_inventory_records:
+            return
+        qdrant_inventory_upsert_many(
+            qdrant_url,
+            inventory_collection,
+            list(pending_inventory_records),
+            batch_size=inventory_write_batch_size,
+        )
+        pending_inventory_records.clear()
+
+    def queue_inventory_record(
+        document_id: str,
+        digest: str,
+        disposition: str,
+        chunk_count: int,
+    ) -> None:
+        pending_inventory_records.append(
+            (
+                document_id,
+                digest,
+                disposition,
+                index_signature,
+                inventory_signature,
+                max(0, int(chunk_count)),
+            )
+        )
+        if len(pending_inventory_records) >= inventory_write_batch_size:
+            flush_inventory_records()
+
+    log.info(
+        "Sync inventory scan started mode=%s qdrant_inventory=%d progress_interval=%ds",
+        "full" if fast_inventory_mode else ("dry-run" if args.dry_run else "scoped/bounded"),
+        len(inventory_snapshot),
+        progress_interval_seconds,
+    )
+
+    def report_progress(*, force: bool = False, phase: str = "scan") -> None:
+        nonlocal progress_last_report
+        now = perf_counter()
+        if not force and now - progress_last_report < progress_interval_seconds:
+            return
+        elapsed = max(0.0, now - run_started_perf)
+        log.info(
+            "Sync progress phase=%s elapsed=%.0fs scanned=%d in_scope=%d "
+            "fetched=%d unchanged=%d excluded=%d new=%d updated=%d empty=%d deleted=%d deferred=%d",
+            phase,
+            elapsed,
+            scanned,
+            in_scope,
+            full_source_fetched,
+            unchanged,
+            excluded_semantic,
+            new,
+            updated,
+            empty,
+            deleted,
+            embedding_deferred,
+        )
+        progress_last_report = now
 
     def pause_requested() -> bool:
         return bool(
@@ -855,8 +1256,69 @@ def main() -> int:
             )
         )
 
+    def needs_full_source(hit: dict[str, Any]) -> bool:
+        nonlocal full_source_fetched
+        document_id = str(hit.get("_id") or "")
+        src = hit.get("_source") or {}
+        if not document_id:
+            return False
+
+        digest = content_hash(hit)
+        old = inventory_snapshot.get(document_id)
+
+        if fast_inventory_mode:
+            if (
+                digest
+                and old
+                and old.get("content_hash") == digest
+                and old.get("decision_signature") == inventory_signature
+                and (
+                    old.get("disposition") != "vectorized"
+                    or old.get("index_signature") == index_signature
+                )
+            ):
+                return False
+            full_source_fetched += 1
+            return True
+
+        title = str(src.get("title") or document_id)
+        if not path_matches_scope(title, include_paths, exclude_paths):
+            return False
+        if is_machine_sidecar_path(title):
+            return False
+
+        min_text_chars = int(cfg_get(cfg, "sync.document_filter.min_text_chars", default=0) or 0)
+        if min_text_chars > 0:
+            full_source_fetched += 1
+            return True
+
+        light_allowed, _ = semantic_document_allowed(cfg, hit)
+        if not light_allowed:
+            return False
+
+        if not digest:
+            full_source_fetched += 1
+            return True
+
+        content_unchanged = bool(old and old.get("content_hash") == digest)
+        signature_unchanged = bool(old and old.get("index_signature") == index_signature)
+        hydrate = not (content_unchanged and signature_unchanged)
+        if args.dry_run:
+            hydrate = False
+        if hydrate:
+            full_source_fetched += 1
+        return hydrate
+
     try:
-        for hit in es_scroll(es_url, es_index, es_page_size, es_scroll_ttl, es_request_options):
+        for hit in es_scroll(
+            es_url,
+            es_index,
+            es_page_size,
+            es_scroll_ttl,
+            es_request_options,
+            full_source_predicate=needs_full_source,
+            inventory_only=fast_inventory_mode,
+        ):
             if (
                 runtime_control_worker
                 and pause_check_documents > 0
@@ -877,7 +1339,29 @@ def main() -> int:
             if not document_id:
                 continue
             scanned += 1
+            es_seen.add(document_id)
+            report_progress()
             src = hit.get("_source") or {}
+            old = inventory_snapshot.get(document_id)
+
+            if fast_inventory_mode and "content" not in src:
+                in_scope += 1
+                inventory = inventory_snapshot.get(document_id)
+                if not inventory:
+                    # Defensive fallback: needs_full_source should have either
+                    # hydrated the hit or seeded this row from legacy state.
+                    full_source_fetched += 1
+                    log.warning("inventory row missing for unhydrated document=%s; skipping this run", document_id)
+                    continue
+                disposition = str(inventory.get("disposition") or "")
+                if disposition == "excluded_semantic":
+                    excluded_semantic += 1
+                    continue
+                if disposition in {"vectorized", "empty"}:
+                    seen.add(document_id)
+                    unchanged += 1
+                    continue
+
             title = str(src.get("title") or document_id)
             source_origin = maybe_register_path_origin(document_id, title, classification_source="sync_path")
             if (not args.dry_run and source_origin in SPECIAL_ORIGINS
@@ -900,26 +1384,66 @@ def main() -> int:
 
             # Hidden mail sidecars are control-plane metadata, never semantic
             # documents.  Leaving them out here also prevents GraphQueue jobs.
-            # On a complete unscoped run, any legacy Qdrant/state entry is
+            # On a complete unscoped run, any legacy Qdrant inventory entry is
             # removed by the normal stale-document cleanup because the id is not
             # added to ``seen``.
             if is_machine_sidecar_path(title):
                 excluded_semantic += 1
-                log.info("filtered semantic document reason=machine_sidecar document=%s title=%s", document_id, title)
+                digest = content_hash(hit)
+                if fast_inventory_mode:
+                    old_chunk_count = max(0, int((old or {}).get("chunk_count") or 0))
+                    if old_chunk_count:
+                        qdrant_delete_chunk_range(qdrant_url, collection, document_id, 0, old_chunk_count)
+                        deleted += 1
+                    queue_inventory_record(document_id, digest, "excluded_semantic", 0)
+                    inventory_snapshot[document_id] = {
+                        "content_hash": digest,
+                        "disposition": "excluded_semantic",
+                        "index_signature": index_signature,
+                        "decision_signature": inventory_signature,
+                        "chunk_count": 0,
+                    }
+                log.debug("filtered semantic document reason=machine_sidecar document=%s title=%s", document_id, title)
                 continue
             semantic_allowed, semantic_reason = semantic_document_allowed(cfg, hit)
             if not semantic_allowed:
                 excluded_semantic += 1
-                log.info("filtered semantic document reason=%s document=%s title=%s", semantic_reason, document_id, title)
+                digest = content_hash(hit)
+                if fast_inventory_mode:
+                    old_chunk_count = max(0, int((old or {}).get("chunk_count") or 0))
+                    if old_chunk_count:
+                        qdrant_delete_chunk_range(qdrant_url, collection, document_id, 0, old_chunk_count)
+                        deleted += 1
+                    queue_inventory_record(document_id, digest, "excluded_semantic", 0)
+                    inventory_snapshot[document_id] = {
+                        "content_hash": digest,
+                        "disposition": "excluded_semantic",
+                        "index_signature": index_signature,
+                        "decision_signature": inventory_signature,
+                        "chunk_count": 0,
+                    }
+                log.debug("filtered semantic document reason=%s document=%s title=%s", semantic_reason, document_id, title)
                 continue
             seen.add(document_id)
             text = str(src.get("content") or "")
             digest = content_hash(hit)
-            old = state.get(document_id)
 
-            content_unchanged = bool(old and old[0] == digest)
-            signature_unchanged = bool(old and len(old) >= 4 and old[3] == index_signature)
-            if content_unchanged and signature_unchanged:
+            content_unchanged = bool(old and old.get("content_hash") == digest)
+            signature_unchanged = bool(old and old.get("index_signature") == index_signature)
+            if (
+                content_unchanged
+                and signature_unchanged
+                and old
+                and old.get("disposition") == "vectorized"
+            ):
+                if old.get("decision_signature") != inventory_signature:
+                    queue_inventory_record(
+                        document_id,
+                        digest,
+                        "vectorized",
+                        max(0, int(old.get("chunk_count") or 0)),
+                    )
+                    old["decision_signature"] = inventory_signature
                 unchanged += 1
                 if max_documents and (new + updated + unchanged + empty + embedding_deferred) >= max_documents:
                     break
@@ -941,12 +1465,20 @@ def main() -> int:
             chunks = chunk_text(text, chunk_size, chunk_overlap)
             if not chunks:
                 empty += 1
-                old_chunk_count = _state_chunk_count(old)
+                old_chunk_count = max(0, int((old or {}).get("chunk_count") or 0))
                 if old_chunk_count:
                     qdrant_delete_chunk_range(
                         qdrant_url, collection, document_id, 0, old_chunk_count
                     )
-                state.put(document_id, digest, 0, title, index_signature)
+                if not args.dry_run:
+                    queue_inventory_record(document_id, digest, "empty", 0)
+                    inventory_snapshot[document_id] = {
+                        "content_hash": digest,
+                        "disposition": "empty",
+                        "index_signature": index_signature,
+                        "decision_signature": inventory_signature,
+                        "chunk_count": 0,
+                    }
                 if max_documents and (new + updated + unchanged + empty + embedding_deferred) >= max_documents:
                     break
                 continue
@@ -986,7 +1518,7 @@ def main() -> int:
                     },
                 )
                 log.warning(
-                    "embedding deferred document=%s title=%r reason=context_length queue=%s; existing Qdrant/state left unchanged",
+                    "embedding deferred document=%s title=%r reason=context_length queue=%s; existing Qdrant inventory left unchanged",
                     document_id, title, embedding_deferred_file,
                 )
                 if max_documents and (new + updated + unchanged + empty + embedding_deferred) >= max_documents:
@@ -997,7 +1529,7 @@ def main() -> int:
 
             final_chunk_count = len(embedded)
             adaptive_split = final_chunk_count != len(chunks)
-            old_chunk_count = _state_chunk_count(old)
+            old_chunk_count = max(0, int((old or {}).get("chunk_count") or 0))
 
             # Stable UUIDv5 point IDs make a pre-delete unnecessary. Upsert the
             # new representation first; existing chunk IDs are overwritten in
@@ -1010,6 +1542,7 @@ def main() -> int:
                 ):
                     payload = {
                         "document_id": document_id,
+                        "content_hash": digest,
                         "chunk_index": chunk_no,
                         "chunk_count": final_chunk_count,
                         "title": title,
@@ -1040,7 +1573,18 @@ def main() -> int:
                     old_chunk_count,
                 )
 
-            state.put(document_id, digest, final_chunk_count, title, index_signature)
+            qdrant_inventory_upsert_many(
+                qdrant_url,
+                inventory_collection,
+                [(document_id, digest, "vectorized", index_signature, inventory_signature, final_chunk_count)],
+            )
+            inventory_snapshot[document_id] = {
+                "content_hash": digest,
+                "disposition": "vectorized",
+                "index_signature": index_signature,
+                "decision_signature": inventory_signature,
+                "chunk_count": final_chunk_count,
+            }
             # Graph ingestion is intentionally origin-agnostic: archived web sources
             # may contain valuable current/historical entity and relation observations.
             # Separation from ordinary internal evidence retrieval is enforced later by
@@ -1097,31 +1641,51 @@ def main() -> int:
                 runtime_control_worker,
             )
 
+        flush_inventory_records()
+
         # Only a genuinely complete, unscoped ES traversal can safely identify deletions.
         # A path-scoped, bounded or cooperatively paused run must never infer that
         # unseen documents vanished.
         if max_documents == 0 and not scoped_run and not args.dry_run and not runtime_paused:
-            stale = state.ids() - seen
+            report_progress(force=True, phase="stale-cleanup")
+            stale = set(inventory_snapshot) - es_seen
             for document_id in sorted(stale):
-                old = state.get(document_id)
-                old_chunk_count = _state_chunk_count(old)
-                log.info(
-                    "delete stale document=%s chunks=%d",
-                    document_id, old_chunk_count,
-                )
+                old = inventory_snapshot.get(document_id) or {}
+                old_chunk_count = max(0, int(old.get("chunk_count") or 0))
+                log.info("delete stale document=%s chunks=%d", document_id, old_chunk_count)
                 if old_chunk_count:
                     qdrant_delete_chunk_range(
                         qdrant_url, collection, document_id, 0, old_chunk_count
                     )
-                state.delete(document_id)
+                qdrant_inventory_delete(qdrant_url, inventory_collection, document_id)
+                inventory_snapshot.pop(document_id, None)
+                deleted += 1
+
 
         if not args.dry_run:
-            state_stats = state.stats()
+            state_stats = {
+                "documents": len(inventory_snapshot),
+                "vectorized_documents": sum(
+                    1 for item in inventory_snapshot.values()
+                    if item.get("disposition") == "vectorized"
+                ),
+                "empty_documents": sum(
+                    1 for item in inventory_snapshot.values()
+                    if item.get("disposition") == "empty"
+                ),
+                "chunks": sum(
+                    max(0, int(item.get("chunk_count") or 0))
+                    for item in inventory_snapshot.values()
+                    if item.get("disposition") == "vectorized"
+                ),
+            }
             _atomic_write_json(
                 status_file,
                 {
                     "schema": "sunaq.sync_status.v1",
+                    "started_at": run_started_at,
                     "completed_at": utc_now(),
+                    "duration_seconds": round(perf_counter() - run_started_perf, 3),
                     "complete_full_scan": bool(max_documents == 0 and not scoped_run and not runtime_paused),
                     "runtime_paused": bool(runtime_paused),
                     "scan": {
@@ -1135,6 +1699,8 @@ def main() -> int:
                         "updated": updated,
                         "unchanged": unchanged,
                         "empty": empty,
+                        "deleted": deleted,
+                        "full_source_fetched": full_source_fetched,
                     },
                     "state": state_stats,
                     "scope": {
@@ -1152,8 +1718,8 @@ def main() -> int:
             )
 
         log.info(
-            "Done: scanned=%d in_scope=%d new=%d updated=%d unchanged=%d empty=%d embedding_deferred=%d excluded_semantic=%d out_of_scope=%d graph_queued=%d graph_coalesced=%d source_origin_mirrored=%d",
-            scanned, in_scope, new, updated, unchanged, empty, embedding_deferred, excluded_semantic, out_of_scope, graph_queued, graph_coalesced, source_origin_mirrored,
+            "Done: scanned=%d in_scope=%d new=%d updated=%d unchanged=%d empty=%d deleted=%d full_source_fetched=%d embedding_deferred=%d excluded_semantic=%d out_of_scope=%d graph_queued=%d graph_coalesced=%d source_origin_mirrored=%d",
+            scanned, in_scope, new, updated, unchanged, empty, deleted, full_source_fetched, embedding_deferred, excluded_semantic, out_of_scope, graph_queued, graph_coalesced, source_origin_mirrored,
         )
         if scoped_run:
             log.info("Scope: include=%s exclude=%s; deletion cleanup outside scope disabled", include_paths or ["<all>"], exclude_paths or [])
@@ -1162,11 +1728,14 @@ def main() -> int:
         elif runtime_paused:
             log.info("Runtime pause: traversal/cleanup incomplete; stale deletion cleanup not run")
         if args.dry_run:
-            log.info("Dry-run: would_change=%d; no Qdrant/state/GraphQueue mutation", would_change)
+            log.info("Dry-run: would_change=%d; no Qdrant inventory/GraphQueue mutation", would_change)
         return 0
     finally:
-        state.close()
-
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_handle.close()
+    
 
 if __name__ == "__main__":
     sys.exit(main())

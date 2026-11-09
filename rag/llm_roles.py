@@ -89,6 +89,7 @@ def build_role_backends(
     default_api_key: str,
     default_verify_tls: bool,
     default_ca_file: str | None,
+    default_allow_insecure_http: bool = False,
     models: dict[str, str] | None = None,
     role_overrides: dict[str, dict[str, Any]] | None = None,
     private_network_only: bool = False,
@@ -196,6 +197,7 @@ def build_role_backends(
             ca_file=ca_file,
             private_network_only=enforce_private_network,
             trust_env=not enforce_private_network,
+            allow_insecure_http=default_allow_insecure_http,
         )
         result[role] = RoleBackend(
             role=role,

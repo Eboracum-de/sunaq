@@ -41,6 +41,13 @@ class SearchPlan(BaseModel):
         default_factory=list
     )
 
+    # 0.8.8 staged Files retrieval contract. lexical_groups remains the expanded
+    # compatibility view; executors may start with primary_lexical_groups and
+    # widen to expanded_lexical_groups only when their policy permits it.
+    primary_lexical_groups: list[dict[str, Any]] = Field(default_factory=list)
+    expanded_lexical_groups: list[dict[str, Any]] = Field(default_factory=list)
+    has_expansion: bool = False
+
     must: list[str] = Field(
         default_factory=list
     )
@@ -1061,18 +1068,28 @@ def plan_from_search_spec(
     original_query: str = "",
     entity_recall: bool = False,
 ) -> SearchPlan:
-    """Compile structured retrieval intent into the mature backend plan.
+    """Compile backend-neutral SearchSpec into deterministic retrieval groups.
 
-    The planner describes intent; it never owns Elasticsearch syntax. Entities,
-    concept alternative groups and safe literal constraints become deterministic
-    lexical groups. elastic_query is retained only as a legacy fallback for
-    callers that do not yet provide structured intent.
+    The 0.8.8 contract separates semantically exact primary terms from
+    recall-oriented expansion terms. lexical_groups stays as the expanded
+    compatibility view so callers that do not implement staged execution keep
+    the 0.8.7 behavior rather than silently losing recall.
     """
     value = dict(spec or {})
-    lexical_groups: list[dict[str, Any]] = []
-    seen_groups: set[tuple[bool, tuple[str, ...]]] = set()
+    primary_groups: list[dict[str, Any]] = []
+    expanded_groups: list[dict[str, Any]] = []
+    primary_seen: set[tuple[bool, str, tuple[str, ...]]] = set()
+    expanded_seen: set[tuple[bool, str, tuple[str, ...]]] = set()
+    has_expansion = False
 
-    def add_group(*, required: bool, terms: list[str], kind: str) -> None:
+    def add_group(
+        target: list[dict[str, Any]],
+        seen: set[tuple[bool, str, tuple[str, ...]]],
+        *,
+        required: bool,
+        terms: list[str],
+        kind: str,
+    ) -> None:
         cleaned: list[str] = []
         seen_terms: set[str] = set()
         for raw in terms:
@@ -1083,11 +1100,12 @@ def plan_from_search_spec(
                 cleaned.append(text)
         if not cleaned:
             return
-        key = (bool(required), tuple(term.casefold() for term in cleaned))
-        if key in seen_groups:
+        kind_key = kind if str(kind).startswith("constraint:") else "lexical"
+        key = (bool(required), kind_key, tuple(term.casefold() for term in cleaned))
+        if key in seen:
             return
-        seen_groups.add(key)
-        lexical_groups.append({
+        seen.add(key)
+        target.append({
             "required": bool(required),
             "kind": str(kind or "concept"),
             "terms": cleaned,
@@ -1095,32 +1113,70 @@ def plan_from_search_spec(
 
     for entity in value.get("entities") or []:
         text = str(entity or "").strip()
-        if text:
-            add_group(required=True, terms=[text], kind="entity")
+        if not text:
+            continue
+        add_group(primary_groups, primary_seen, required=True, terms=[text], kind="entity")
+        add_group(expanded_groups, expanded_seen, required=True, terms=[text], kind="entity")
 
     for group in value.get("concept_groups") or []:
         if not isinstance(group, dict):
             continue
+        required = bool(group.get("required", False))
+        primary_terms = [
+            str(term) for term in (group.get("primary_terms") or []) if str(term).strip()
+        ]
+        expansion_terms = [
+            str(term) for term in (group.get("expansion_terms") or []) if str(term).strip()
+        ]
+        all_terms = [
+            str(term) for term in (group.get("terms") or []) if str(term).strip()
+        ]
+        if not primary_terms and all_terms:
+            primary_terms = [all_terms[0]]
+            expansion_terms = all_terms[1:]
+        if not all_terms:
+            all_terms = primary_terms + expansion_terms
+
         add_group(
-            required=bool(group.get("required", False)),
-            terms=[str(term) for term in (group.get("terms") or [])],
+            primary_groups,
+            primary_seen,
+            required=required,
+            terms=primary_terms,
             kind="concept",
         )
+        add_group(
+            expanded_groups,
+            expanded_seen,
+            required=required,
+            terms=all_terms,
+            kind="concept",
+        )
+        if expansion_terms:
+            has_expansion = True
 
     if original_query:
-        # Import lazily to keep retrieval_planner -> planner imports acyclic.
         from rag.retrieval_planner import extract_safe_hard_constraints
 
         safe = extract_safe_hard_constraints(original_query)
         for constraint_kind in ("filenames", "identifiers", "dates", "years"):
             for constraint in safe.get(constraint_kind) or []:
+                kind = f"constraint:{constraint_kind}"
                 add_group(
+                    primary_groups,
+                    primary_seen,
                     required=True,
                     terms=[str(constraint)],
-                    kind=f"constraint:{constraint_kind}",
+                    kind=kind,
+                )
+                add_group(
+                    expanded_groups,
+                    expanded_seen,
+                    required=True,
+                    terms=[str(constraint)],
+                    kind=kind,
                 )
 
-    structured_intent = bool(lexical_groups)
+    structured_intent = bool(expanded_groups)
     plan = SearchPlan(
         search_mode="search_spec",
         semantic_query=str(value.get("semantic_query") or "").strip(),
@@ -1129,13 +1185,16 @@ def plan_from_search_spec(
             if structured_intent
             else str(value.get("elastic_query") or "").strip()
         ),
-        lexical_groups=lexical_groups,
+        lexical_groups=expanded_groups,
+        primary_lexical_groups=primary_groups,
+        expanded_lexical_groups=expanded_groups,
+        has_expansion=has_expansion,
         must=[str(x).strip() for x in (value.get("must") or []) if str(x).strip()],
         should=[str(x).strip() for x in (value.get("should") or []) if str(x).strip()],
         must_not=[str(x).strip() for x in (value.get("must_not") or []) if str(x).strip()],
         phrases=[str(x).strip() for x in (value.get("phrases") or []) if str(x).strip()],
         must_not_phrases=[str(x).strip() for x in (value.get("must_not_phrases") or []) if str(x).strip()],
-        notes="structured retrieval intent",
+        notes="structured retrieval intent (primary + expansion contract)",
     )
     return _apply_entity_context(
         plan,

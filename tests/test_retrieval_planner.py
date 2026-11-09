@@ -13,9 +13,9 @@ def test_query_rewriter_keeps_bare_entity_recall_oriented():
     prompt = (
         Path(__file__).resolve().parent.parent / "prompts" / "query_rewriter.txt"
     ).read_text(encoding="utf-8")
-    assert "breite Informationssuche zu dieser Entität" in prompt
-    assert "Erfinde dann kein zusätzliches zwingendes Sachkonzept" in prompt
-    assert "The planner describes intent; it does not own Elasticsearch syntax." in prompt
+    assert "For a request consisting essentially of one concrete entity name" in prompt
+    assert "do not invent a mandatory concept" in prompt
+    assert "deterministic host code owns retrieval syntax" in prompt
 
 
 def test_config_yaml_rounds_override_legacy_env():
@@ -154,3 +154,19 @@ def test_weak_boolean_probe_cannot_leak_controls_into_non_strict_view():
         retrieval_arms={"files"},
     )
     assert probes == [{"kind": "lexical", "query": "examplehost Rechnung"}]
+
+
+def test_candidate_verification_is_enabled_by_default():
+    settings = load_retrieval_planner_settings(
+        {"retrieval_planner": {}},
+        env={},
+    )
+    assert settings.verification_enabled is True
+
+
+def test_candidate_verification_can_be_disabled_per_profile():
+    settings = load_retrieval_planner_settings(
+        {"retrieval_planner": {"verification_enabled": False}},
+        env={},
+    )
+    assert settings.verification_enabled is False

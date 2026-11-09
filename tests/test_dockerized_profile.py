@@ -303,7 +303,7 @@ def test_dockerized_uses_profile_specific_verification_budget_without_reranker()
     thorough = registry.get("sunaq-thorough")
     deep = registry.get("sunaq-deep")
 
-    assert standard.section("retrieval_planner")["verification_candidate_limit"] == 10
+    assert standard.section("retrieval_planner")["verification_candidate_limit"] == 15
     assert thorough.section("retrieval_planner")["verification_candidate_limit"] == 30
     assert deep.section("retrieval_planner")["verification_candidate_limit"] == 50
     assert standard.section("reranker")["backend"] == "none"
@@ -828,8 +828,8 @@ def test_dockerized_neo4j_uses_persistent_volumes_and_file_backed_secret():
 def test_release_identity_hygiene():
     current_version = (ROOT / "rag/version.py").read_text(encoding="utf-8").strip()
     app_info = (ROOT / "clients/nextcloud/sunaq/appinfo/info.xml").read_text(encoding="utf-8")
-    assert current_version == 'VERSION = "0.8.7-rc1"'
-    assert "<version>0.3.16</version>" in app_info
+    assert current_version == 'VERSION = "0.8.8-rc1"'
+    assert "<version>0.3.21</version>" in app_info
 
     forbidden_by_file = {
         "README.md": (
@@ -870,7 +870,7 @@ def test_release_identity_hygiene():
             "SunaQ Recherche 0.3.0",
         ),
         "docs/BETA-OPERATIONS.md": (
-            "## 4. SunaQ Recherche 0.3.2",
+            "## 4. SunaQ Recherche 0.3.2\n",
         ),
         "docs/KNOWN-LIMITATIONS.md": (
             "Recherche 0.3.4",
@@ -897,3 +897,53 @@ def test_release_identity_hygiene():
         text = (ROOT / relative).read_text(encoding="utf-8")
         for forbidden in forbidden_strings:
             assert forbidden not in text, f"{relative}: stale release marker {forbidden!r}"
+
+
+
+def test_src_templates_disable_erg_only_research_and_exclude_pst():
+    dockerized = yaml.safe_load(
+        (ROOT / "install" / "dockerized" / "config.dockerized.yaml").read_text(encoding="utf-8")
+    )
+    core = yaml.safe_load((ROOT / "install" / "presets" / "core.yaml").read_text(encoding="utf-8"))
+    workgroup = yaml.safe_load((ROOT / "install" / "presets" / "workgroup.yaml").read_text(encoding="utf-8"))
+    full = yaml.safe_load((ROOT / "install" / "presets" / "full.yaml").read_text(encoding="utf-8"))
+    standard_cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
+
+    assert "pst" in standard_cfg["sync"]["document_filter"]["exclude_extensions"]
+    assert "pst" in dockerized["sync"]["document_filter"]["exclude_extensions"]
+    assert dockerized["research_backends"]["brave-search"]["enabled"] is False
+
+    assert core["research_backends"]["brave-search"]["enabled"] is False
+    assert core["research_backends"]["openai-research"]["enabled"] is False
+    assert core["dossier_writer"]["enabled"] is False
+
+    assert workgroup["research_backends"]["brave-search"]["enabled"] is False
+    assert workgroup["dossier_writer"]["enabled"] is True
+
+    assert full["research_backends"]["brave-search"]["enabled"] is True
+    assert full["dossier_writer"]["enabled"] is True
+
+
+def test_provider_templates_default_graph_hook_off_and_explain_insecure_llm_http():
+    for relative in (
+        "provider.env.example",
+        "install/dockerized/provider.env.dockerized.example",
+    ):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        assert "GRAPH_EVIDENCE_HOOK_ENABLED=false" in text
+        assert "ALLOW_INSECURE_LLM=false" in text
+        assert "Plain HTTP is accepted automatically" in text
+
+
+def test_fresh_install_proxy_is_auto_selected_but_has_explicit_opt_out():
+    for relative in (
+        "install/profiles/install-standard.sh",
+        "install/profiles/install-dockerized.sh",
+    ):
+        installer = (ROOT / relative).read_text(encoding="utf-8")
+        assert "auto_select_proxy_for_fresh_install" in installer
+        assert "proxy_port_in_use" in installer
+        assert "PROXY_AUTO_SELECTED=1" in installer
+        assert "PROXY_AUTO_SKIPPED=1" in installer
+        assert "--no-proxy) WITH_PROXY=0; PROXY_EXPLICIT=1; shift ;;" in installer
+        assert "--no-proxy) WITH_PROXY=0; PROXY_EXPLICIT=1; RERUN_DISABLE_EXPLICIT=1" not in installer

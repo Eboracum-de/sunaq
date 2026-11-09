@@ -37,7 +37,8 @@ def test_json_evidence_keeps_boundary_like_text_inside_one_record():
     assert payload["format"] == EVIDENCE_FORMAT
     assert payload["kind"] == "documents"
     assert len(payload["records"]) == 1
-    assert payload["records"][0]["citation"] == "[1]"
+    assert payload["records"][0]["evidence_id"] == "file-1"
+    assert "citation" not in payload["records"][0]
     assert payload["records"][0]["title"] == result.title
     assert payload["records"][0]["text"] == malicious
     assert included == [result]
@@ -317,7 +318,7 @@ async def test_candidate_verifier_uses_line_preserving_json_evidence(monkeypatch
     )
 
     evidence = seen["user"].split(
-        "KANDIDATEN (bereits Live-ACL-geprueft):\n",
+        "CANDIDATES (already checked by live ACL):\n",
         1,
     )[1]
     payload = json.loads(evidence)

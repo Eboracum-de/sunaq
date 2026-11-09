@@ -1,8 +1,8 @@
 # SunaQ architecture
-## Architecture and design baseline 0.8.7-rc1
+## Architecture and design baseline 0.8.8-rc1
 
 **Updated:** 9 October 2026  
-**Status:** 0.8.7-rc1 release-candidate architecture
+**Status:** 0.8.8-rc1 release-candidate architecture
 
 For the rationale behind the trust envelopes and design choices, see [WHITEPAPER.md](WHITEPAPER.md).
 
@@ -994,7 +994,7 @@ This is recovery, not a unified purge/rollback transaction: SunaQ does not atomi
 
 ## 19. Current release-candidate boundaries
 
-`0.8.7-rc1` is the current release-candidate baseline.
+`0.8.8-rc1` is the current release-candidate baseline.
 
 Known limits include:
 

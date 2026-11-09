@@ -15,6 +15,7 @@ The local Ollama API itself does not provide an authentication layer.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import ssl
 from dataclasses import dataclass
@@ -25,6 +26,16 @@ import httpx
 
 from rag.policy_hooks import PRE_MODEL_EGRESS, apply_policy_hook
 from rag.network_policy import pinned_private_target
+
+
+def _http_host_is_loopback(base_url: str) -> bool:
+    try:
+        host = (urlparse(base_url).hostname or "").strip().casefold()
+        if host in {"localhost", "localhost.localdomain"}:
+            return True
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _verify_value(verify_tls: bool, ca_file: str | None) -> bool | ssl.SSLContext:
@@ -60,6 +71,7 @@ class LLMBackend:
     ca_file: str | None = None
     private_network_only: bool = False
     trust_env: bool = True
+    allow_insecure_http: bool = False
 
     kind: ClassVar[str] = "base"
 
@@ -67,6 +79,14 @@ class LLMBackend:
         self.base_url = str(self.base_url).rstrip("/")
         self.model = str(self.model)
         self.api_key = str(self.api_key or "")
+        scheme = (urlparse(self.base_url).scheme or "").casefold()
+        if scheme not in {"http", "https"}:
+            raise RuntimeError("LLM base URL must use http or https")
+        if scheme == "http" and not _http_host_is_loopback(self.base_url) and not self.allow_insecure_http:
+            raise RuntimeError(
+                "Refusing unencrypted non-loopback LLM endpoint "
+                f"{self.base_url!r}; set ALLOW_INSECURE_LLM=true only for a controlled network"
+            )
         self._verify = _verify_value(self.verify_tls, self.ca_file)
 
     def headers(self) -> dict[str, str]:
@@ -141,6 +161,7 @@ class LLMBackend:
             "ca_file": bool(self.ca_file),
             "private_network_only": bool(self.private_network_only),
             "trust_env": bool(self.trust_env),
+            "allow_insecure_http": bool(self.allow_insecure_http),
         }
 
 
@@ -506,6 +527,7 @@ def build_llm_backend(
     ca_file: str | None = None,
     private_network_only: bool = False,
     trust_env: bool = True,
+    allow_insecure_http: bool = False,
 ) -> LLMBackend:
     name = str(backend or "ollama").strip().lower()
     kwargs = {
@@ -516,6 +538,7 @@ def build_llm_backend(
         "ca_file": ca_file,
         "private_network_only": private_network_only,
         "trust_env": trust_env,
+        "allow_insecure_http": allow_insecure_http,
     }
     if name in {"ollama", "native_ollama"}:
         return OllamaBackend(**kwargs)

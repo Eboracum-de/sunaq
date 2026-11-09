@@ -44,6 +44,7 @@ def test_scoped_sync_checks_scope_before_semantic_filter(monkeypatch, tmp_path):
         _hit("files:2", "Wanted/document.txt"),
     ]
     monkeypatch.setattr(sync, "es_scroll", lambda *args, **kwargs: iter(hits))
+    monkeypatch.setattr(sync, "qdrant_load_inventory", lambda *a, **k: {})
     monkeypatch.setattr(sync, "build_embedding_backend_from_config", lambda cfg: DummyEmbeddingBackend())
 
     semantic_titles = []

@@ -11,6 +11,10 @@
     var status;
     var retrievalStrategy;
     var retrievalStrategyContent;
+    var analysisPanel;
+    var analysisContent;
+    var analysisMode = false;
+    var showSearchStrategy = true;
     var messageList;
     var retryButton;
     var chatList;
@@ -782,10 +786,84 @@
             retrievalStrategy.hidden = true;
             retrievalStrategy.open = false;
         }
+        if (analysisContent) {
+            analysisContent.textContent = '';
+        }
+        if (analysisPanel) {
+            analysisPanel.hidden = true;
+            analysisPanel.open = false;
+        }
+    }
+
+    function renderAnalysisStatus(data) {
+        if (!analysisMode || !analysisPanel || !analysisContent || !data || typeof data !== 'object') {
+            return;
+        }
+
+        var diagnostics = data.diagnostics && typeof data.diagnostics === 'object'
+            ? data.diagnostics
+            : {};
+        var timings = diagnostics.timings_ms && typeof diagnostics.timings_ms === 'object'
+            ? diagnostics.timings_ms
+            : {};
+        var roles = diagnostics.roles && typeof diagnostics.roles === 'object'
+            ? diagnostics.roles
+            : {};
+        var created = Number(data.created_at || 0);
+        var updated = Number(data.updated_at || 0);
+        var fallbackElapsed = created > 0 && updated >= created
+            ? Math.round((updated - created) * 1000)
+            : null;
+        var lines = [];
+
+        function add(label, value, suffix) {
+            if (value === null || value === undefined || value === '') {
+                return;
+            }
+            if (typeof value === 'number' && !isFinite(value)) {
+                return;
+            }
+            lines.push(label + ': ' + value + (suffix || ''));
+        }
+
+        function addTiming(label, key) {
+            var value = Number(timings[key]);
+            if (isFinite(value) && value >= 0) {
+                add(label, Math.round(value), ' ms');
+            }
+        }
+
+        add('Status', data.stage || '');
+        add('Profil', data.model || '');
+        add('Planner-Modell', roles.planner || '');
+        add('Antwort-Modell', roles.answer || '');
+        if (diagnostics.authorized_candidates !== undefined) {
+            add('Autorisierte Kandidaten', diagnostics.authorized_candidates);
+        }
+
+        lines.push('');
+        lines.push('Laufzeiten');
+        addTiming('Auth', 'auth_preflight');
+        addTiming('Query-Kontext', 'query_context');
+        addTiming('Rewrite', 'query_rewrite');
+        addTiming('Retrieval gesamt', 'retrieval');
+        addTiming('  Retrieval Core', 'retrieval_core');
+        addTiming('  Live-ACL', 'acl');
+        addTiming('  Middleware gesamt', 'middleware_total');
+        addTiming('Antwortmodell', 'answer_model');
+        addTiming('Antwortstufe', 'answer_stage');
+        if (timings.total !== undefined) {
+            addTiming('Gesamt', 'total');
+        } else if (fallbackElapsed !== null) {
+            add('Bisher gesamt', fallbackElapsed, ' ms');
+        }
+
+        analysisContent.textContent = lines.join('\n');
+        analysisPanel.hidden = false;
     }
 
     function renderRetrievalDecision(record) {
-        if (!retrievalStrategy || !retrievalStrategyContent || !record || typeof record !== 'object') {
+        if (!showSearchStrategy || !retrievalStrategy || !retrievalStrategyContent || !record || typeof record !== 'object') {
             return;
         }
         var planner = record.planner || {};
@@ -895,6 +973,7 @@
                 if (data.retrieval_decision) {
                     renderRetrievalDecision(data.retrieval_decision);
                 }
+                renderAnalysisStatus(data);
                 if (String(data.stage || '') === 'complete') {
                     stopProgress(requestId);
                     return;
@@ -908,6 +987,26 @@
                 }
             });
         }, 800);
+    }
+
+    function finalizeProgress(requestId) {
+        if (!analysisMode) {
+            stopProgress(requestId);
+            return;
+        }
+        apiRequest('/status/' + encodeURIComponent(requestId), 'GET').then(function (data) {
+            if (activeRequestId !== requestId) {
+                return;
+            }
+            if (data.retrieval_decision) {
+                renderRetrievalDecision(data.retrieval_decision);
+            }
+            renderAnalysisStatus(data);
+        }).catch(function () {
+            // Final diagnostics are best-effort and must not affect the answer.
+        }).then(function () {
+            stopProgress(requestId);
+        });
     }
 
     function startProgress(requestId) {
@@ -1024,7 +1123,7 @@
         }
 
         function finish(data) {
-            stopProgress(requestId);
+            finalizeProgress(requestId);
             var answer = data.content || 'Keine Antwort erhalten.';
             var assistant = {
                 role: 'assistant',
@@ -1148,6 +1247,11 @@
         status = document.getElementById('sunaq-status');
         retrievalStrategy = document.getElementById('sunaq-retrieval-strategy');
         retrievalStrategyContent = document.getElementById('sunaq-retrieval-strategy-content');
+        analysisPanel = document.getElementById('sunaq-analysis');
+        analysisContent = document.getElementById('sunaq-analysis-content');
+        var appRoot = document.getElementById('sunaq-app');
+        analysisMode = !!(appRoot && appRoot.getAttribute('data-analysis-mode') === '1');
+        showSearchStrategy = !(appRoot && appRoot.getAttribute('data-show-search-strategy') === '0');
         messageList = document.getElementById('sunaq-messages');
         retryButton = document.getElementById('sunaq-retry');
         chatList = document.getElementById('sunaq-chat-list');

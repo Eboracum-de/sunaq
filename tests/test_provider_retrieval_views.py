@@ -183,5 +183,5 @@ def test_missing_query_frame_keeps_legacy_files_fallback_for_planner_failure():
 def test_candidate_verifier_requires_requested_document_type_itself():
     from rag.openai_provider import CANDIDATE_VERIFIER_SYSTEM_PROMPT
 
-    assert "Das geprüfte Dokument muss selbst diesem Typ entsprechen" in CANDIDATE_VERIFIER_SYSTEM_PROMPT
-    assert "bloße Erwähnung, Buchung, Anlage oder Referenz" in CANDIDATE_VERIFIER_SYSTEM_PROMPT
+    assert "candidate document itself must be of that type" in CANDIDATE_VERIFIER_SYSTEM_PROMPT
+    assert "mere mention, accounting entry, attachment reference" in CANDIDATE_VERIFIER_SYSTEM_PROMPT

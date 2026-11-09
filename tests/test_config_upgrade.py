@@ -108,3 +108,41 @@ def test_upgrade_file_supports_staged_output(tmp_path: Path):
     assert changes
     assert "pause_check_documents: 25" not in source.read_text(encoding="utf-8")
     assert "pause_check_documents: 25" in target.read_text(encoding="utf-8")
+
+
+def test_upgrade_completes_incomplete_research_backend_declarations():
+    source = """research_backends:
+  brave-search:
+    enabled: true
+  openai-research:
+    enabled: false
+"""
+    rendered, changes = upgrade_text(source)
+    cfg = yaml.safe_load(rendered)
+
+    assert cfg["research_backends"]["brave-search"]["kind"] == "web_retrieval"
+    assert cfg["research_backends"]["brave-search"]["adapter"] == "brave_search"
+    assert cfg["research_backends"]["brave-search"]["enabled"] is True
+    assert cfg["research_backends"]["openai-research"]["kind"] == "delegated_research"
+    assert cfg["research_backends"]["openai-research"]["adapter"] == "openai"
+    assert cfg["research_backends"]["openai-research"]["enabled"] is False
+    assert any("brave-search.kind" in item for item in changes)
+    assert any("openai-research.adapter" in item for item in changes)
+
+
+def test_upgrade_preserves_explicit_research_backend_adapter_choices():
+    source = """research_backends:
+  brave-search:
+    kind: web_retrieval
+    adapter: brave_search
+    enabled: false
+"""
+    rendered, changes = upgrade_text(source)
+    cfg = yaml.safe_load(rendered)
+
+    assert cfg["research_backends"]["brave-search"] == {
+        "kind": "web_retrieval",
+        "adapter": "brave_search",
+        "enabled": False,
+    }
+    assert not any("research_backends.brave-search" in item for item in changes)

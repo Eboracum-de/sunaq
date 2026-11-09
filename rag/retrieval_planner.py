@@ -25,6 +25,7 @@ class RetrievalPlannerSettings:
     context_max_chars: int = 12000
     max_complete_documents: int = 15
     overflow_acl_scan_limit: int = 80
+    verification_enabled: bool = True
     verification_candidate_limit: int = 6
     bounded_verification_candidate_limit: int = 30
     exhaustive_verification_candidate_limit: int = 30
@@ -87,6 +88,7 @@ def load_retrieval_planner_settings(
         ),
         max_complete_documents=max_complete_documents,
         overflow_acl_scan_limit=overflow_acl_scan_limit,
+        verification_enabled=_truthy(cfg.get("verification_enabled"), True),
         verification_candidate_limit=_bounded_int(
             cfg.get("verification_candidate_limit", 6), 6, 1, 60
         ),

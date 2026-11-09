@@ -53,15 +53,17 @@ and archive engines.
 
 ## Budget profiles
 
-The initial 0.8.6 profile experiment deliberately isolates **budget size** from
-extra retrieval rounds and model reasoning. All shipped profiles currently use
-one retrieval round, Evidence Review is off, and planner thinking remains off.
+The profiles keep retrieval rounds and planner reasoning separate from the
+Candidate Verifier. All shipped profiles currently use one retrieval round,
+Evidence Review is off, and planner thinking remains off. Candidate verification
+is a profile choice: Standard (Schnell) skips the extra verifier pass, while
+Thorough (Gründlich) and Deep (Tief) keep it enabled.
 
-| Model | Verification window | Answer documents | Per-document answer chars | Total answer chars |
-| --- | ---: | ---: | ---: | ---: |
-| `sunaq-standard` | 10 | 10 | 2,500 | 25,000 |
-| `sunaq-thorough` | 30 | 30 | 4,000 | 100,000 |
-| `sunaq-deep` | 50 | 50 | 6,000 | 200,000 |
+| Model | Candidate verifier | Verification window | Answer documents | Per-document answer chars | Total answer chars |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `sunaq-standard` | off | 10 | 10 | 2,500 | 25,000 |
+| `sunaq-thorough` | on | 30 | 30 | 4,000 | 100,000 |
+| `sunaq-deep` | on | 50 | 50 | 6,000 | 200,000 |
 
 For remote LLM roles these profile budgets remain subject to separate
 administrator-controlled `SUNAQ_REMOTE_HARD_*` ceilings. The shipped ceilings are
@@ -92,7 +94,7 @@ The shipped `sunaq-standard` profile has `legacy_config_overlay: true` as a
 0.8.5 compatibility bridge. If an upgraded installation still contains the old
 request-local sections in `config.yaml`, those values override the
 corresponding Standard profile values only. Other SunaQ models are unaffected.
-Fresh 0.8.7-rc1 configurations contain no such legacy sections, so the bridge is
+Fresh 0.8.8-rc1 configurations contain no such legacy sections, so the bridge is
 inert.
 
 Once an upgraded installation has intentionally transferred its tuning into the
@@ -179,7 +181,7 @@ binding retain the global 'delegated_research' or
 
 A model can set 'capabilities.web: false' or 'research.web_backend: none' to
 disable Web. Unknown/disabled backends are rejected, never silently replaced.
-The Nextcloud 0.3.16 UI updates visible source selectors on model changes.
+The Nextcloud 0.3.21 UI updates visible source selectors on model changes.
 Existing clients remain server-authorized but may show outdated selectors.
 
 **Current egress status:** The shared outbound policy is implemented with
@@ -255,18 +257,21 @@ The internal IDs remain stable even if a display label changes. The legacy
 provider model ID `nextcloud-hybrid-rag` remains an alias of
 `sunaq-standard`.
 
-For the current 0.8.7-rc1 release candidate, all three profiles deliberately use
-**one retrieval round**, `evidence_control.mode: off` and planner
-`thinking: false`. The intended difference is budget only:
+On the current development branch, all three profiles deliberately use **one
+retrieval round**, `evidence_control.mode: off` and planner `thinking: false`.
+Standard (Schnell) is the low-latency path and does not run Candidate Verification;
+Thorough (Gründlich) and Deep (Tief) retain verification with larger windows:
 
-| Display name | Model ID | Candidate/verifier window | Answer context |
-| --- | --- | ---: | ---: |
-| Standard (Schnell) | `sunaq-standard` | 10 | 10 docs / 25k chars |
-| Thorough (Gründlich) | `sunaq-thorough` | 30 | 30 docs / 100k chars |
-| Deep (Tief) | `sunaq-deep` | 50 | 50 docs / 200k chars |
+| Display name | Model ID | Candidate verifier | Verification window | Answer context |
+| --- | --- | --- | ---: | ---: |
+| Standard (Schnell) | `sunaq-standard` | off | 10 | 10 docs / 25k chars |
+| Thorough (Gründlich) | `sunaq-thorough` | on | 30 | 30 docs / 100k chars |
+| Deep (Tief) | `sunaq-deep` | on | 50 | 50 docs / 200k chars |
 
-This isolation is intentional. Additional retrieval rounds and model thinking
-are separate experiments and are not part of rc1's shipped behaviour.
+The selected profile is authoritative. Exhaustive wording such as “find all” does
+not silently switch profiles or enable the verifier; users can choose a stronger
+profile when completeness matters. Additional retrieval rounds and model thinking
+remain separate experiments.
 
 A near-capacity run can warn that the current ranked candidate window is almost
 exhausted without claiming that additional ACL-visible hits are known to exist.

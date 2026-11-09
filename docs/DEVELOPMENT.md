@@ -2,7 +2,7 @@
 
 ## Baseline
 
-`0.8.7-rc1` is the current release-candidate baseline. The 0.8.7 line keeps startup-loaded SunaQ research profiles and live Nextcloud ACL while separating Standard/Dockerized packaging from the enforced SRC / ERG Internal / ERG Full architecture tiers and the core/workgroup/full capability presets.
+`0.8.8-rc1` is the current release-candidate baseline. It keeps startup-loaded SunaQ research profiles and live Nextcloud ACL while separating Standard/Dockerized packaging from the enforced SRC / ERG Internal / ERG Full architecture tiers and the core/workgroup/full capability presets.
 
 ## Repository layout
 
@@ -44,7 +44,7 @@ python -m pytest
 
 Some graph/vector tests require the optional runtime client libraries listed in `requirements.txt`. The deployment regression tests also inspect Docker/installer/config files directly and therefore catch accidental changes to the supported topology.
 
-GitHub Actions runs the complete pytest suite on Python 3.13 plus Python compile and shipped-shell syntax checks. The 0.8.7-rc1 release line is additionally validated against real Nextcloud/Elasticsearch estates with a fresh Dockerized installation and an in-place Standard upgrade.
+GitHub Actions runs the complete pytest suite on Python 3.13 plus Python compile and shipped-shell syntax checks. The 0.8.8-rc1 release line is additionally validated against real Nextcloud/Elasticsearch estates with a fresh Dockerized installation and an in-place Standard upgrade.
 
 ## Release rule
 

@@ -93,6 +93,7 @@ def test_sync_does_not_delete_existing_qdrant_points_before_embedding_success(mo
 
     deleted = []
     monkeypatch.setattr(sync, "es_scroll", lambda *a, **k: iter([hit]))
+    monkeypatch.setattr(sync, "qdrant_load_inventory", lambda *a, **k: {})
     monkeypatch.setattr(sync, "build_embedding_backend_from_config", lambda cfg: BrokenBackend())
     monkeypatch.setattr(sync, "qdrant_delete_chunk_range", lambda *a, **k: deleted.append(a))
     monkeypatch.setattr(sys, "argv", ["sync", "--config", str(cfg_path), "--max-documents", "0"])
@@ -143,6 +144,7 @@ def test_persistent_context_overflow_is_deferred_and_sync_continues(monkeypatch,
     deleted = []
     upserted = []
     monkeypatch.setattr(sync, "es_scroll", lambda *a, **k: iter([hit]))
+    monkeypatch.setattr(sync, "qdrant_load_inventory", lambda *a, **k: {})
     monkeypatch.setattr(sync, "build_embedding_backend_from_config", lambda cfg: AlwaysTooLongBackend())
     monkeypatch.setattr(sync, "qdrant_delete_chunk_range", lambda *a, **k: deleted.append(a))
     monkeypatch.setattr(sync, "qdrant_upsert", lambda *a, **k: upserted.append(a))

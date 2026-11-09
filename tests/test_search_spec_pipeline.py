@@ -78,9 +78,12 @@ def test_search_spec_builds_expected_plan_and_query_frame():
     frame = query_frame_from_search_spec(spec, intent="Rechnungen finden")
     assert frame["entities"][0]["text"] == "examplehost"
     assert frame["concepts"] == ["Rechnung"]
-    assert frame["concept_groups"] == [
-        {"required": True, "terms": ["Rechnung", "Invoice"]}
-    ]
+    assert frame["concept_groups"] == [{
+        "required": True,
+        "primary_terms": ["Rechnung"],
+        "expansion_terms": ["Invoice"],
+        "terms": ["Rechnung", "Invoice"],
+    }]
     assert frame["constraints"] == [{"kind": "Jahr", "value": "2025"}]
 
 
@@ -136,7 +139,7 @@ def test_elasticsearch_compiler_executes_structured_intent(monkeypatch):
     assert "2025" in rendered
     assert len(query["must"]) == 3
     assert query["should"] == []
-    assert query["must"][1]["bool"]["minimum_should_match"] == 1
+    assert query["must"][1]["dis_max"]["tie_breaker"] == 0.0
     # The natural sentence belongs only to semantic/vector retrieval.
     assert "Suche Rechnungen von examplehost aus dem Jahr 2025" not in rendered
 
@@ -181,9 +184,12 @@ def test_query_rewriter_returns_backend_neutral_analysis_metadata(monkeypatch):
     assert decision["valid"] is True
     assert decision["spec"]["elastic_query"] == ""
     assert decision["spec"]["concepts"] == ["Rechnung"]
-    assert decision["spec"]["concept_groups"] == [
-        {"required": True, "terms": ["Rechnung", "Invoice"]}
-    ]
+    assert decision["spec"]["concept_groups"] == [{
+        "required": True,
+        "primary_terms": ["Rechnung"],
+        "expansion_terms": ["Invoice"],
+        "terms": ["Rechnung", "Invoice"],
+    }]
     assert decision["spec"]["verification_requirements"]
     assert "ExampleHost GmbH" in captured["messages"][1]["content"]
 
@@ -433,9 +439,9 @@ def test_shipped_model_query_rewriters_forbid_backend_query_syntax():
         prompt = (
             root / "models" / model / "prompts" / "query_rewriter.txt"
         ).read_text(encoding="utf-8")
-        assert "The planner describes intent; it does not own Elasticsearch syntax." in prompt
-        assert "erzeugst keine Elasticsearch-, Nextcloud- oder andere Backend-Syntax" in prompt
-        assert "MUST(OR(term1, term2, ...))" in prompt
+        assert "deterministic host code owns retrieval syntax" in prompt
+        assert "never produce Elasticsearch, Nextcloud, SQL, or other" in prompt
+        assert "Never encode backend operators" in prompt
 
 
 def test_general_query_rewriter_prompt_keeps_planner_backend_neutral():
@@ -443,10 +449,10 @@ def test_general_query_rewriter_prompt_keeps_planner_backend_neutral():
         Path(__file__).resolve().parent.parent
         / "prompts" / "query_rewriter.txt"
     ).read_text(encoding="utf-8")
-    assert "The planner describes intent; it does not own Elasticsearch syntax." in prompt
-    assert "MUST(OR(term1, term2, ...))" in prompt
-    assert "Jane Doe CV" in prompt
-    assert "erzeugst keine Elasticsearch-, Nextcloud- oder andere Backend-Syntax" in prompt
+    assert "deterministic host code owns retrieval syntax" in prompt
+    assert "Never encode backend operators" in prompt
+    assert "backend query syntax" in prompt
+    assert "lexical_query" in prompt
 
 
 def test_general_query_rewriter_prompt_preserves_unicode_orthography():
@@ -454,11 +460,10 @@ def test_general_query_rewriter_prompt_preserves_unicode_orthography():
         Path(__file__).resolve().parent.parent
         / "prompts" / "query_rewriter.txt"
     ).read_text(encoding="utf-8")
-    assert "Bewahre die Orthografie" in prompt
-    assert "`Geschäftsführer`" in prompt
-    assert "`München`" in prompt
+    assert "Names, organizations, domains, brands, identifiers, and case numbers are not" in prompt
+    assert "Do not transliterate Unicode characters on your own." in prompt
+    assert "Geschäftsführer" in prompt
     assert "Geschaeftsfuehrer" not in prompt
-    assert "Muenchen" not in prompt
 
 
 def test_short_user_query_uses_structured_intent_in_first_round():
@@ -518,7 +523,7 @@ def test_jane_doe_cv_compiles_entity_and_required_alternative_group(monkeypatch)
     assert "résumé" in rendered
     assert "curriculum vitae" in rendered
     assert "professional background" in rendered
-    assert query["must"][1]["bool"]["minimum_should_match"] == 1
+    assert query["must"][1]["dis_max"]["tie_breaker"] == 0.0
 
 
 def test_longer_query_also_executes_structured_search_spec_in_first_round():
@@ -528,3 +533,245 @@ def test_longer_query_also_executes_structured_search_spec_in_first_round():
         round_no=1,
         search_spec=rewritten,
     ) == rewritten
+
+
+# --- SunaQ 0.8.8 / SunaQ Find SearchSpec contract parity ---
+
+def test_search_spec_v2_preserves_primary_and_expansion_terms():
+    spec = normalize_search_spec({
+        "retrieval_intent": "planned_semantic",
+        "lexical_sufficiency": "high",
+        "lexical_query": "Rechnungen Eboracum 2020",
+        "semantic_query": "Suche Rechnungen der Eboracum aus 2020.",
+        "entities": ["Eboracum"],
+        "concepts": ["Rechnung"],
+        "concept_groups": [{
+            "required": True,
+            "primary_terms": ["Rechnungen", "Rechnung"],
+            "expansion_terms": ["Rechnungsnummer", "Invoice"],
+        }],
+        "constraints": [{"kind": "year", "value": "2020"}],
+        "verification_requirements": ["Der Treffer ist eine Rechnung der Eboracum aus 2020."],
+        "answer_requirements": ["Nach Datum absteigend auflisten."],
+        "term_interpretations": [],
+        "alternative_interpretations": [],
+    }, original_query="Suche Rechnungen der Eboracum aus 2020")
+
+    group = spec["concept_groups"][0]
+    assert group["primary_terms"] == ["Rechnungen", "Rechnung"]
+    assert group["expansion_terms"] == ["Rechnungsnummer", "Invoice"]
+    assert group["terms"] == ["Rechnungen", "Rechnung", "Rechnungsnummer", "Invoice"]
+    assert spec["answer_requirements"] == ["Nach Datum absteigend auflisten."]
+
+
+def test_legacy_terms_only_group_remains_accepted_but_is_staged():
+    spec = normalize_search_spec({
+        "concepts": ["CV"],
+        "concept_groups": [{
+            "required": True,
+            "terms": ["CV", "résumé", "curriculum vitae"],
+        }],
+    }, original_query="Jane Doe CV")
+    group = spec["concept_groups"][0]
+    assert group["primary_terms"] == ["CV"]
+    assert group["expansion_terms"] == ["résumé", "curriculum vitae"]
+    assert group["terms"] == ["CV", "résumé", "curriculum vitae"]
+
+
+def test_term_interpretation_must_reference_literal_user_text():
+    spec = normalize_search_spec({
+        "term_interpretations": [
+            {"original": "Rachnungen", "status": "probable_typo", "alternatives": ["Rechnungen"]},
+            {"original": "hallucinated", "status": "normalization", "alternatives": ["x"]},
+        ],
+    }, original_query="Suche Rachnungen der Eboracum")
+    assert spec["term_interpretations"] == [{
+        "original": "Rachnungen",
+        "status": "probable_typo",
+        "alternatives": ["Rechnungen"],
+    }]
+
+
+def test_plan_exposes_primary_and_expanded_lexical_groups():
+    spec = normalize_search_spec({
+        "semantic_query": "Suche Rechnungen der Eboracum",
+        "entities": ["Eboracum"],
+        "concepts": ["Rechnung"],
+        "concept_groups": [{
+            "required": True,
+            "primary_terms": ["Rechnungen", "Rechnung"],
+            "expansion_terms": ["Invoice"],
+        }],
+    }, original_query="Suche Rechnungen der Eboracum")
+    plan = plan_from_search_spec(spec, {}, original_query="Suche Rechnungen der Eboracum")
+    assert plan.has_expansion is True
+    assert plan.primary_lexical_groups[0]["terms"] == ["Eboracum"]
+    assert plan.primary_lexical_groups[1]["terms"] == ["Rechnungen", "Rechnung"]
+    assert plan.expanded_lexical_groups[1]["terms"] == ["Rechnungen", "Rechnung", "Invoice"]
+    assert plan.lexical_groups == plan.expanded_lexical_groups
+
+
+def test_search_spec_response_schema_matches_staged_contract():
+    props = provider.SEARCH_SPEC_RESPONSE_SCHEMA["properties"]
+    required = set(provider.SEARCH_SPEC_RESPONSE_SCHEMA["required"])
+    for field in (
+        "retrieval_intent", "lexical_sufficiency", "lexical_query",
+        "term_interpretations", "alternative_interpretations",
+        "answer_requirements",
+    ):
+        assert field in props
+        assert field in required
+    group_props = props["concept_groups"]["items"]["properties"]
+    assert "primary_terms" in group_props
+    assert "expansion_terms" in group_props
+    assert "terms" not in group_props
+
+
+def test_api_search_spec_transport_preserves_find_parity_fields():
+    from rag.api import SearchSpecRequest
+
+    request = SearchSpecRequest(
+        retrieval_intent="planned_semantic",
+        lexical_sufficiency="medium",
+        lexical_query="Leon Autokauf",
+        term_interpretations=[],
+        semantic_query="Wann hat Leon ein Auto gekauft?",
+        alternative_interpretations=[],
+        entities=["Leon"],
+        concepts=["Kauf", "Kraftfahrzeug"],
+        concept_groups=[{
+            "required": True,
+            "primary_terms": ["Autokauf"],
+            "expansion_terms": ["Kauf", "gekauft"],
+        }],
+        answer_requirements=["Nenne das Kaufdatum."],
+    )
+    dumped = request.model_dump()
+    assert dumped["retrieval_intent"] == "planned_semantic"
+    assert dumped["concept_groups"][0]["primary_terms"] == ["Autokauf"]
+    assert dumped["answer_requirements"] == ["Nenne das Kaufdatum."]
+
+
+def test_shipped_query_rewriter_prompts_use_find_style_contract():
+    root = Path(__file__).resolve().parent.parent
+    paths = [root / "prompts" / "query_rewriter.txt"] + [
+        root / "models" / model / "prompts" / "query_rewriter.txt"
+        for model in ("standard", "thorough", "deep")
+    ]
+    for path in paths:
+        text = path.read_text(encoding="utf-8")
+        assert "primary_terms" in text
+        assert "expansion_terms" in text
+        assert "answer_requirements" in text
+        assert "term_interpretations" in text
+        assert "SUNAQ RETRIEVAL CONTEXT" in text
+        assert "presentation instructions into lexical search terms" in text
+
+
+def test_search_spec_multiword_terms_use_and_semantics(monkeypatch):
+    captured = {}
+
+    def fake_post(endpoint, *, json, timeout):
+        captured["body"] = json
+        return FakeResponse({"hits": {"total": {"value": 0, "relation": "eq"}, "hits": []}})
+
+    monkeypatch.setattr(search, "_es_post", fake_post)
+    spec = normalize_search_spec({
+        "concept_groups": [{
+            "required": True,
+            "primary_terms": ["professional background"],
+            "expansion_terms": [],
+        }],
+    }, original_query="professional background")
+    plan = plan_from_search_spec(spec, {}, original_query="professional background")
+    search.elastic_search("professional background", plan, {})
+    rendered = json.dumps(captured["body"]["query"], ensure_ascii=False)
+    assert '"operator": "and"' in rendered
+    assert "match_phrase_prefix" not in rendered
+
+
+def test_staged_files_search_skips_expansion_when_primary_fills_window(monkeypatch):
+    monkeypatch.setattr(search, "RERANKER_ENABLED", False)
+    monkeypatch.setattr(search, "ELASTICSEARCH_ENABLED", True)
+    monkeypatch.setattr(search, "RETRIEVAL_SIGNAL_ENABLED", False)
+    monkeypatch.setattr(search, "_es_limit", lambda: 3)
+    monkeypatch.setattr(
+        search,
+        "prepare_entity_context",
+        lambda question: {"enabled": True, "entities": [], "elastic_phrase_expansion": [], "error": None},
+    )
+    calls = []
+
+    def fake_es(question, plan, diagnostics):
+        calls.append([group["terms"] for group in plan.lexical_groups])
+        diagnostics.update({"total_hits": 3, "total_relation": "eq", "available": True, "compiled_query": {}})
+        return [
+            {"document_id": f"files:{i}", "title": f"d{i}.pdf", "path": f"d{i}.pdf",
+             "score": float(10-i), "text": f"evidence {i}", "snippet": f"evidence {i}"}
+            for i in range(3)
+        ]
+
+    monkeypatch.setattr(search, "elastic_search", fake_es)
+    spec = normalize_search_spec({
+        "entities": ["Eboracum"],
+        "concepts": ["Rechnung"],
+        "concept_groups": [{
+            "required": True,
+            "primary_terms": ["Rechnung"],
+            "expansion_terms": ["Invoice"],
+        }],
+    }, original_query="Eboracum Rechnung")
+    payload = search.perform_search(
+        "Eboracum Rechnung", limit=3, retrieval_arms={"files"}, raw_results=True,
+        force_unspecific=True, search_spec=spec,
+        entity_context_override={"enabled": True, "entities": [], "elastic_phrase_expansion": [], "error": None},
+    )
+    assert len(calls) == 1
+    assert calls[0][1] == ["Rechnung"]
+    assert payload["results"][0]["retrieval_stage"] == "primary"
+
+
+def test_staged_files_search_appends_expansion_without_displacing_primary(monkeypatch):
+    monkeypatch.setattr(search, "RERANKER_ENABLED", False)
+    monkeypatch.setattr(search, "ELASTICSEARCH_ENABLED", True)
+    monkeypatch.setattr(search, "RETRIEVAL_SIGNAL_ENABLED", False)
+    monkeypatch.setattr(search, "_es_limit", lambda: 3)
+    calls = []
+
+    def fake_es(question, plan, diagnostics):
+        terms = [group["terms"] for group in plan.lexical_groups]
+        calls.append(terms)
+        diagnostics.update({"total_hits": 3, "total_relation": "eq", "available": True, "compiled_query": {}})
+        if any("Invoice" in group for group in terms):
+            ids = [1, 2, 3]
+        else:
+            ids = [1]
+        return [
+            {"document_id": f"files:{i}", "title": f"d{i}.pdf", "path": f"d{i}.pdf",
+             "score": float(10-i), "text": f"evidence {i}", "snippet": f"evidence {i}"}
+            for i in ids
+        ]
+
+    monkeypatch.setattr(search, "elastic_search", fake_es)
+    spec = normalize_search_spec({
+        "entities": ["Eboracum"],
+        "concepts": ["Rechnung"],
+        "concept_groups": [{
+            "required": True,
+            "primary_terms": ["Rechnung"],
+            "expansion_terms": ["Invoice"],
+        }],
+    }, original_query="Eboracum Rechnung")
+    payload = search.perform_search(
+        "Eboracum Rechnung", limit=3, retrieval_arms={"files"}, raw_results=True,
+        force_unspecific=True, search_spec=spec,
+        entity_context_override={"enabled": True, "entities": [], "elastic_phrase_expansion": [], "error": None},
+    )
+    assert len(calls) == 2
+    assert calls[0][1] == ["Rechnung"]
+    assert calls[1][1] == ["Rechnung", "Invoice"]
+    assert [item["document_id"] for item in payload["results"][:3]] == [
+        "files:1", "files:2", "files:3"
+    ]
+    assert payload["results"][0]["retrieval_stage"] == "primary"
+    assert payload["results"][1]["retrieval_stage"] == "expansion"

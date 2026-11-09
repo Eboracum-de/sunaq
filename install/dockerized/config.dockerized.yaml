@@ -63,7 +63,7 @@ research_backends:
   brave-search:
     kind: web_retrieval
     adapter: brave_search
-    enabled: true
+    enabled: false
   openai-research:
     kind: delegated_research
     adapter: openai
@@ -125,6 +125,7 @@ sync:
     - eml
     - msg
     - mbox
+    - pst
     - zip
     - 7z
     - rar

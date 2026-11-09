@@ -15,6 +15,8 @@ import base64
 import json
 import logging
 import os
+import subprocess
+import sys
 import secrets
 import threading
 from time import perf_counter
@@ -1119,6 +1121,37 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
             ),
         )
 
+    @router.post("/vector/sync-now", name="admin_vector_sync_now", dependencies=auth)
+    async def admin_vector_sync_now(request: Request):
+        if not vector_enabled or not bool(cfg_get(cfg, "sync_worker.enabled", default=False)):
+            raise HTTPException(status_code=404, detail="Sync capability is not configured")
+        try:
+            command = [
+                sys.executable,
+                "-m",
+                "rag.sync",
+                "--config",
+                str(runtime_config_path),
+                "--max-documents",
+                "0",
+                "--no-enqueue-graph",
+            ]
+            subprocess.Popen(
+                command,
+                cwd=str(runtime_config_path.parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            return redirect(
+                str(request.app.url_path_for("admin_vector")),
+                "Synchronisierung gestartet; ein bereits laufender Sync wird nicht parallel dupliziert.",
+            )
+        except Exception as exc:
+            return error_page(request, exc, status_code=500)
+
     @router.get("/vector", response_class=HTMLResponse, name="admin_vector", dependencies=auth)
     async def admin_vector(request: Request):
         qdrant_url = str(cfg_get(cfg, "qdrant.url", default="http://127.0.0.1:6333") or "").rstrip("/")
@@ -1165,18 +1198,25 @@ def create_admin_router(cfg: dict[str, Any], graph_queue: GraphQueue, web_cfg: d
                 "state_documents": sync_state.get("documents"),
                 "empty_documents": sync_state.get("empty_documents"),
                 "chunks": sync_state.get("chunks"),
+                "last_sync_started_at": sync_status.get("started_at"),
                 "last_sync_at": sync_status.get("completed_at"),
+                "duration_seconds": sync_status.get("duration_seconds"),
                 "complete_full_scan": bool(sync_status.get("complete_full_scan")),
                 "scanned": sync_scan.get("scanned"),
                 "eligible_seen": sync_scan.get("eligible_seen"),
                 "excluded_semantic": sync_scan.get("excluded_semantic"),
                 "out_of_scope": sync_scan.get("out_of_scope"),
                 "embedding_deferred": sync_scan.get("embedding_deferred"),
+                "new": sync_scan.get("new"),
+                "updated": sync_scan.get("updated"),
+                "unchanged": sync_scan.get("unchanged"),
+                "deleted": sync_scan.get("deleted"),
+                "full_source_fetched": sync_scan.get("full_source_fetched"),
             },
             worker={
                 "configured": bool(cfg_get(cfg, "sync_worker.enabled", default=False)),
                 "runtime_enabled": controls["sync_worker"],
-                "poll_interval_seconds": int(cfg_get(cfg, "sync_worker.poll_interval_seconds", default=300) or 300),
+                "poll_interval_seconds": int(cfg_get(cfg, "sync_worker.poll_interval_seconds", default=900) or 900),
                 "pause_check_documents": max(1, int(cfg_get(cfg, "sync_worker.pause_check_documents", default=25) or 25)),
                 "max_documents": int(cfg_get(cfg, "sync_worker.max_documents", default=0) or 0),
                 "enqueue_graph": bool(cfg_get(cfg, "sync_worker.enqueue_graph", default=False)),

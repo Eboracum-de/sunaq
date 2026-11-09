@@ -325,3 +325,9 @@ def test_dockerized_template_is_formal_src():
     assert architecture_tier(cfg) == SRC
     assert cfg["neo4j"]["enabled"] is False
     assert validate_architecture_config(cfg) == []
+
+
+
+def test_src_provider_never_enqueues_graph_evidence():
+    provider = open("rag/openai_provider.py", encoding="utf-8").read()
+    assert "if is_src(PROVIDER_CONFIG) or not GRAPH_EVIDENCE_HOOK_ENABLED or not results:" in provider

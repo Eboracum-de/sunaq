@@ -1203,6 +1203,7 @@ RESULT_METADATA_KEYS = (
     "users",
     "groups",
     "circles",
+    "retrieval_stage",
 )
 
 
@@ -2153,15 +2154,24 @@ def elastic_search(
     def lexical_term_clause(term: str) -> dict:
         if not search_spec_mode:
             return normal_clause(term)
-        # SearchSpec files retrieval deliberately follows the proven
-        # Nextcloud QueryContent field semantics: every explicit lexical
-        # anchor may occur in content OR title.  Older Nextcloud indexes do
-        # not necessarily expose a `combined` field, and filenames often
-        # carry important identifiers that are absent from extracted content.
+        # Keep Files compiler semantics aligned with SunaQ Find. Multiword
+        # lexical alternatives mean co-occurrence of analyzed words, not an
+        # exact phrase; single tokens keep Nextcloud's phrase-prefix behavior.
+        value = str(term or "").strip()
+        if re.search(r"\s", value):
+            return {
+                "bool": {
+                    "should": [
+                        {"match": {"content": {"query": value, "operator": "and"}}},
+                        {"match": {"title": {"query": value, "operator": "and"}}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
         return {
             "bool": {
                 "should": _nextcloud_field_clauses({
-                    "text": str(term or ""),
+                    "text": value,
                     "match": "match_phrase_prefix",
                 }),
                 "minimum_should_match": 1,
@@ -2207,25 +2217,31 @@ def elastic_search(
         for term in plan.should:
             bool_query["should"].append(lexical_term_clause(term))
 
-    # Structured planner intent is compiled here, never by the LLM. Each group
-    # is an OR over lexical alternatives. Required groups become MUST(OR(...));
-    # optional groups remain ranking signals.
+    # Structured planner intent is compiled here, never by the LLM. Alternative
+    # spellings/synonyms are score-neutral equivalents within one semantic
+    # anchor: dis_max prevents a document from winning merely because it happens
+    # to contain several variants from the same group.
     for group in getattr(plan, "lexical_groups", []) or []:
         if not isinstance(group, dict):
             continue
+        group_kind = str(group.get("kind") or "")
+        clause_builder = (
+            lexical_phrase_clause
+            if group_kind.startswith("constraint:")
+            else lexical_term_clause
+        )
         alternatives = [
-            lexical_term_clause(str(term).strip())
+            clause_builder(str(term).strip())
             for term in (group.get("terms") or [])
             if str(term).strip()
         ]
         if not alternatives:
             continue
-        clause = {
-            "bool": {
-                "should": alternatives,
-                "minimum_should_match": 1,
-            }
-        }
+        clause = (
+            alternatives[0]
+            if len(alternatives) == 1
+            else {"dis_max": {"queries": alternatives, "tie_breaker": 0.0}}
+        )
         if bool(group.get("required")):
             bool_query["must"].append(clause)
         else:
@@ -4753,40 +4769,132 @@ def perform_search(
         es_diagnostics: dict = {}
         vector_diagnostics: dict = {}
 
+        def _files_search(active_plan, diagnostics):
+            if acl_prefilter_active:
+                if normalized_source_scopes is None:
+                    return elastic_search(
+                        question,
+                        active_plan,
+                        diagnostics,
+                        acl_prefilter_user=acl_prefilter_user,
+                        acl_prefilter_groups=acl_prefilter_groups,
+                    )
+                return elastic_search(
+                    question,
+                    active_plan,
+                    diagnostics,
+                    source_scopes=normalized_source_scopes,
+                    acl_prefilter_user=acl_prefilter_user,
+                    acl_prefilter_groups=acl_prefilter_groups,
+                )
+            if normalized_source_scopes is None:
+                return elastic_search(question, active_plan, diagnostics)
+            return elastic_search(
+                question,
+                active_plan,
+                diagnostics,
+                source_scopes=normalized_source_scopes,
+            )
+
+        def _stage_plan(groups):
+            values = list(groups or [])
+            if hasattr(plan, "model_copy"):
+                return plan.model_copy(update={"lexical_groups": values})
+            copied = plan.copy(deep=True)
+            copied.lexical_groups = values
+            return copied
+
         if "files" in active_arms and ELASTICSEARCH_ENABLED:
             try:
-                es_results = run_timed(
-                    "elasticsearch",
-                    lambda: (
-                        (
-                            elastic_search(
-                                question,
-                                plan,
-                                es_diagnostics,
-                                acl_prefilter_user=acl_prefilter_user,
-                                acl_prefilter_groups=acl_prefilter_groups,
-                            )
-                            if normalized_source_scopes is None
-                            else elastic_search(
-                                question,
-                                plan,
-                                es_diagnostics,
-                                source_scopes=normalized_source_scopes,
-                                acl_prefilter_user=acl_prefilter_user,
-                                acl_prefilter_groups=acl_prefilter_groups,
-                            )
-                        )
-                        if acl_prefilter_active
-                        else (
-                            elastic_search(question, plan, es_diagnostics)
-                            if normalized_source_scopes is None
-                            else elastic_search(
-                                question, plan, es_diagnostics, source_scopes=normalized_source_scopes
-                            )
-                        )
-                    ),
-                    timings,
+                staged_files = (
+                    str(getattr(plan, "search_mode", "")) == "search_spec"
+                    and bool(getattr(plan, "has_expansion", False))
+                    and bool(getattr(plan, "primary_lexical_groups", []) or [])
+                    and bool(getattr(plan, "expanded_lexical_groups", []) or [])
                 )
+                if staged_files:
+                    primary_diagnostics: dict = {}
+                    primary_results = run_timed(
+                        "elasticsearch_primary",
+                        lambda: _files_search(
+                            _stage_plan(getattr(plan, "primary_lexical_groups", [])),
+                            primary_diagnostics,
+                        ),
+                        timings,
+                    )
+                    for item in primary_results:
+                        item["retrieval_stage"] = "primary"
+
+                    target = max(1, int(_es_limit()))
+                    stage_records = [{
+                        "stage": "primary",
+                        "executed": True,
+                        "reason": "initial",
+                        "compiled_query": primary_diagnostics.get("compiled_query") or {},
+                    }]
+
+                    # Security boundary: this decision is intentionally based on
+                    # pre-ACL Files retrieval. We do not refill the result window
+                    # in response to later live-ACL denials.
+                    if len(primary_results) < target:
+                        expansion_diagnostics: dict = {}
+                        expansion_results = run_timed(
+                            "elasticsearch_expansion",
+                            lambda: _files_search(
+                                _stage_plan(getattr(plan, "expanded_lexical_groups", [])),
+                                expansion_diagnostics,
+                            ),
+                            timings,
+                        )
+                        seen_document_ids = {
+                            str(item.get("document_id") or "")
+                            for item in primary_results
+                            if str(item.get("document_id") or "")
+                        }
+                        combined = list(primary_results)
+                        for item in expansion_results:
+                            document_id = str(item.get("document_id") or "")
+                            if document_id and document_id in seen_document_ids:
+                                continue
+                            item["retrieval_stage"] = "expansion"
+                            combined.append(item)
+                            if document_id:
+                                seen_document_ids.add(document_id)
+                        for rank, item in enumerate(combined, start=1):
+                            item["rank"] = rank
+                            item["final_rank"] = rank
+                            item["es_rank"] = rank
+                        es_results = combined[:target]
+                        es_diagnostics = dict(expansion_diagnostics)
+                        stage_records.append({
+                            "stage": "expansion",
+                            "executed": True,
+                            "reason": "primary_below_candidate_target",
+                            "compiled_query": expansion_diagnostics.get("compiled_query") or {},
+                        })
+                    else:
+                        es_results = list(primary_results)
+                        es_diagnostics = dict(primary_diagnostics)
+                        stage_records.append({
+                            "stage": "expansion",
+                            "executed": False,
+                            "reason": "primary_filled_candidate_target",
+                            "compiled_query": {},
+                        })
+
+                    es_diagnostics["retrieval_stages"] = stage_records
+                    es_diagnostics["staged_retrieval"] = True
+                    timings["elasticsearch"] = (
+                        float(timings.get("elasticsearch_primary") or 0.0)
+                        + float(timings.get("elasticsearch_expansion") or 0.0)
+                    )
+                else:
+                    es_results = run_timed(
+                        "elasticsearch",
+                        lambda: _files_search(plan, es_diagnostics),
+                        timings,
+                    )
+                    es_diagnostics["staged_retrieval"] = False
                 es_diagnostics.setdefault("available", True)
             except Exception as exc:
                 es_results = []
@@ -4812,6 +4920,7 @@ def perform_search(
                 "disabled_by_request": "files" not in active_arms,
                 "disabled_by_config": not ELASTICSEARCH_ENABLED,
                 "available": False,
+                "staged_retrieval": False,
             }
             timings["elasticsearch"] = 0.0
 

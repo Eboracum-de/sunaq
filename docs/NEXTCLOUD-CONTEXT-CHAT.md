@@ -1,6 +1,6 @@
 # Relationship to Nextcloud Context Chat
 
-**Reference:** `0.8.7-rc1`  
+**Reference:** `0.8.8-rc1`  
 **External facts checked:** 2026-09-19
 
 Nextcloud Context Chat is the most relevant comparison for SunaQ because it is Nextcloud's own native RAG/search assistant solution. This document is not a feature-ranking or a claim that one architecture is universally better. The two projects optimize for different operating assumptions.

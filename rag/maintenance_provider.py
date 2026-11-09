@@ -132,6 +132,9 @@ async def list_models(authorization: str | None = Header(default=None)) -> dict[
     _authenticate_client(authorization)
     return {
         "object": "list",
+        "status": "maintenance",
+        "maintenance": True,
+        "version": VERSION,
         "data": [
             {
                 "id": MODEL_ID,

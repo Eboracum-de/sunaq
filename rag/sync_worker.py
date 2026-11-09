@@ -36,7 +36,7 @@ def load_worker_settings(config_path: str | Path) -> tuple[bool, int, int, bool,
     worker = cfg.get("sync_worker") or {}
     qdrant = cfg.get("qdrant") or {}
     enabled = _truthy(worker.get("enabled"), True) and _truthy(qdrant.get("enabled"), True)
-    interval = max(60, int(worker.get("poll_interval_seconds") or 300))
+    interval = max(60, int(worker.get("poll_interval_seconds") or 900))
     max_documents = max(0, int(worker.get("max_documents") or 0))
     enqueue_graph = _truthy(worker.get("enqueue_graph"), False)
     pause_check_documents = max(1, int(worker.get("pause_check_documents") or 25))
@@ -99,7 +99,9 @@ def main() -> int:
                 enqueue_graph=enqueue_graph,
                 pause_check_documents=pause_check_documents,
             )
-            if code:
+            if code == 3:
+                log.info("ES->Qdrant sync skipped because another sync run is already active")
+            elif code:
                 log.error("ES->Qdrant sync run failed exit=%s; retrying after interval", code)
             runtime_allowed_after_run = runtime_worker_enabled(
                 "sync_worker",

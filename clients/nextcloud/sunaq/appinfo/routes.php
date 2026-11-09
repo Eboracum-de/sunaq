@@ -13,5 +13,6 @@ return [
         ['name' => 'fileAction#suggestName', 'url' => '/files/suggest-name', 'verb' => 'POST'],
         ['name' => 'fileAction#rename', 'url' => '/files/rename', 'verb' => 'POST'],
         ['name' => 'admin#save', 'url' => '/admin/config', 'verb' => 'POST'],
+        ['name' => 'admin#status', 'url' => '/admin/status', 'verb' => 'GET'],
     ],
 ];

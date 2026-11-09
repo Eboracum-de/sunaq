@@ -190,7 +190,7 @@ The recurring `RelationObservation.relation_text` property warning and sparse-gr
 4. creates the Research Finding/Run/User schema;
 5. backfills a missing Finding `curation_hash` without changing Finding IDs.
 
-The standard installer waits for selected local Neo4j and, on a fresh 0.8.6 installation, runs the equivalent of:
+The standard installer waits for selected local Neo4j and, on a fresh 0.8.8-rc1 installation, runs the equivalent of:
 
 ```bash
 python -m rag.graph --config /opt/sunaq/config.yaml init

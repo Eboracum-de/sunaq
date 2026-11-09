@@ -1,19 +1,22 @@
 id: sunaq-standard
 name: Schnell
 order: 10
-description: Ausgewogene Recherche mit den validierten 0.8.5-rc5.1 Budgets.
+description: SunaQ-Find-kompatible Basis; zusätzliche ERG-Arme messen ihren Mehrwert gegen dieselben Budgets.
 default: true
 aliases:
   - nextcloud-hybrid-rag
 legacy_config_overlay: true  # 0.8.5 upgrade bridge; inert on fresh installs
 
 search:
-  es_limit: 50
-  vector_limit: 80
+  # Standard is the SunaQ Find benchmark: 15 retrieval candidates.
+  # ERG may add vector candidates, but does not silently increase the
+  # downstream result/evidence budget.
+  es_limit: 15
+  vector_limit: 15
   vector_threshold: 0.55
   rrf_k: 60
-  rerank_candidates: 10
-  final_limit: 10
+  rerank_candidates: 15
+  final_limit: 15
   rerank_min_score: null
 
 retrieval_planner:
@@ -25,10 +28,11 @@ retrieval_planner:
   max_tokens: 700
   context_max_chars: 12000
   max_complete_documents: 15
-  overflow_acl_scan_limit: 80
-  verification_candidate_limit: 10
-  bounded_verification_candidate_limit: 10
-  exhaustive_verification_candidate_limit: 10
+  overflow_acl_scan_limit: 30
+  verification_enabled: false
+  verification_candidate_limit: 15
+  bounded_verification_candidate_limit: 15
+  exhaustive_verification_candidate_limit: 15
   verification_max_chars_per_document: 2500
   verification_max_tokens: 900
   verification_batch_size: 6
@@ -37,7 +41,9 @@ evidence_control:
   mode: "off"
 
 retrieval_signal:
-  enabled: true
+  # SunaQ Find has no separate score-curve rejection heuristic. Keep Standard
+  # neutral so SRC+Standard is a meaningful compatibility benchmark.
+  enabled: false
   reject_unspecific: true
   unspecific_signal_floor: 0.08
   min_curve_candidates: 8
@@ -81,24 +87,27 @@ reranker:
   fallback_backend: "none"
 
 context_enrichment:
-  enabled: true
-  head_chars: 2200
-  window_chars: 1800
-  max_windows: 2
-  max_chars: 7000
+  # SunaQ Find answers from bounded Elasticsearch evidence snippets rather than
+  # a second context-enrichment pass.
+  enabled: false
+  head_chars: 1000
+  window_chars: 1000
+  max_windows: 1
+  max_chars: 1000
 
 answer_context:
-  max_documents: 10
-  max_chars_per_document: 2500
-  max_total_chars: 25000
+  # Match SunaQ Find EvidenceBuilder defaults.
+  max_documents: 12
+  max_chars_per_document: 1000
+  max_total_chars: 16000
 
 deployment_overrides:
   dockerized:
     retrieval_planner:
-      # Budget-only experiment: keep the same 10-document Standard window.
-      verification_candidate_limit: 10
-      bounded_verification_candidate_limit: 10
-      exhaustive_verification_candidate_limit: 10
+      # Keep the SunaQ Find benchmark window independent of deployment mode.
+      verification_candidate_limit: 15
+      bounded_verification_candidate_limit: 15
+      exhaustive_verification_candidate_limit: 15
 
 # Underlying LLM routing is independent from the SunaQ model.
 # Add planner/verifier/evidence/answer overrides here when desired.

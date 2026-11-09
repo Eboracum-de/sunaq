@@ -283,7 +283,7 @@ def test_docker_and_ml_beta_dependencies_are_pinned():
     renderer_dockerfile = (ROOT / "install/components/playwright-renderer/Dockerfile").read_text()
     assert "PIP_ROOT_USER_ACTION=ignore" in renderer_dockerfile
     assert "PIP_DISABLE_PIP_VERSION_CHECK=1" in renderer_dockerfile
-    assert "v1.19.0@sha256:" in images["qdrant"]
+    assert "v1.19.2@sha256:" in images["qdrant"]
     assert "5.26.29-community@sha256:" in images["neo4j"]
     assert "v0.11.4-slim@sha256:" in images["openwebui"]
     lock = yaml.safe_load((ROOT / "versions.lock.yaml").read_text())
@@ -624,6 +624,17 @@ def test_fresh_install_default_is_bare_src_for_both_deployments(tmp_path):
         assert result.returncode == 0, result.stderr
         assert "Architecture tier:       src" in result.stdout
         assert "Capability preset:       <none>" in result.stdout
+        if installer.name == "install-standard.sh":
+            assert "Qdrant:                  disabled by architecture tier" in result.stdout
+            assert "Neo4j:                   disabled by architecture tier" in result.stdout
+            assert "ERG resolver:             disabled by architecture tier" in result.stdout
+            assert "Playwright renderer:      disabled by architecture tier" in result.stdout
+            assert "Web search service:       disabled by architecture tier" in result.stdout
+        else:
+            assert "Vector/Qdrant state:      disabled by architecture tier" in result.stdout
+            assert "Neo4j state:             disabled by architecture tier" in result.stdout
+            assert "ERG resolver:             disabled by architecture tier" in result.stdout
+            assert "Playwright archive:      disabled by architecture tier" in result.stdout
 
 
 def test_recognized_rerun_without_state_uses_authoritative_config(tmp_path):
@@ -922,7 +933,7 @@ def test_dockerized_qdrant_packaging_and_sync_worker_are_generated():
     status = (ROOT / "status.sh").read_text()
     smoke = (ROOT / "install/smoke-test.sh").read_text()
 
-    assert "QDRANT_IMAGE=qdrant/qdrant:v1.19.0@" in installer
+    assert "QDRANT_IMAGE=qdrant/qdrant:v1.19.2@" in installer
     assert "qdrant_data:/qdrant/storage" in installer
     assert 'command: ["python", "-m", "rag.sync_worker", "--config", "/app/config.yaml"]' in installer
     assert "sync_worker_enabled_from_config" in installer
@@ -1194,7 +1205,7 @@ def test_rc_line_documents_destructive_erg_to_src_graph_reset():
     assert "--yes-really-delete-all" in docs
 
 def test_release_repository_hygiene():
-    assert (ROOT / "rag/version.py").read_text().strip() == 'VERSION = "0.8.7-rc1"'
+    assert (ROOT / "rag/version.py").read_text().strip() == 'VERSION = "0.8.8-rc1"'
     assert not (ROOT / "provider.env").exists()
     assert "provider.env" in (ROOT / ".gitignore").read_text().splitlines()
     assert (ROOT / "CHANGELOG.md").exists()

@@ -21,7 +21,7 @@ The central security invariant is deliberately simple:
 
 Every document candidate is checked live against Nextcloud for the authenticated user before it can become answer evidence. If an otherwise relevant document is not authorized, it is removed rather than replaced by a weaker result merely to fill the context window.
 
-> **Project status:** `0.8.7-rc1` is the current public-beta release candidate, focused on retrieval architecture, deterministic intent compilation, resolver/retriever boundaries and auditable ResearchRun provenance. The tagged `v0.8.7-rc1` tree is the release contract; development branches may move ahead independently. See `CHANGELOG.md`, `docs/WHITEPAPER.md`, `docs/RETRIEVAL-ARCHITECTURE.md`, `docs/BETA-OPERATIONS.md` and `docs/KNOWN-LIMITATIONS.md`.
+> **Project status:** `0.8.8-rc1` is the current public-beta release candidate, focused on query/rewrite quality, deterministic Elasticsearch compilation, fast ES→Qdrant delta synchronization and upgrade hardening. The tagged `v0.8.8-rc1` tree is the release contract; development branches may move ahead independently. See `CHANGELOG.md`, `docs/WHITEPAPER.md`, `docs/RETRIEVAL-ARCHITECTURE.md`, `docs/BETA-OPERATIONS.md` and `docs/KNOWN-LIMITATIONS.md`.
 
 
 ## Why this project exists
@@ -43,7 +43,7 @@ The project focuses on eight practical goals:
 
 ## Default architecture boundary
 
-In the 0.8.7-rc1 architecture, a fresh Dockerized core installation is the formal
+In the 0.8.8-rc1 architecture, a fresh Dockerized core installation is the formal
 **Secure RAG Core (SRC)** package:
 
 ```text
@@ -181,7 +181,7 @@ Archive provenance is still retained internally (for example public-Web origin a
 
 Without an explicit source directive, SunaQ searches ordinary Nextcloud documents only. Mail archives, saved chat/research archives and live Web research are optional capabilities. The provider enforces the effective capability for the authenticated user: optional sources are usable only while the corresponding global service gate and per-user gate are enabled. Explicit `/mailarchive`, `/chatarchive` or `/web` directives cannot bypass that policy. The bundled SunaQ Recherche client renders these optional source controls fail-closed: they start hidden and are shown only after the authenticated capability response confirms availability. **Documents** remain the always-visible baseline source.
 
-Archive scopes are optional. In particular, saved chats are useful as shared/flat-hierarchy working memory, but they are deliberate retained copies: a saved conversation can contain text derived from another document and then has its own Nextcloud file ID, ACL and lifecycle. In SunaQ Recherche 0.3.16 chat archiving is enabled only when both the global `chat_archive.enabled` gate and the canonical user's chat-archive switch are enabled. Otherwise new chats remain session-local, the Chats source control is not shown and explicit `/chatarchive` retrieval is rejected. Manual deletion of a managed Markdown chat removes its hidden metadata sidecar in the same Nextcloud file-operation path, with list/load self-healing for older orphan sidecars.
+Archive scopes are optional. In particular, saved chats are useful as shared/flat-hierarchy working memory, but they are deliberate retained copies: a saved conversation can contain text derived from another document and then has its own Nextcloud file ID, ACL and lifecycle. In SunaQ Recherche 0.3.21 chat archiving is enabled only when both the global `chat_archive.enabled` gate and the canonical user's chat-archive switch are enabled. Otherwise new chats remain session-local, the Chats source control is not shown and explicit `/chatarchive` retrieval is rejected. Manual deletion of a managed Markdown chat removes its hidden metadata sidecar in the same Nextcloud file-operation path, with list/load self-healing for older orphan sidecars.
 
 ## Privacy and trust boundaries
 
@@ -211,9 +211,9 @@ See `docs/PRIVACY-ARCHITECTURE.md`, `docs/THREAT-MODEL.md` and `SECURITY.md` for
 
 The project intentionally keeps support for older installations in scope rather than requiring a current Linux/Python stack everywhere.
 
-Current 0.8.7-rc1 release-candidate reference points:
+Current 0.8.8-rc1 release-candidate reference points:
 
-- **SunaQ Recherche 0.3.16:** Nextcloud 23+
+- **SunaQ Recherche 0.3.21:** Nextcloud 23+
 - **Dockerized acceptance host:** openSUSE Leap 15.3
 - **Document retrieval:** existing Nextcloud FullTextSearch / Elasticsearch
 - **Internal PKI:** supported, including compatibility mode for older private certificate chains without disabling ordinary TLS verification
@@ -238,7 +238,7 @@ sudo ./install/install.sh \
   --plan
 ```
 
-Then install with the same arguments, removing `--plan` and adding only the components you want. Fresh installations default to the bare SRC boundary with optional components off. For reproducible installations, record `--architecture-tier src` explicitly when declaring the policy boundary; add `--preset core` only when you want the named Core shortcut. For an internal PKI, use repeatable `--ca-certificate FILE` arguments rather than disabling TLS verification. Fresh installs and installer reruns enter an explicit **maintenance mode** first: the OpenAI-compatible provider remains reachable and authenticates trusted client keys, but returns a maintenance message without loading the normal SunaQ/LLM pipeline. After configuration and checks, use `sudo /opt/sunaq/install/maintenance-mode.sh off` on a fresh 0.8.7-rc1 installation to start normal operation. Recognized legacy installations keep their existing prefix (for example `/opt/nextcloud-rag`) rather than being moved.
+Then install with the same arguments, removing `--plan` and adding only the components you want. Fresh installations default to the bare SRC boundary with optional components off. For reproducible installations, record `--architecture-tier src` explicitly when declaring the policy boundary; add `--preset core` only when you want the named Core shortcut. For an internal PKI, use repeatable `--ca-certificate FILE` arguments rather than disabling TLS verification. Fresh installs and installer reruns enter an explicit **maintenance mode** first: the OpenAI-compatible provider remains reachable and authenticates trusted client keys, but returns a maintenance message without loading the normal SunaQ/LLM pipeline. After configuration and checks, use `sudo /opt/sunaq/install/maintenance-mode.sh off` on a fresh 0.8.8-rc1 installation to start normal operation. Recognized legacy installations keep their existing prefix (for example `/opt/nextcloud-rag`) rather than being moved.
 
 Detailed installation and acceptance steps are in `install/INSTALL.md` and `docs/BETA-OPERATIONS.md`.
 
@@ -256,7 +256,7 @@ When SunaQ is selected as the model, client-side Knowledge/RAG/File-Context
 injection should be disabled: SunaQ is intended to remain the retrieval and
 evidence authority. Replayed client `user`/`assistant` history is still used for bounded follow-up
 resolution and is therefore not authoritative provenance. Authoritative
-server-side conversation state is a post-0.8.7-rc1 target.
+server-side authoritative conversation state is deliberately deferred to the 0.9 development line.
 
 The same OpenAI-compatible boundary can be used by other local frontends, RAG systems, agents or research tools when an administrator deliberately registers them as trusted clients. A trusted-client key is an integration-server credential: keep it server-side and restrict externally reachable provider endpoints by network policy/reverse-proxy allowlists or equivalent controls where practical.
 
@@ -298,10 +298,10 @@ The graph layer is deliberately conservative: retrieved or LLM-derived observati
 - `docs/ADMINISTRATION.md` — user, credential, mail, web and graph administration
 - `docs/GRAPHLIGHT-FINDINGS.md` — Findings curation and Graph-Lite safety boundary
 - `docs/KNOWN-LIMITATIONS.md` — known limitations and deferred polish
-- `docs/ROADMAP.md` — 0.8.7-rc1 baseline and explicitly deferred follow-up work
+- `docs/ROADMAP.md` — 0.8.8-rc1 baseline and explicitly deferred 0.9 follow-up work
 - `docs/DEVELOPMENT.md` — repository layout and test baseline
 - `SECURITY.md` — security model and vulnerability reporting
-- `RELEASE-NOTES-0.8.7-rc1.md` — current release-candidate notes
+- `RELEASE-NOTES-0.8.8-rc1.md` — current release-candidate notes
 - `RELEASE-NOTES-0.8.6-rc1.2.md` — previous hardening release-candidate notes
 - `RELEASE-NOTES-0.8.6-rc1.1.md` — previous public release-candidate notes
 - `RELEASE-NOTES-0.8.5-rc5.1.md` — earlier public-beta release notes
